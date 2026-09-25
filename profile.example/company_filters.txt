@@ -1,0 +1,13 @@
+# Substring match against the job's company name (case-insensitive). Any listing
+# whose company contains one of these strings is dropped in the processData stage.
+#
+# Use this to exclude agencies and job boards rather than real employers, so you
+# do not silently discard roles you actually want.
+#
+# EXAMPLE LIST - replace or extend. Keep entries specific: overly broad values
+# such as "inc" or "tech" will remove legitimate postings.
+example staffing agency
+example job board
+example talent solutions
+example consulting group
+example recruiters

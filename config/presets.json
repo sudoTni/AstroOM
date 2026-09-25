@@ -1,0 +1,90 @@
+{
+	"jobCloth": {
+		"jc_ds-v4-f-0423": {
+			"name": "jc_ds-v4-f-0423",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "deepseek/deepseek-v4-flash",
+			"promptTemplate": "./prompts/jc_prompt-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		},
+		"jc_glm-5.3-flash": {
+			"name": "jc_glm-5.3-flash",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "z-ai/glm-5.3-flash",
+			"promptTemplate": "./prompts/jc_prompt-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		}
+	},
+	"remoteEval": {
+		"re_ds-v4-f-0423": {
+			"name": "re_ds-v4-f-0423",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "deepseek/deepseek-v4-flash",
+			"promptTemplate": "./prompts/re_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		},
+		"re_glm-5.3-flash": {
+			"name": "re_glm-5.3-flash",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "z-ai/glm-5.3-flash",
+			"promptTemplate": "./prompts/re_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		}
+	},
+	"jobJudge": {
+		"jep_ds-v4-f-0423": {
+			"name": "jep_ds-v4-f-0423",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "deepseek/deepseek-v4-flash",
+			"promptTemplate": "./prompts/jep_prompt05-re-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		},
+		"jep_glm-5.3-flash": {
+			"name": "jep_glm-5.3-flash",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "z-ai/glm-5.3-flash",
+			"promptTemplate": "./prompts/jep_prompt05-re-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		}
+	},
+	"makeMaterials": {
+		"rop_g5.6-luna_or": {
+			"name": "rop_g5.6-luna_or",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "openai/gpt-5.6-luna",
+			"promptTemplate": "./prompts/rop_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 1.0,
+			"maxTokens": 64000
+		},
+		"rop_glm-5.3-flash": {
+			"name": "rop_glm-5.3-flash",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "z-ai/glm-5.3-flash",
+			"promptTemplate": "./prompts/rop_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 0.95,
+			"maxTokens": 64000
+		}
+	}
+}
