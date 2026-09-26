@@ -2,7 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/tools/install)
-[![Platform](https://img.shields.io/badge/platform-x86__64--linux-lightgrey.svg)](#supported-platforms)<br>
+[![Platform](https://img.shields.io/badge/platform-x86__64--linux-lightgrey.svg)](#supported-platforms)
+[![portable to Win/Mac](https://img.shields.io/badge/portable%20to-Win/Mac-4692f7?labelColor=555555)](#supported-platforms)<br>
 [![Google Antigravity](https://img.shields.io/badge/Google-Antigravity-4285F4)](https://antigravity.google/)
 [![OpenAI Codex](https://img.shields.io/badge/OpenAI-Codex-000000?labelColor=555555)](https://openai.com/codex/)
 [![Anomaly OpenCode](https://img.shields.io/badge/Anomaly-OpenCode-C6C4C4?labelColor=555555)](https://opencode.ai/)
