@@ -232,7 +232,7 @@ To use it:
 | `x86_64-unknown-linux-gnu` | **Prebuilt binary shipped.** The release artifact targets glibc. |
 | Other POSIX (macOS, other Linux architectures) | Build from source with `cargo build --release`. |
 
-AstroOM is POSIX-only. It uses `dup`/`pipe`/`dup2` to tee its execution log (`src/logging/execution_log.rs`) and reads `/proc/self/status` for statistics (Linux; degrades gracefully elsewhere). Windows is not supported.
+This version of AstroOM is POSIX-only. It uses `dup`/`pipe`/`dup2` to tee its execution log (`src/logging/execution_log.rs`) and reads `/proc/self/status` for statistics (Linux; degrades gracefully elsewhere). Windows/Mac support could be added with minimal changes. [AstroEX](https://github.com/sudoTni/AstroEX), AstroOM's Node.js sibling, may get up & running under Windows/Mac a bit quicker. Use a codex / AI coding assistant to configure/port!
 
 ---
 
