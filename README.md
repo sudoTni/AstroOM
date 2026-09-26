@@ -83,6 +83,9 @@ Each stage writes a JSON artifact plus a companion `<artifact>.json.manifest.jso
 
 ## Quick Start Guide
 
+> [!NOTE]
+> The AOM contributors highly recommend the use of a codex / AI coding assistant for rapidly porting to your platform and configuring the software with your application materials!
+
 ### 1. Prerequisites
 
 **Option A — use the prebuilt binary.** No toolchain needed.
