@@ -3,13 +3,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/tools/install)
 [![Platform](https://img.shields.io/badge/platform-x86__64--linux-lightgrey.svg)](#supported-platforms)
-[![portable to Win/Mac](https://img.shields.io/badge/portable%20to-Win/Mac-4692f7?labelColor=555555)](#supported-platforms)<br>
+[![Platform Windows](https://img.shields.io/badge/platform-Windows-0078D4)](#supported_platforms)<br>
 [![Google Antigravity](https://img.shields.io/badge/Google-Antigravity-4285F4)](https://antigravity.google/)
 [![OpenAI Codex](https://img.shields.io/badge/OpenAI-Codex-000000?labelColor=555555)](https://openai.com/codex/)
 [![Anomaly OpenCode](https://img.shields.io/badge/Anomaly-OpenCode-C6C4C4?labelColor=555555)](https://opencode.ai/)
 [![OpenRouter](https://img.shields.io/badge/OpenRouter-141210?style=flat-square&logo=openrouter&logoColor=white)](https://openrouter.ai)
 
-> **AstroOM** is an autonomous, multi-phase job acquisition and tailored application materials generation engine, written in Rust for Linux. It combines lightweight, headless job search querying with multi-provider LLM grounding to systematically evaluate opportunities, match candidate qualifications, and produce tailored application packages.
+> **AstroOM** is an autonomous, multi-phase job acquisition and tailored application materials generation engine, written in Rust for Linux & Windows. It combines lightweight, headless job search querying with multi-provider LLM grounding to systematically evaluate opportunities, match candidate qualifications, and produce tailored application packages.
 
 <p align = "center"><img width = "640" alt="AstroOM animated logo" src="screenshots/AstroOM-logo.gif" /></p>
 
