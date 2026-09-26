@@ -9,7 +9,7 @@
 [![Anomaly OpenCode](https://img.shields.io/badge/Anomaly-OpenCode-C6C4C4?labelColor=555555)](https://opencode.ai/)
 [![OpenRouter](https://img.shields.io/badge/OpenRouter-141210?style=flat-square&logo=openrouter&logoColor=white)](https://openrouter.ai)
 
-> **AstroOM** is an autonomous, multi-phase job acquisition and tailored application materials generation engine. It combines lightweight, headless job search querying with multi-provider LLM grounding to systematically evaluate opportunities, match candidate qualifications, and produce tailored application packages.
+> **AstroOM** is an autonomous, multi-phase job acquisition and tailored application materials generation engine, written in Rust for Linux. It combines lightweight, headless job search querying with multi-provider LLM grounding to systematically evaluate opportunities, match candidate qualifications, and produce tailored application packages.
 
 <p align = "center"><img width = "640" alt="AstroOM animated logo" src="screenshots/AstroOM-logo.gif" /></p>
 
