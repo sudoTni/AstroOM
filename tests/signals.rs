@@ -2,6 +2,8 @@
 //! must cancel the pipeline gracefully and map to exit codes 130/143. A slow
 //! mock LLM keeps a request in flight so the signal is delivered mid-run.
 
+#![cfg(unix)]
+
 mod common;
 
 use common::*;

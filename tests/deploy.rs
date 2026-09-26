@@ -1,5 +1,7 @@
 //! Stage 8 deployment contract with a fake `rclone` shim on PATH.
 
+#![cfg(unix)]
+
 mod common;
 
 use common::*;

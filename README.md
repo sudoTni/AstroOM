@@ -97,18 +97,32 @@ Each stage writes a JSON artifact plus a companion `<artifact>.json.manifest.jso
 
 **Option A — use the prebuilt binary.** No toolchain needed.
 
-The repository ships a release build at `target/release/astroom`, built for `x86_64-unknown-linux-gnu` (glibc). It needs the `config/`, `prompts/`, and `sysprompts/` directories alongside it, which is why the binary is distributed inside the repository tree rather than as a bare download.
+The repository ships prebuilt release binaries at `target/release/astroom` for Linux (`x86_64-unknown-linux-gnu`, glibc) and `target/x86_64-pc-windows-gnu/release/astroom.exe` for Windows (`x86_64-pc-windows-gnu`). They need the `config/`, `prompts/`, and `sysprompts/` directories alongside them, which is why the binaries are distributed inside the repository tree rather than as bare downloads.
 
 ```bash
+# Linux
 ./target/release/astroom --help
 ```
 
-**Option B — build from source.** Requires the [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; CI uses `dtolnay/rust-toolchain@stable`) and a C toolchain for the bundled SQLite build.
+```powershell
+# Windows (PowerShell)
+.\target\x86_64-pc-windows-gnu\release\astroom.exe --help
+```
+
+**Option B — build from source.** Requires the [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; CI uses `dtolnay/rust-toolchain@stable`) and a C compiler (GCC/Clang on Linux; MSVC C++ Build Tools or MinGW-w64 on Windows) for the bundled SQLite build.
 
 ```bash
+# Clone the repository
 git clone https://github.com/sudoTni/AstroOM.git
 cd AstroOM
-cargo build --release      # -> target/release/astroom
+
+# Linux
+cargo build --release        # -> target/release/astroom
+```
+
+```powershell
+# Windows (PowerShell)
+cargo build --release        # -> target\release\astroom.exe
 ```
 
 ### 2. Candidate Profile Setup
@@ -116,7 +130,13 @@ cargo build --release      # -> target/release/astroom
 AstroOM keeps all personal job-search data outside the code, in a `profile/` directory. The repository ships an annotated template:
 
 ```bash
+# Linux
 cp -r profile.example profile
+```
+
+```powershell
+# Windows (PowerShell)
+Copy-Item -Recurse profile.example profile
 ```
 
 Then replace the sample content in each file. See [`profile.example/README.md`](profile.example/README.md) for a per-field table. In short:
@@ -141,11 +161,18 @@ AstroOM itself **reads no environment variables.** Every setting reaches it thro
 - `--api-key "<YOUR_KEY>"`, or
 - `--api-key-file /path/to/key` (mutually exclusive with `--api-key`).
 
-For convenience the wrapper script reads `AOM_OR_API_KEY` from a local `.env` and forwards it:
+For convenience the wrapper scripts (`astro_launcher.bash` / `astro_launcher.ps1`) read `AOM_OR_API_KEY` from a local `.env` and forward it:
 
 ```bash
+# Linux
 cp .env.example .env
 $EDITOR .env          # set AOM_OR_API_KEY
+```
+
+```powershell
+# Windows (PowerShell)
+Copy-Item .env.example .env
+notepad .env          # set AOM_OR_API_KEY
 ```
 
 `.env` is git-ignored. Never commit a real key; rotate any key that is ever committed or shared.
@@ -154,21 +181,36 @@ The Indeed scraper uses a public Indeed mobile client key that is compiled into 
 
 ### 4. Running the Pipeline
 
-Run the full 8-phase pipeline with the wrapper:
+Run the full 8-phase pipeline with the wrapper script:
 
 ```bash
+# Linux
 ./astro_launcher.bash
+```
+
+```powershell
+# Windows (PowerShell)
+# If script execution is restricted on your system, enable it for the current process:
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\astro_launcher.ps1
 ```
 
 The wrapper applies a tuned policy argv (presets, provider routing, `--remote-only`, cost tracking, internet watchdog) and appends any arguments you pass it **last**, so they override those defaults:
 
 ```bash
+# Linux
 ./astro_launcher.bash --batch 50 --results-wanted 500 --clean
+```
+
+```powershell
+# Windows (PowerShell)
+.\astro_launcher.ps1 --batch 50 --results-wanted 500 --clean
 ```
 
 Or invoke the binary directly:
 
 ```bash
+# Linux
 ./target/release/astroom run-pipeline \
   --job-provider indeed,linkedin \
   --profile-dir ./profile \
@@ -180,10 +222,29 @@ Or invoke the binary directly:
   --batch 25 --sleep 2 --results-wanted 200 --remote-only true
 ```
 
+```powershell
+# Windows (PowerShell)
+.\target\x86_64-pc-windows-gnu\release\astroom.exe run-pipeline `
+  --job-provider indeed,linkedin `
+  --profile-dir .\profile `
+  --api-key "<YOUR_KEY>" `
+  --jobcloth-preset jc_glm-5.3-flash `
+  --remoteeval-preset re_glm-5.3-flash `
+  --jobjudge-preset jep_glm-5.3-flash `
+  --makematerials-preset rop_glm-5.3-flash `
+  --batch 25 --sleep 2 --results-wanted 200 --remote-only true
+```
+
 Validate the setup before spending any tokens:
 
 ```bash
+# Linux
 ./target/release/astroom preflight --profile-dir ./profile --json
+```
+
+```powershell
+# Windows (PowerShell)
+.\target\x86_64-pc-windows-gnu\release\astroom.exe preflight --profile-dir .\profile --json
 ```
 
 ---
@@ -242,10 +303,11 @@ To use it:
 
 | Target | Status |
 | :--- | :--- |
-| `x86_64-unknown-linux-gnu` | **Prebuilt binary shipped.** The release artifact targets glibc. |
+| `x86_64-unknown-linux-gnu` | **Primary target.** Full native Linux support. Prebuilt binary shipped. |
+| `x86_64-pc-windows-gnu` / `x86_64-pc-windows-msvc` | **Windows native.** Full native Windows support via `astro_launcher.ps1` or direct CLI execution. |
 | Other POSIX (macOS, other Linux architectures) | Build from source with `cargo build --release`. |
 
-This version of AstroOM is POSIX-only. It uses `dup`/`pipe`/`dup2` to tee its execution log (`src/logging/execution_log.rs`) and reads `/proc/self/status` for statistics (Linux; degrades gracefully elsewhere). Windows/Mac support could be added with minimal changes. [AstroEX](https://github.com/sudoTni/AstroEX), AstroOM's Node.js sibling, may get up & running under Windows/Mac a bit quicker. Use a codex / AI coding assistant to configure/port!
+AstroOM natively dual-targets Linux and Windows. On Linux, it uses POSIX pipes and descriptors to tee its execution log (`src/logging/execution_log.rs`) and reads `/proc/self/status` for process metrics. On Windows, it uses Win32 standard handle redirection and pipes with virtual terminal processing for ANSI styling.
 
 ---
 

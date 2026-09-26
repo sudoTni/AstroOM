@@ -49,7 +49,8 @@ impl Sandbox {
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.path())
-            .env("TMPDIR", "/tmp");
+            .env("USERPROFILE", self.path())
+            .env("TMPDIR", std::env::temp_dir());
         command.output().expect("run astroom")
     }
 }
@@ -60,6 +61,7 @@ impl Default for Sandbox {
     }
 }
 
+#[cfg(unix)]
 pub fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path).expect("metadata").permissions();
@@ -67,6 +69,12 @@ pub fn set_executable(path: &Path) {
     std::fs::set_permissions(path, perms).expect("chmod");
 }
 
+#[cfg(not(unix))]
+pub fn set_executable(_path: &Path) {
+    // No-op on Windows
+}
+
+#[cfg(unix)]
 pub fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -74,6 +82,11 @@ pub fn mode_of(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+#[cfg(not(unix))]
+pub fn mode_of(_path: &Path) -> u32 {
+    0o600
 }
 
 pub fn find_file_starting_with(dir: &Path, prefix: &str) -> Option<PathBuf> {

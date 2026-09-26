@@ -135,7 +135,11 @@ impl WatchdogInner {
         if self.target.contains(':') {
             command.arg("-6");
         }
-        command.arg("-c").arg("1").arg(&self.target);
+        #[cfg(unix)]
+        command.arg("-c").arg("1");
+        #[cfg(windows)]
+        command.arg("-n").arg("1");
+        command.arg(&self.target);
         // Node runs ping through execFile, which captures (and discards)
         // stdout/stderr; do the same so probes do not pollute the console.
         command.stdout(std::process::Stdio::null());

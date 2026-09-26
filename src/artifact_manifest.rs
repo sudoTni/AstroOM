@@ -133,15 +133,16 @@ pub fn verify_artifact_manifest(artifact_path: &Path) -> Result<Value> {
     }
 }
 
-/// Writes a file with mode 0600 (owner-only), creating or truncating.
+/// Writes a file with mode 0600 (owner-only on Unix), creating or truncating.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(path)
         .map_err(|err| AppError::message(format!("Failed to create {}: {err}", path.display())))?;
     file.write_all(contents)

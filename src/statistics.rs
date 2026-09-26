@@ -147,6 +147,7 @@ fn read_cpu_ticks() -> Option<(u64, u64)> {
     Some((utime, stime))
 }
 
+#[cfg(unix)]
 fn clock_ticks_per_sec() -> f64 {
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if tck > 0 {
@@ -154,6 +155,11 @@ fn clock_ticks_per_sec() -> f64 {
     } else {
         100.0
     }
+}
+
+#[cfg(not(unix))]
+fn clock_ticks_per_sec() -> f64 {
+    100.0
 }
 
 impl StatisticsCollector {
@@ -946,8 +952,11 @@ mod tests {
             Some(7)
         );
 
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 }

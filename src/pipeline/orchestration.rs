@@ -115,6 +115,7 @@ pub async fn execute(ctx: &RunContext, config: &PipelineConfig) -> Result<Pipeli
     // mapped to exit codes 130/143, matching Node's CLI handler.
     let signal_code = Arc::new(AtomicU16::new(0));
     let signal_stop = tokio_util::sync::CancellationToken::new();
+    #[cfg(unix)]
     let signal_task = {
         let cancellation = ctx.cancellation.clone();
         let stop = signal_stop.clone();
@@ -148,6 +149,29 @@ pub async fn execute(ctx: &RunContext, config: &PipelineConfig) -> Result<Pipeli
                     );
                     code.store(143, Ordering::SeqCst);
                     cancellation.cancel();
+                }
+                _ = stop.cancelled() => {}
+            }
+        })
+    };
+
+    #[cfg(windows)]
+    let signal_task = {
+        let cancellation = ctx.cancellation.clone();
+        let stop = signal_stop.clone();
+        let code = Arc::clone(&signal_code);
+        tokio::spawn(async move {
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => {
+                    if res.is_ok() {
+                        crate::logging::log(
+                            "Pipeline",
+                            "Received Ctrl-C; cancelling pipeline gracefully.",
+                            LogLevel::Warn,
+                        );
+                        code.store(130, Ordering::SeqCst);
+                        cancellation.cancel();
+                    }
                 }
                 _ = stop.cancelled() => {}
             }

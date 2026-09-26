@@ -24,6 +24,21 @@
 # Intentionally NOT ignored:
 #   /target/release/astroom   <- the distributed release binary
 
+/target/x86_64-pc-windows-gnu/debug/
+/target/x86_64-pc-windows-gnu/tmp/
+/target/x86_64-pc-windows-gnu/CACHEDIR.TAG
+/target/x86_64-pc-windows-gnu/release/build/
+/target/x86_64-pc-windows-gnu/release/deps/
+/target/x86_64-pc-windows-gnu/release/incremental/
+/target/x86_64-pc-windows-gnu/release/examples/
+/target/x86_64-pc-windows-gnu/release/.fingerprint/
+/target/x86_64-pc-windows-gnu/release/*.d
+/target/x86_64-pc-windows-gnu/release/*.rlib
+/target/x86_64-pc-windows-gnu/release/.cargo-*
+
+# Intentionally NOT ignored:
+#   /target/x86_64-pc-windows-gnu/release/astroom.exe <- the distributed Windows release binary
+
 # ---------------------------------------------------------------------------
 # Secrets and local configuration
 # ---------------------------------------------------------------------------

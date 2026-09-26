@@ -8,6 +8,7 @@ use crate::types::LogLevel;
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,11 +76,11 @@ pub fn write_llm_payload_log(log_directory: &Path, stage: &str, payload: &Value)
         }
     };
     let directory = log_directory.join(directory_name);
-    if let Err(error) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&directory)
-    {
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    #[cfg(unix)]
+    dir_builder.mode(0o700);
+    if let Err(error) = dir_builder.create(&directory) {
         warn_payload_failure(
             format!(
                 "Unable to create LLM payload log directory at {}",
@@ -111,10 +112,11 @@ pub fn write_llm_payload_log(log_directory: &Path, stage: &str, payload: &Value)
         uuid::Uuid::new_v4()
     );
     let file_path = directory.join(file_name);
-    let write_result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = options
         .open(&file_path)
         .and_then(|mut file| file.write_all(serialized_payload.as_bytes()));
     match write_result {
@@ -180,12 +182,11 @@ fn update_llm_payload_log_inner(file_path: &str, llm_output: &Value) -> std::io:
         random_suffix
     );
     {
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut temp_file = options.open(&temp_path)?;
         temp_file
             .write_all(serde_json::to_string_pretty(&Value::Object(updated_data))?.as_bytes())?;
     }

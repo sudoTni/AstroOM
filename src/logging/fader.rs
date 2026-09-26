@@ -310,15 +310,42 @@ pub fn gradient_profile(key: GradientKey) -> GradientProfile {
 /// None = not yet configured (falls back to TTY detection).
 static COLOR_DECISION: OnceLock<bool> = OnceLock::new();
 
+#[cfg(windows)]
+pub fn enable_windows_ansi() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(handle_id) };
+        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let mut mode = 0u32;
+            if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
+                let _ =
+                    unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
+            }
+        }
+    }
+}
+
 pub fn set_color_decision(enabled: bool) {
+    #[cfg(windows)]
+    if enabled {
+        enable_windows_ansi();
+    }
     let _ = COLOR_DECISION.set(enabled);
 }
 
 pub fn is_color_supported() -> bool {
-    COLOR_DECISION
+    let supported = COLOR_DECISION
         .get()
         .copied()
-        .unwrap_or_else(super::execution_log::is_stdout_terminal)
+        .unwrap_or_else(super::execution_log::is_stdout_terminal);
+    #[cfg(windows)]
+    if supported {
+        enable_windows_ansi();
+    }
+    supported
 }
 
 fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {

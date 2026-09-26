@@ -1,6 +1,8 @@
 //! `astro_launcher.bash` launcher integration: argv assembly, policy flags,
 //! logs cleanup, key gating, deploy gating and argument forwarding.
 
+#![cfg(unix)]
+
 mod common;
 
 use common::*;

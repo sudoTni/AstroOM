@@ -216,6 +216,7 @@ pub fn render_strike_frame_custom(
 /// (crest of slate temper blue wave #528ebf and deep quench cobalt #42608a).
 pub const BANNER_MAX_BLUE_TIME_SEC: f64 = 1.58;
 
+#[cfg(unix)]
 pub fn get_terminal_size() -> Option<(u16, u16)> {
     let fd = libc::STDOUT_FILENO;
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -228,6 +229,28 @@ pub fn get_terminal_size() -> Option<(u16, u16)> {
     } else {
         None
     }
+}
+
+#[cfg(windows)]
+pub fn get_terminal_size() -> Option<(u16, u16)> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(handle_id) };
+        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+            if unsafe { GetConsoleScreenBufferInfo(handle, &mut csbi) } != 0 {
+                let rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+                let cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+                if rows > 0 && cols > 0 {
+                    return Some((rows as u16, cols as u16));
+                }
+            }
+        }
+    }
+    None
 }
 
 struct CursorGuard;

@@ -61,22 +61,30 @@ jobs:
           [ "$failed" -eq 0 ] && echo "No personalization residue in prompts."
           exit "$failed"
 
-      # The published artifact must not leak the build machine's layout. Rust
+      # The published artifacts must not leak the build machine's layout. Rust
       # embeds source paths in panic-location strings unless they are remapped.
-      - name: Verify the release binary embeds no build paths
+      - name: Verify release binaries embed no build paths
         run: |
           set -euo pipefail
-          cargo build --release
-          BIN=target/release/astroom
-          for pattern in '/home/' '/Users/' 'C:\\Users' "$HOME"; do
-            if [ -n "$pattern" ] && [ "$pattern" != '/' ] \
-               && strings -a "$BIN" | grep -qF -- "$pattern"; then
-              echo "::error::$BIN embeds '$pattern'. Build with"
-              echo "::error::  RUSTFLAGS=\"--remap-path-prefix=\$PWD=/astroom --remap-path-prefix=\$HOME=/build\""
-              exit 1
+          for BIN in target/release/astroom target/x86_64-pc-windows-gnu/release/astroom.exe; do
+            if [ -f "$BIN" ]; then
+              for pattern in '/home/' '/Users/' 'C:\\Users' "$HOME"; do
+                if [ -n "$pattern" ] && [ "$pattern" != '/' ] \
+                   && strings -a "$BIN" | grep -qF -- "$pattern"; then
+                  echo "::error::$BIN embeds '$pattern'. Build with"
+                  echo "::error::  RUSTFLAGS=\"--remap-path-prefix=\$PWD=/astroom --remap-path-prefix=\$HOME=/build\""
+                  exit 1
+                fi
+              done
             fi
           done
-          echo "Release binary embeds no build paths."
+          echo "Release binaries embed no build paths."
+
+      - name: Verify release binary checksums
+        run: |
+          set -euo pipefail
+          sha256sum -c astroom-*-x86_64-unknown-linux-gnu.sha256
+          sha256sum -c astroom-*-x86_64-pc-windows-gnu.sha256
 
   build:
     name: Build, lint, and test
@@ -84,9 +92,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install MinGW GCC for Windows target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          targets: x86_64-pc-windows-gnu
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -95,14 +109,23 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
-      - name: Clippy
+      - name: Clippy (Linux)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test
+      - name: Clippy (Windows)
+        run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+      - name: Test (Linux)
         run: cargo test
 
-      - name: Release build
+      - name: Test harnesses compilation (Windows)
+        run: cargo test --target x86_64-pc-windows-gnu --no-run
+
+      - name: Release build (Linux)
         run: cargo build --release
+
+      - name: Release build (Windows)
+        run: cargo build --target x86_64-pc-windows-gnu --release
 
       - name: Smoke test
         run: ./target/release/astroom --help

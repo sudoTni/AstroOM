@@ -94,11 +94,13 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
     ]);
     let acquired = data.join("acquired_jobs_indeed.json");
     std::fs::write(&acquired, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
-    // Ensure the fixture is treated exactly like an acquisition artifact.
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&acquired).unwrap().permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(&acquired, perms).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&acquired).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&acquired, perms).unwrap();
+    }
 
     let ctx = context(&data, &logs, &materials, &profile, server.base_url.clone());
 

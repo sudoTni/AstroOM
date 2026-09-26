@@ -8,6 +8,7 @@ use crate::jobrepo::{JobRepository, JobRepositoryConfig, JobRepositoryHealth};
 use crate::presets::load_presets;
 use serde::Serialize;
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -227,10 +228,11 @@ fn verify_directory_writable(directory: &Path) -> bool {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = options
         .open(&probe)
         .and_then(|_| std::fs::remove_file(&probe));
     result.is_ok()

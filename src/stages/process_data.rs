@@ -521,6 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn processing_deduplicates_filters_and_writes_private_manifested_artifact() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
@@ -563,6 +564,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id.as_deref(), Some("one"));
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
             0o600
