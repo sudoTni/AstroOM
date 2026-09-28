@@ -57,63 +57,6 @@ fn an_explicit_override_wins_over_the_compiled_in_key() {
     assert_eq!(overridden, "user-supplied");
 }
 
-/// The external-secret-source tier sits between the CLI flag and the compiled
-/// in public default. Exercised through the explicit-source variant so this
-/// suite never mutates the process environment, which is global and racy under
-/// a parallel test runner; `tests/indeed_api_key_env.rs` covers the actual
-/// `$ASTROOM_INDEED_API_KEY` read in its own process.
-#[test]
-fn the_environment_credential_is_used_when_no_flag_is_given() {
-    assert_eq!(
-        indeed::resolve_indeed_api_key_with(None, Some("env-supplied".to_string())),
-        "env-supplied"
-    );
-    assert_eq!(
-        indeed::resolve_indeed_api_key_with(
-            Some("flag-supplied"),
-            Some("env-supplied".to_string())
-        ),
-        "flag-supplied",
-        "--indeed-api-key must outrank the environment"
-    );
-    assert_eq!(
-        indeed::resolve_indeed_api_key_with(None, None),
-        indeed::DEFAULT_INDEED_CLIENT_KEY,
-        "with neither source set, the compiled-in key must still be used so a \
-         zero-config install keeps scraping"
-    );
-}
-
-#[test]
-fn a_blank_environment_credential_falls_through_instead_of_breaking_acquisition() {
-    for blank in ["", "   ", "\t\n"] {
-        assert_eq!(
-            indeed::resolve_indeed_api_key_with(None, Some(blank.to_string())),
-            indeed::DEFAULT_INDEED_CLIENT_KEY,
-            "an empty {blank:?} value must be treated as absent"
-        );
-        assert_eq!(
-            indeed::resolve_indeed_api_key_with(Some("flag-supplied"), Some(blank.to_string())),
-            "flag-supplied",
-            "a blank environment value must not mask an explicit flag"
-        );
-    }
-}
-
-#[test]
-fn a_surrounded_environment_credential_is_trimmed() {
-    assert_eq!(
-        indeed::resolve_indeed_api_key_with(None, Some("  env-supplied\n".to_string())),
-        "env-supplied"
-    );
-}
-
-#[test]
-fn the_environment_variable_has_a_stable_documented_name() {
-    // Renaming this would silently stop any deployment that sets it.
-    assert_eq!(indeed::INDEED_API_KEY_ENV, "ASTROOM_INDEED_API_KEY");
-}
-
 #[test]
 fn the_key_is_sent_as_the_indeed_api_key_header() {
     // The header name is part of Indeed's request contract; renaming it

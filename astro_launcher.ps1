@@ -132,7 +132,6 @@ if (-not $binary) {
         'Searched, in order:',
         '  $env:ASTROOM_BIN',
         "  $(Join-Path $scriptDir 'astroom.exe')",
-        "  $(Join-Path $scriptDir 'bin\astroom.exe')",
         "  $(Join-Path $scriptDir '..\bin\astroom.exe')",
         "  $(Join-Path $scriptDir 'target\release\astroom.exe')",
         "  $(Join-Path $scriptDir 'target\x86_64-pc-windows-gnu\release\astroom.exe')",
@@ -167,7 +166,15 @@ if ($env:AOM_CLEAN_LOGS -ne '0') {
 # Mirrors astro_launcher.bash exactly. A List[string] is used rather than a
 # string so that every element reaches the process as one argument: spaces,
 # quotes and Unicode survive without any manual escaping.
-$profileDir = if ($env:AOM_PROFILE_DIR) { $env:AOM_PROFILE_DIR } else { Join-Path $scriptDir 'candidate_profile' }
+$profileDir = if ($env:AOM_PROFILE_DIR) {
+    $env:AOM_PROFILE_DIR
+} elseif (Test-Path -LiteralPath (Join-Path $scriptDir 'candidate_data') -PathType Container) {
+    Join-Path $scriptDir 'candidate_data'
+} elseif (Test-Path -LiteralPath (Join-Path $scriptDir 'michael_martini_data') -PathType Container) {
+    Join-Path $scriptDir 'michael_martini_data'
+} else {
+    Join-Path $scriptDir 'candidate_data'
+}
 
 $argsList = [System.Collections.Generic.List[string]]::new()
 function Add-Pair { param([string] $Flag, [string] $Value) $argsList.Add($Flag); $argsList.Add($Value) }

@@ -170,6 +170,8 @@ pub struct RunContext {
     /// When `run-pipeline --track-or-costs` is set, the shared OpenRouter
     /// usage tracker attached to every stage's LLM service for the run.
     pub usage_tracker: Option<Arc<Mutex<OpenRouterUsageTracker>>>,
+    /// Thread-safe run telemetry store for persistent dashboard monitoring.
+    pub telemetry: Arc<crate::telemetry::TelemetryStore>,
     /// Cooperative cancellation for the whole run (signals, watchdog).
     pub cancellation: CancellationToken,
     /// Timestamp (epoch ms) the run started; used for LLM deadline checks.

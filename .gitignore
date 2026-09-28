@@ -1,77 +1,50 @@
-# --- AstroOM .gitignore -----------------------------------------------------
-#
-# NOTE: `bin/` is deliberately NOT ignored. It holds the staged release
-# binaries (bin/astroom, bin/astroom.exe) that ship with the distribution.
-# `target/` below is ignored; `bin/` is the curated, version-controlled copy
-# of what `target/release` produced. Please do not "tidy" this away.
+# AstroOM Distribution & Development .gitignore
 
-# --- Rust / Cargo build output ----------------------------------------------
-# Root-anchored so a nested crate's target/ is handled by its own ignore file.
-/target/
-**/*.rs.bk
+# Cargo build tree
+target/
 
-# --- Runtime state (recreated on first run) ---------------------------------
+# Runtime mutable state (created on demand)
 data/
 logs/
 materials/
 materials-deployed/
-*.log
-*.sqlite
-*.sqlite-*
 
-# Committed Node-generated database compatibility fixture.
-# These negations must stay after the *.sqlite rules above; gitignore
-# negations do not re-include a file if a parent directory is excluded.
-!tests/fixtures/*.sqlite
-!tests/fixtures/*.sqlite-*
+# Private candidate profile data (template candidate_data.example is tracked)
+candidate_data/
+michael_martini_data/
 
-# --- Candidate profile (personal resume/testimonials: never version control) -
-candidate_profile/
-# `candidate_profile.example/` is the shipped template and IS tracked; the
-# trailing slash on the rule above means it cannot match the .example dir.
-
-# --- Credentials and secrets -------------------------------------------------
-# `.env.example` is the documented template and IS tracked.
+# Environment secrets and credentials
 .env
 .env.*
 !.env.example
-.envrc
-*.pem
-*.key
-*.p12
-*.pfx
-*.pfx.bak
-id_rsa
-id_rsa.*
-id_ecdsa*
-id_ed25519*
-credentials.json
-*.kdbx
-secrets.*
 
-# --- Node (differential-oracle generators in tests/differential/) ------------
-# The Node checkout itself is external and not part of this repository.
-node_modules/
-.npm/
+# Local SQLite databases and write-ahead logs
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
 
-# --- Editor / IDE local state ------------------------------------------------
-.vscode/
-.idea/
-.fleet/
+# Runtime execution and payload logs
+*.log
+
+# Shipped test fixtures (explicit exceptions)
+!tests/fixtures/*.sqlite
+!tests/fixtures/*.sqlite-*
+
+# Distribution binaries in ./bin/
+# Distributable release binaries are tracked; intermediate/temporary build files are excluded
+bin/*
+!bin/astroom
+!bin/astroom.exe
+!bin/.gitkeep
+
+# Operating system and editor metadata
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
-*.bak
-*.orig
-*.rej
-
-# --- OS metadata -------------------------------------------------------------
-.DS_Store
-.DS_Store?
-**/.DS_Store
-._*
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-$RECYCLE.BIN/
-*.lnk
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace

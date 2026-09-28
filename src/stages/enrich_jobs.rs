@@ -9,6 +9,7 @@ use crate::context::{abortable_delay, RunContext};
 use crate::error::Result;
 use crate::jobrepo::{JobIdentity, JobRepository, JobRepositoryConfig};
 use crate::models::JobInterface;
+use crate::telemetry::StageMetrics;
 use crate::types::LogLevel;
 use serde::Serialize;
 use serde_json::json;
@@ -63,6 +64,7 @@ pub async fn run(ctx: &RunContext, options: &EnrichJobsOptions) -> Result<Enrich
         .map(|(index, _)| index)
         .collect();
     let total_to_enrich = targets.len();
+    ctx.telemetry.set_progress_total(total_to_enrich as u64);
     crate::logging::log_kv(
         "EnrichJobs",
         &format!(
@@ -82,6 +84,13 @@ pub async fn run(ctx: &RunContext, options: &EnrichJobsOptions) -> Result<Enrich
             abortable_delay(options.delay_ms, &ctx.cancellation).await?;
         }
         let job = &mut jobs[*index];
+        ctx.telemetry.item_started(
+            Some((step + 1) as u64),
+            Some(total_to_enrich as u64),
+            job.title.clone(),
+            job.company.clone(),
+        );
+        let item_start = Instant::now();
         let raw_id = job
             .source_job_id
             .as_deref()
@@ -91,6 +100,12 @@ pub async fn run(ctx: &RunContext, options: &EnrichJobsOptions) -> Result<Enrich
         let Some(id) = extract_job_id_from_url(job.url.as_deref().unwrap_or(""))
             .or_else(|| (!raw_id.is_empty()).then(|| raw_id.to_string()))
         else {
+            ctx.telemetry.item_completed(None);
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::EnrichJobs { skipped, .. } = m {
+                    *skipped = skipped.saturating_add(1);
+                }
+            });
             crate::logging::log(
                 "EnrichJobs",
                 &format!(
@@ -147,6 +162,12 @@ pub async fn run(ctx: &RunContext, options: &EnrichJobsOptions) -> Result<Enrich
                 job.img = details.img;
             }
             enriched_count += 1;
+            ctx.telemetry.item_completed(Some(item_start.elapsed()));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::EnrichJobs { enriched, .. } = m {
+                    *enriched = enriched.saturating_add(1);
+                }
+            });
             // Node counts the enrichment first, then best-effort records the DB
             // checkpoint and downgrades any repository error to a warning.
             if let Err(error) = repository.mark_job_description_scraped(&identity(job)) {
@@ -189,35 +210,43 @@ pub async fn run(ctx: &RunContext, options: &EnrichJobsOptions) -> Result<Enrich
                     ],
                 );
             }
-        } else if show_fetch_url {
-            crate::logging::log_kv(
-                "EnrichJobs",
-                &format!(
-                    "Stage 4/8: [enrich][linkedin] {}/{total_to_enrich} No description retrieved for \"{title}\" at \"{company}\" (jobId: {id}, url: https://www.linkedin.com/jobs/view/{id})",
-                    step + 1
-                ),
-                LogLevel::Warn,
-                &[
-                    ("step", json!(step + 1)),
-                    ("total", json!(total_to_enrich)),
-                    ("jobId", json!(id)),
-                    ("url", json!(format!("https://www.linkedin.com/jobs/view/{id}"))),
-                ],
-            );
         } else {
-            crate::logging::log_kv(
-                "EnrichJobs",
-                &format!(
-                    "Stage 4/8: [enrich][linkedin] {}/{total_to_enrich} No description retrieved for \"{title}\" at \"{company}\" (jobId: {id})",
-                    step + 1
-                ),
-                LogLevel::Warn,
-                &[
-                    ("step", json!(step + 1)),
-                    ("total", json!(total_to_enrich)),
-                    ("jobId", json!(id)),
-                ],
-            );
+            ctx.telemetry.item_completed(Some(item_start.elapsed()));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::EnrichJobs { fetch_failures, .. } = m {
+                    *fetch_failures = fetch_failures.saturating_add(1);
+                }
+            });
+            if show_fetch_url {
+                crate::logging::log_kv(
+                    "EnrichJobs",
+                    &format!(
+                        "Stage 4/8: [enrich][linkedin] {}/{total_to_enrich} No description retrieved for \"{title}\" at \"{company}\" (jobId: {id}, url: https://www.linkedin.com/jobs/view/{id})",
+                        step + 1
+                    ),
+                    LogLevel::Warn,
+                    &[
+                        ("step", json!(step + 1)),
+                        ("total", json!(total_to_enrich)),
+                        ("jobId", json!(id)),
+                        ("url", json!(format!("https://www.linkedin.com/jobs/view/{id}"))),
+                    ],
+                );
+            } else {
+                crate::logging::log_kv(
+                    "EnrichJobs",
+                    &format!(
+                        "Stage 4/8: [enrich][linkedin] {}/{total_to_enrich} No description retrieved for \"{title}\" at \"{company}\" (jobId: {id})",
+                        step + 1
+                    ),
+                    LogLevel::Warn,
+                    &[
+                        ("step", json!(step + 1)),
+                        ("total", json!(total_to_enrich)),
+                        ("jobId", json!(id)),
+                    ],
+                );
+            }
         }
     }
     if let Some(parent) = options.output_file.parent() {

@@ -7,7 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_astroom"))
+    let p = PathBuf::from(env!("CARGO_BIN_EXE_astroom"));
+    if p.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(p);
+        }
+    }
+    p
 }
 
 pub struct Sandbox {

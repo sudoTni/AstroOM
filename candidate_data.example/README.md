@@ -4,16 +4,16 @@ Copy this directory to create your own profile, then replace every file.
 
 ```bash
 # Linux / macOS
-cp -r candidate_profile.example candidate_profile
+cp -r candidate_data.example candidate_data
 
 # Windows (PowerShell)
-Copy-Item -Recurse candidate_profile.example candidate_profile
+Copy-Item -Recurse candidate_data.example candidate_data
 ```
 
 Then point AstroOM at it:
 
 ```bash
-astroom preflight --profile-dir ./candidate_profile --json
+astroom preflight --profile-dir ./candidate_data --json
 ```
 
 `preflight` fails until the two required files exist and are non-empty, so it is
@@ -23,7 +23,7 @@ Every file here is placeholder text. Replace all of it: AstroOM sends this
 content to whichever LLM provider your preset names, and the generated
 application materials will otherwise describe the placeholder.
 
-`candidate_profile/` is git-ignored. Keep your résumé and testimonials out of
+`candidate_data/` is git-ignored. Keep your résumé and testimonials out of
 version control and out of bug reports.
 
 ## A sharp edge: comment syntax

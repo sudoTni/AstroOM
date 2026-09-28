@@ -53,6 +53,7 @@ fn context(
         llm_base_url_override: Some(base_url),
         indeed_api_key: None,
         usage_tracker: None,
+        telemetry: std::sync::Arc::new(astroom::telemetry::TelemetryStore::new()),
         cancellation: tokio_util::sync::CancellationToken::new(),
         run_started_at_ms: 0,
     }
@@ -197,6 +198,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
             provider_routing: None,
             show_reasoning: false,
             show_stream: false,
+            concurrent: 1,
         },
     )
     .await
@@ -239,6 +241,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
             show_reasoning: false,
             show_stream: false,
             suppress_errors: false,
+            concurrent: 1,
         },
     )
     .await

@@ -40,7 +40,7 @@ Terminal captures are in [`screenshots/`](screenshots).
 ## Privacy & Data Handling
 
 - **AstroOM has no telemetry.** Nothing is phoned home except the requests you explicitly make to the job boards and to your configured LLM provider.
-- **Your personal data lives in one place:** the candidate profile directory, `candidate_profile/` by default. The application only reads it; it never writes to it and never bundles it into a release.
+- **Your personal data lives in one place:** the candidate profile directory, `candidate_data/` by default. The application only reads it; it never writes to it and never bundles it into a release.
 - **The profile directory is git-ignored.** Keep your résumé and testimonials out of version control and out of bug reports.
 - Profile text is sent to whichever LLM provider your preset names (the shipped presets target OpenRouter). Treat it the same way you would any data you submit to a third-party API.
 - A public Indeed mobile client key is compiled into the binary; it is not a user secret. See "Credentials" below.
@@ -146,31 +146,32 @@ cargo build --release        # -> target/release/astroom
 # Windows (PowerShell)
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
-#   -> target\x86_64-pc-windows-gnu\release\astroom.exe
+#   -> target_64-pc-windows-gnu
+eleasestroom.exe
 ```
 
 Cross-compiling from Linux to `x86_64-pc-windows-gnu` works with the same command as long as MinGW-w64 is installed (`x86_64-w64-mingw32-gcc`). No `.cargo/config.toml` is required: rustc's target specification already selects the MinGW linker for this target.
 
 ### 2. Candidate Profile Setup
 
-AstroOM keeps all personal job-search data outside the code, in a candidate profile directory. It defaults to `candidate_profile/` and is selected with `--profile-dir`. The repository ships an annotated template — copy it and replace every file:
+AstroOM keeps all personal job-search data outside the code, in a candidate profile directory. It defaults to `candidate_data/` and is selected with `--profile-dir`. The repository ships an annotated template — copy it and replace every file:
 
 ```bash
 # Linux / macOS
-cp -r candidate_profile.example candidate_profile
+cp -r candidate_data.example candidate_data
 
 # Windows (PowerShell)
-Copy-Item -Recurse candidate_profile.example candidate_profile
+Copy-Item -Recurse candidate_data.example candidate_data
 ```
 
-See [`candidate_profile.example/README.md`](candidate_profile.example/README.md) for the copy step and a per-field description. You can point `--profile-dir` at any other location if you would rather keep it elsewhere:
+See [`candidate_data.example/README.md`](candidate_data.example/README.md) for the copy step and a per-field description. You can point `--profile-dir` at any other location if you would rather keep it elsewhere:
 
 ```bash
 # Linux
-./target/release/astroom preflight --profile-dir ~/job-search-profile --json
+./bin/astroom preflight --profile-dir ~/job-search-profile --json
 
 # Windows (PowerShell)
-.\astroom.exe preflight --profile-dir $HOME\job-search-profile --json
+.\bin\astroom.exe preflight --profile-dir $HOME\job-search-profile --json
 ```
 
 `preflight` fails until the two required files exist and are non-empty, so it is the fastest way to confirm the profile is wired up before spending any tokens. The directory must contain these files:
@@ -186,18 +187,16 @@ See [`candidate_profile.example/README.md`](candidate_profile.example/README.md)
 | `company_filters.txt` | no | Company/agency names to exclude (case-insensitive substring match). |
 | `title_filters.txt` | no | Title keywords to exclude (case-insensitive substring match). |
 
-> Everything in `candidate_profile.example/` is placeholder text. Replace all of it, or the generated application materials will describe the placeholder rather than you.
-
-> **Upgrading from an older checkout?** The default profile directory is now `candidate_profile/`, and only the new name is covered by `.gitignore`. If you still have a personal profile directory under the previous name, **rename it** (or move it outside the checkout and keep passing `--profile-dir`). Leaving it in place is not safe: it is no longer git-ignored, so a `git add .` would stage your résumé and testimonials.
+> Everything in `candidate_data.example/` is placeholder text. Replace all of it, or the generated application materials will describe the placeholder rather than you.
 
 ### 3. Credentials
 
-AstroOM reads **no behavioural configuration from the environment.** Every setting reaches it through an explicit CLI flag, passed with either:
+AstroOM reads **no configuration from the environment.** Every setting reaches it through an explicit CLI flag, passed with either:
 
 - `--api-key "<YOUR_KEY>"`, or
 - `--api-key-file /path/to/key` (mutually exclusive with `--api-key`).
 
-The only variables AstroOM consults itself are the optional `ASTROOM_HOME` and `ASTROOM_RESOURCE_DIR` path overrides described under *Where AstroOM looks for things*, the optional `ASTROOM_INDEED_API_KEY` Indeed credential override, plus `TERM` / `NO_COLOR` / `CI` for terminal-capability detection. None of them can change what the application does beyond where it reads and writes.
+The only two variables AstroOM consults itself are the optional `ASTROOM_HOME` and `ASTROOM_RESOURCE_DIR` path overrides described under *Where AstroOM looks for things*, plus `TERM` / `NO_COLOR` / `CI` for terminal-capability detection. None of them can change what the application does beyond where it reads and writes.
 
 For convenience the wrapper scripts (`astro_launcher.bash` / `astro_launcher.ps1`) read `AOM_OR_API_KEY` from a local `.env` and forward it:
 
@@ -215,7 +214,7 @@ notepad .env          # set AOM_OR_API_KEY
 
 `.env` is git-ignored. Never commit a real key; rotate any key that is ever committed or shared.
 
-The Indeed scraper uses a public Indeed mobile client key that is compiled into the binary, so a relocated binary scrapes exactly like an in-tree one and no configuration is required. It is not a user secret: Indeed's own mobile application ships the same identifier to every device. If you would rather keep the credential in a secret manager than rely on the compiled-in value, set `ASTROOM_INDEED_API_KEY` (it may be placed in the same git-ignored `.env`, which `astro_launcher.bash` / `astro_launcher.ps1` source for you) or pass `--indeed-api-key` on the command line. Precedence is `--indeed-api-key`, then `ASTROOM_INDEED_API_KEY`, then the compiled-in key; a blank value at either level is ignored rather than sent.
+The Indeed scraper uses a public Indeed mobile client key that is compiled into the binary. It is not a user secret, and it is deliberately not read from `.env` or the environment: a relocated binary therefore scrapes exactly like an in-tree one. Supply your own with `--indeed-api-key` if you have an Indeed API credential.
 
 ### 4. Running the Pipeline
 
@@ -236,10 +235,11 @@ Run the full 8-phase pipeline with the wrapper script:
 Both launchers find the executable in this order, so a relocated install works without editing anything:
 
 1. `$ASTROOM_BIN` (`$env:ASTROOM_BIN` on Windows)
-2. `astroom` / `astroom.exe` next to the launcher
-3. `../bin/astroom`
-4. `target/release/astroom` (and `target/x86_64-pc-windows-gnu/release/astroom.exe`)
-5. `astroom` on `PATH`
+2. `bin/astroom` / `bin/astroom.exe`
+3. `astroom` / `astroom.exe` next to the launcher
+4. `../bin/astroom`
+5. `target/release/astroom` (and `target/x86_64-pc-windows-gnu/release/astroom.exe`)
+6. `astroom` on `PATH`
 
 If none exists the launcher prints every location it searched and exits 1 — *before* it deletes the previous run's logs.
 
@@ -259,9 +259,9 @@ Or invoke the binary directly:
 
 ```bash
 # Linux
-./target/release/astroom run-pipeline \
+./bin/astroom run-pipeline \
   --job-provider indeed,linkedin \
-  --profile-dir ./candidate_profile \
+  --profile-dir ./candidate_data \
   --api-key "<YOUR_KEY>" \
   --jobcloth-preset jc_glm-5.3-flash \
   --remoteeval-preset re_glm-5.3-flash \
@@ -272,9 +272,9 @@ Or invoke the binary directly:
 
 ```powershell
 # Windows (PowerShell)
-.\target\x86_64-pc-windows-gnu\release\astroom.exe run-pipeline `
+.\bin\astroom.exe run-pipeline `
   --job-provider indeed,linkedin `
-  --profile-dir .\candidate_profile `
+  --profile-dir .\candidate_data `
   --api-key "<YOUR_KEY>" `
   --jobcloth-preset jc_glm-5.3-flash `
   --remoteeval-preset re_glm-5.3-flash `
@@ -287,12 +287,12 @@ Validate the setup before spending any tokens:
 
 ```bash
 # Linux
-./target/release/astroom preflight --profile-dir ./candidate_profile --json
+./bin/astroom preflight --profile-dir ./candidate_data --json
 ```
 
 ```powershell
 # Windows (PowerShell)
-.\target\x86_64-pc-windows-gnu\release\astroom.exe preflight --profile-dir .\candidate_profile --json
+.\bin\astroom.exe preflight --profile-dir .\candidate_data --json
 ```
 
 ---
@@ -311,7 +311,7 @@ All subcommands support `--help` for comprehensive option listings.
 | `jobJudge` | Score and filter jobs based on candidate gates and alignment rules |
 | `makeMaterials` | Generate optimized, tailored resumes and cover letters for qualified opportunities |
 | `preflight` | Validate system prerequisites, runtime paths, API keys, and model presets |
-| `jobdb` | Inspect the local SQLite deduplication repository (`status`, `verify`, `backup`, `rotate-backups`) |
+| `jobDb` | Inspect the local SQLite deduplication repository (`status`, `verify`, `backup`, `rotate-backups`) |
 | `artifact` | Verify an artifact against its companion SHA-256 manifest (`artifact verify <file>`) |
 
 **Stage 5 (Remote Eval) has no standalone subcommand.** It runs inside `run-pipeline` when `--remote-only` is enabled, which is the only supported way to use it.
@@ -400,7 +400,7 @@ Relative paths you type on the command line always resolve against your current 
 
 The ancestor search is what keeps in-tree development working: `target/release/astroom` walks up to the repository root. **No build-machine path is compiled into the binary.** When a resource directory genuinely cannot be found, AstroOM says so and lists every location it searched, rather than falling back to a wrong directory or writing data somewhere unexpected.
 
-`ASTROOM_HOME`, `ASTROOM_RESOURCE_DIR` and `ASTROOM_INDEED_API_KEY` are the only environment variables AstroOM reads, and they are all optional — every command works with zero configuration. All other configuration reaches the application through explicit CLI flags.
+`ASTROOM_HOME` and `ASTROOM_RESOURCE_DIR` are the only environment variables AstroOM reads, and they are optional — every command works with zero configuration. All other configuration reaches the application through explicit CLI flags.
 
 ### Reproducible releases
 
@@ -409,9 +409,7 @@ The ancestor search is what keeps in-tree development working: `target/release/a
 AstroOM no longer embeds its application root at compile time, so a relocated binary needs no `RUSTFLAGS`. Rust still records source paths in panic-location strings, which is harmless debug metadata but does leak the builder's directory layout. If that matters to you, remap it:
 
 ```bash
-# Order matters: list the general prefix first and the more specific one last,
-# or the general rule wins and the project directory name survives.
-RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$(pwd)=/astroom" \
+RUSTFLAGS="--remap-path-prefix=$(pwd)=/astroom --remap-path-prefix=$HOME=/build" \
   cargo build --release
 sha256sum target/release/astroom > astroom-$(cat VERSION)-x86_64-unknown-linux-gnu.sha256
 ```
@@ -420,10 +418,7 @@ To confirm no *runtime* build path survived, check that the only absolute paths 
 
 ```bash
 strings -a target/release/astroom | grep -c 'AstroOM-rust'   # 0 expected at runtime
-strings -a target/release/astroom | grep -c "$HOME"          # 0 expected at runtime
 ```
-
-> **Cross-compiling to Windows?** The MinGW linker mangles the *import-library file path* into PE symbol names, and `--remap-path-prefix` is a `rustc` flag that cannot reach them. Build the `.exe` from a directory whose path contains no user or machine name (a container or CI workspace works well), otherwise the builder's home directory is embedded in the artifact.
 
 ---
 

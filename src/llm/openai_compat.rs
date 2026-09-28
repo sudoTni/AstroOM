@@ -44,6 +44,10 @@ pub(crate) fn shared_client() -> crate::error::Result<&'static reqwest::Client> 
         "X-Title",
         reqwest::header::HeaderValue::from_static("AstroOM"),
     );
+    headers.insert(
+        "X-OpenRouter-Metadata",
+        reqwest::header::HeaderValue::from_static("enabled"),
+    );
     // A TLS backend that cannot initialise (missing or incompatible OpenSSL on
     // a musl host, a FIPS-restricted host) is a runtime configuration problem,
     // not a programming error, so it is reported rather than panicked. The
@@ -149,7 +153,7 @@ async fn send_chat_completion(
     provider_config: &ProviderConfig,
     body: &Value,
     timeout_ms: u64,
-) -> Result<Value> {
+) -> Result<(Value, Option<String>)> {
     let url = format!(
         "{}/chat/completions",
         provider_config.base_url.trim_end_matches('/')
@@ -167,6 +171,12 @@ async fn send_chat_completion(
         }
     }?;
     let status = response.status();
+    let upstream_provider = response
+        .headers()
+        .get("x-openrouter-provider")
+        .or_else(|| response.headers().get("x-provider-name"))
+        .and_then(|val| val.to_str().ok())
+        .map(str::to_string);
     if !status.is_success() {
         // A failed body read must not erase the diagnostics that explain why
         // the provider rejected the request.
@@ -181,10 +191,11 @@ async fn send_chat_completion(
             format!("Provider API error (HTTP {}): {}", status.as_u16(), snippet),
         ));
     }
-    response
+    let body = response
         .json::<Value>()
         .await
-        .map_err(|error| AppError::new("LLM_CALL_FAILED", 500, error.to_string()))
+        .map_err(|error| AppError::new("LLM_CALL_FAILED", 500, error.to_string()))?;
+    Ok((body, upstream_provider))
 }
 
 /// Result of parsing a non-streaming response body: the response plus a flag
@@ -239,6 +250,24 @@ pub fn parse_non_streaming_response(
         }
     }
 
+    let body_provider = response_body
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            response_body
+                .get("openrouter_metadata")
+                .and_then(|m| m.get("summary"))
+                .and_then(Value::as_str)
+                .and_then(|summary| {
+                    summary.split(',').find_map(|part| {
+                        let trimmed = part.trim();
+                        trimmed.strip_prefix("selected=").map(str::to_string)
+                    })
+                })
+        });
+
     let usage = response_body.get("usage").filter(|u| u.is_object());
     if usage.is_none() {
         return NonStreamingOutcome {
@@ -263,6 +292,7 @@ pub fn parse_non_streaming_response(
                         .unwrap_or(&request.model)
                         .to_string(),
                 ),
+                upstream_provider: body_provider,
             },
             usage_missing: true,
         };
@@ -393,6 +423,7 @@ pub fn parse_non_streaming_response(
                     .unwrap_or(&request.model)
                     .to_string(),
             ),
+            upstream_provider: body_provider,
         },
         usage_missing: false,
     }
@@ -410,6 +441,7 @@ pub async fn call_openai_compatible(
     request: &LlmRequest,
     tracker: Option<&Arc<Mutex<OpenRouterUsageTracker>>>,
 ) -> Result<LlmResponse> {
+    let mut last_stream_error: Option<AppError> = None;
     if request.show_reasoning_tokens || request.show_response_stream {
         let include_usage = request.provider == Provider::Openrouter && tracker.is_some();
         let body = build_request_body(request.provider, request, true, include_usage);
@@ -465,6 +497,7 @@ pub async fn call_openai_compatible(
                             error.message
                         ),
                     );
+                    last_stream_error = Some(error);
                     break;
                 }
             }
@@ -472,13 +505,37 @@ pub async fn call_openai_compatible(
     }
 
     let body = build_request_body(request.provider, request, false, false);
-    let response_body =
-        send_chat_completion(ctx, provider_config, &body, request.timeout_ms).await?;
-    let outcome = parse_non_streaming_response(
+    // Non-streaming fallback for reasoning models must not be constrained by a
+    // tight streaming timeout (which only had to wait for the first token).
+    // Ensure at least 120s timeout for fallback to complete full generation.
+    let fallback_timeout_ms = if last_stream_error.is_some() {
+        request.timeout_ms.max(120_000)
+    } else {
+        request.timeout_ms
+    };
+    let (response_body, upstream_provider) =
+        match send_chat_completion(ctx, provider_config, &body, fallback_timeout_ms).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if let Some(stream_err) = last_stream_error {
+                    return Err(AppError::new(
+                        &err.code,
+                        err.status_code,
+                        format!(
+                            "{} (initial streaming error: {})",
+                            err.message, stream_err.message
+                        ),
+                    ));
+                }
+                return Err(err);
+            }
+        };
+    let mut outcome = parse_non_streaming_response(
         request,
         &response_body,
         ctx.diagnostics.log_max_payload_length,
     );
+    outcome.response.upstream_provider = upstream_provider.or(outcome.response.upstream_provider);
 
     if outcome.usage_missing {
         // Node only raises the OpenRouter usage-unavailable identity while a
@@ -773,5 +830,32 @@ mod tests {
         });
         let outcome = parse_non_streaming_response(&req, &body, None);
         assert_eq!(outcome.response.content, "short");
+    }
+
+    #[test]
+    fn upstream_provider_parsed_from_body() {
+        let req = request(Provider::Openrouter);
+        let body = json!({
+            "provider": "BaseTen",
+            "choices": [{"message": {"content": "short"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        });
+        let outcome = parse_non_streaming_response(&req, &body, None);
+        assert_eq!(
+            outcome.response.upstream_provider.as_deref(),
+            Some("BaseTen")
+        );
+
+        // Fallback to openrouter_metadata summary
+        let body_meta = json!({
+            "openrouter_metadata": {"summary": "available=4, attempts=1, selected=GMICloud"},
+            "choices": [{"message": {"content": "short"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        });
+        let outcome_meta = parse_non_streaming_response(&req, &body_meta, None);
+        assert_eq!(
+            outcome_meta.response.upstream_provider.as_deref(),
+            Some("GMICloud")
+        );
     }
 }

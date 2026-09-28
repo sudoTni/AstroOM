@@ -182,6 +182,8 @@ struct JobClothArgs {
     show_stream: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = parse_bool)]
     show_stream_tokens: Option<bool>,
+    #[arg(long, visible_alias = "jc-concurrent", default_value_t = 3)]
+    concurrent: usize,
 }
 
 #[derive(Debug, Args)]
@@ -230,6 +232,8 @@ struct JobJudgeArgs {
     show_stream: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = parse_bool)]
     show_stream_tokens: Option<bool>,
+    #[arg(long, visible_alias = "jj-concurrent", default_value_t = 3)]
+    concurrent: usize,
 }
 
 #[derive(Debug, Args)]
@@ -276,6 +280,8 @@ struct MakeMaterialsArgs {
     show_stream: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = parse_bool)]
     show_stream_tokens: Option<bool>,
+    #[arg(long, visible_alias = "mm-concurrent", default_value_t = 3)]
+    concurrent: usize,
 }
 #[derive(Debug, Args)]
 struct RunPipelineArgs {
@@ -351,6 +357,19 @@ struct RunPipelineArgs {
     mm_provider_quant: Option<String>,
     #[arg(long = "astro_auto_provider-top")]
     astro_auto_provider_top: Option<u32>,
+    #[arg(long, default_value_t = 3)]
+    jc_concurrent: usize,
+    #[arg(long, default_value_t = 3)]
+    re_concurrent: usize,
+    #[arg(long, default_value_t = 3)]
+    jj_concurrent: usize,
+    #[arg(
+        long = "mm-concurrent",
+        alias = "mm_concurrent",
+        visible_alias = "mm-concurrent",
+        default_value_t = 3
+    )]
+    mm_concurrent: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -634,7 +653,10 @@ fn initialize_banner(
     }
     let use_color = context.display.use_color();
     if crate::logging::footer::is_supported(use_color) {
-        return crate::logging::footer::install(use_color);
+        return crate::logging::footer::install(
+            use_color,
+            Some(std::sync::Arc::clone(&context.telemetry)),
+        );
     }
     // Fallback: the historical bounded animation, byte-for-byte.
     crate::utils::display_banner(use_color, context.display.banner_loops);
@@ -737,6 +759,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                 show_reasoning: context.display.show_reasoning,
                 show_stream: args.show_stream.unwrap_or(false)
                     || args.show_stream_tokens.unwrap_or(false),
+                concurrent: args.concurrent,
             };
             let _ = (
                 args.base_url,
@@ -810,6 +833,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                 show_reasoning: context.display.show_reasoning,
                 show_stream: args.show_stream.unwrap_or(false)
                     || args.show_stream_tokens.unwrap_or(false),
+                concurrent: args.concurrent,
             };
             if options.max_tokens == Some(0) {
                 return Err(AppError::message("--max-tokens must be positive"));
@@ -852,6 +876,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                 show_stream: args.show_stream.unwrap_or(false)
                     || args.show_stream_tokens.unwrap_or(false),
                 suppress_errors: false,
+                concurrent: args.concurrent,
             };
             let _ = (
                 args.max_retries,
@@ -907,6 +932,10 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                     provider_quant_remoteeval: optional_list(args.re_provider_quant),
                     provider_quant_jobjudge: optional_list(args.jj_provider_quant),
                     provider_quant_makematerials: optional_list(args.mm_provider_quant),
+                    jc_concurrent: args.jc_concurrent,
+                    re_concurrent: args.re_concurrent,
+                    jj_concurrent: args.jj_concurrent,
+                    mm_concurrent: args.mm_concurrent,
                 },
             )?;
             let runtime = tokio::runtime::Runtime::new()
@@ -980,7 +1009,7 @@ mod tests {
             "--job-provider",
             "indeed,linkedin",
             "--search-terms-file",
-            "/p/candidate_profile/search_terms.txt",
+            "/p/candidate_data/search_terms.txt",
             "--api-key",
             "test-key",
             "--jobcloth-preset",

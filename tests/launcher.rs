@@ -42,7 +42,7 @@ impl Launcher {
         install_launcher(sandbox.path());
         std::fs::write(sandbox.path().join(".env"), env_contents).unwrap();
 
-        let profile = sandbox.sub("candidate_profile");
+        let profile = sandbox.sub("candidate_data");
         std::fs::write(profile.join("search_terms.txt"), "engineer\n").unwrap();
 
         // A pre-existing log file must be wiped by the launcher.

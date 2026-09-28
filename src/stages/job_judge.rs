@@ -13,12 +13,13 @@ use crate::presets::{
     get_preset, load_and_replace_prompt_template, load_presets, load_veritas_system_prompt,
 };
 use crate::statistics::create_statistics_collector;
+use crate::telemetry::StageMetrics;
 use crate::types::{LogLevel, ProviderRouting};
 use crate::utils::progress::{CompleteOptions, ProgressOptions, ProgressReporter};
 use crate::utils::shared::{load_application_data, normalize_job_analysis_record};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -38,6 +39,7 @@ pub struct JobJudgeOptions {
     pub show_reasoning: bool,
     /// Node `showResponseStream` (standalone default false; pipeline default true).
     pub show_stream: bool,
+    pub concurrent: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +393,7 @@ async fn evaluate(
                     timeout_ms: 30_000,
                     show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
                     show_response_stream: options.show_stream,
+                    suppress_stream_display: options.concurrent > 1,
                     reasoning_effort: options.reasoning_effort.clone(),
                     provider_routing: options.provider_routing.clone(),
                     json_mode: true,
@@ -401,13 +404,19 @@ async fn evaluate(
             .await
             .and_then(|r| parse_results(&r.content))
         {
-            Ok(results) => return Ok((results.into_iter().next().unwrap(), false, attempt)),
+            Ok(results) => {
+                if attempt > 0 {
+                    ctx.telemetry.retry_streak_reset();
+                }
+                return Ok((results.into_iter().next().unwrap(), false, attempt));
+            }
             Err(error) => {
                 if ctx.cancellation.is_cancelled() {
                     return Err(error);
                 }
                 last = Some(error);
                 if attempt < 2 {
+                    ctx.telemetry.retry_recorded();
                     abortable_delay(2_u64.pow((attempt + 1) as u32) * 1000, &ctx.cancellation)
                         .await?;
                 }
@@ -633,135 +642,469 @@ pub async fn run(ctx: &RunContext, options: &JobJudgeOptions) -> Result<JobJudge
                 ctx.now_ms() as i64,
             )?;
         }
-        for job in entries {
-            current_job_index += 1;
-            crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
-            let id = job.id.as_deref().unwrap();
-            if processed.contains(id) {
+        if options.concurrent > 1 && !entries.is_empty() {
+            let queue = std::sync::Arc::new(tokio::sync::Mutex::new(VecDeque::from(entries)));
+            let repo_shared = std::sync::Arc::new(std::sync::Mutex::new(repo));
+            let stats_shared = std::sync::Arc::new(std::sync::Mutex::new(stats));
+            let progress_shared = std::sync::Arc::new(std::sync::Mutex::new(progress));
+            let passed_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(passed));
+            let current_job_index_shared =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(current_job_index));
+            let fatal_error: std::sync::Arc<std::sync::Mutex<Option<AppError>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let concurrency = options.concurrent.min(file_jobs).max(1);
+
+            let service = &service;
+            let preset = &preset;
+            let app = &app;
+            let system = &system;
+            let pass_dir = &pass_dir;
+            let fail_dir = &fail_dir;
+            let dupe_dir = &dupe_dir;
+            let hash_ref = hash.as_deref();
+
+            let mut workers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> =
+                Vec::new();
+            for _ in 0..concurrency {
+                let queue = queue.clone();
+                let repo_shared = repo_shared.clone();
+                let stats_shared = stats_shared.clone();
+                let progress_shared = progress_shared.clone();
+                let passed_shared = passed_shared.clone();
+                let current_job_index_shared = current_job_index_shared.clone();
+                let fatal_error = fatal_error.clone();
+                let processed = &processed;
+
+                workers.push(Box::pin(async move {
+                    loop {
+                        if ctx.cancellation.is_cancelled() || fatal_error.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let job = {
+                            let mut q = queue.lock().await;
+                            q.pop_front()
+                        };
+                        let Some(job) = job else { break };
+                        let this_job_index = current_job_index_shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let id = job.id.as_deref().unwrap();
+                        if processed.contains(id) {
+                            ctx.telemetry.item_completed(None);
+                            ctx.telemetry.update_stage_metrics(|m| {
+                                if let StageMetrics::JobJudge { pending, .. } = m {
+                                    *pending = pending.saturating_sub(1);
+                                }
+                            });
+                            progress_shared.lock().unwrap().complete_with_context(
+                                &[
+                                    ("jobId", json!(job.id)),
+                                    ("jobTitle", json!(job.title)),
+                                    ("outcome", json!("checkpoint_skip")),
+                                ],
+                                CompleteOptions {
+                                    suffix: Some("already judged from checkpoint".to_string()),
+                                    ..Default::default()
+                                },
+                            );
+                            continue;
+                        }
+                        let outcome: &str;
+                        let mut suffix: Option<&str> = None;
+                        let mut warn = false;
+                        let clean = sanitize_job_for_evaluation(&job);
+                        let file_name = filename(&job);
+                        let job_identity = identity(&job);
+                        let is_dupe = match repo_shared.lock().unwrap().is_job_matched(&job_identity) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        };
+                        if is_dupe {
+                            ctx.telemetry.item_completed(None);
+                            ctx.telemetry.update_stage_metrics(|m| {
+                                if let StageMetrics::JobJudge { rejected, pending, .. } = m {
+                                    *rejected = rejected.saturating_add(1);
+                                    *pending = pending.saturating_sub(1);
+                                }
+                            });
+                            let mut output = match serde_json::to_value(clean) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    *fatal_error.lock().unwrap() = Some(e.into());
+                                    return;
+                                }
+                            };
+                            output
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("evaluationResult".into(), json!({"duplicate": true}));
+                            if let Err(e) = write_private_file(
+                                &dupe_dir.join(file_name),
+                                serde_json::to_string_pretty(&output).unwrap().as_bytes(),
+                            ) {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                            stats_shared.lock().unwrap().increment_counter("data.duplicatesRemoved");
+                            outcome = "duplicate";
+                            suffix = Some("duplicate skipped");
+                        } else if job
+                            .description_text
+                            .as_deref()
+                            .is_none_or(|text| text.trim().is_empty())
+                        {
+                            ctx.telemetry.item_completed(None);
+                            ctx.telemetry.update_stage_metrics(|m| {
+                                if let StageMetrics::JobJudge { rejected, pending, .. } = m {
+                                    *rejected = rejected.saturating_add(1);
+                                    *pending = pending.saturating_sub(1);
+                                }
+                            });
+                            stats_shared.lock().unwrap().increment_counter("data.recordsFiltered");
+                            outcome = "no_description";
+                            suffix = Some("no description skipped");
+                            warn = true;
+                        } else {
+                            ctx.telemetry.item_started(
+                                Some(this_job_index as u64),
+                                Some(total as u64),
+                                job.title.clone(),
+                                job.company.clone(),
+                            );
+                            let call_progress_str = format!("{}/{}", this_job_index, total);
+                            crate::logging::log_kv(
+                                "JobJudge",
+                                &format!(
+                                    "Evaluating alignment for job {}/{}: \"{}\"",
+                                    this_job_index,
+                                    total,
+                                    job.title.as_deref().unwrap_or("Untitled")
+                                ),
+                                LogLevel::Info,
+                                &[
+                                    ("jobIndex", json!(this_job_index)),
+                                    ("totalJobs", json!(total)),
+                                    ("jobId", json!(job.id)),
+                                    ("jobTitle", json!(job.title)),
+                                    ("company", json!(job.company)),
+                                ],
+                            );
+                            let started = Instant::now();
+                            let (analysis, fallback, retries) = match evaluate(
+                                ctx,
+                                service,
+                                &job,
+                                preset,
+                                options,
+                                &app.resume,
+                                &app.testimonials,
+                                system,
+                                Some(call_progress_str),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    *fatal_error.lock().unwrap() = Some(e);
+                                    return;
+                                }
+                            };
+                            stats_shared.lock().unwrap().record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
+                            outcome = if fallback { "fallback" } else { "evaluated" };
+                            if fallback {
+                                suffix = Some("conservative fallback");
+                                warn = true;
+                            }
+                            let is_pass = analysis.is_very_highly_aligned;
+                            let item_elapsed = started.elapsed();
+                            ctx.telemetry.item_completed(Some(item_elapsed));
+                            ctx.telemetry.update_stage_metrics(|m| {
+                                if let StageMetrics::JobJudge { qualified, rejected, pending } = m {
+                                    if is_pass {
+                                        *qualified = qualified.saturating_add(1);
+                                    } else {
+                                        *rejected = rejected.saturating_add(1);
+                                    }
+                                    *pending = pending.saturating_sub(1);
+                                }
+                            });
+                            let mut output = match serde_json::to_value(clean) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    *fatal_error.lock().unwrap() = Some(e.into());
+                                    return;
+                                }
+                            };
+                            output.as_object_mut().unwrap().insert(
+                                "evaluationResult".into(),
+                                json!({
+                                    "mode": options.eval_mode,
+                                    "isPass": is_pass,
+                                    "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                    "fallbackUsed": fallback,
+                                    "analysisResult": analysis,
+                                    "retryCount": retries
+                                }),
+                            );
+                            let target = if is_pass { pass_dir } else { fail_dir };
+                            let target_file = target.join(file_name);
+                            if let Err(e) = write_private_file(
+                                &target_file,
+                                serde_json::to_string_pretty(&output).unwrap().as_bytes(),
+                            ) {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                            if let Err(e) = write_artifact_manifest(
+                                &target_file,
+                                "jobJudge",
+                                json!({"preset": preset.name, "model": preset.model_id, "evaluationMode": options.eval_mode, "passed": is_pass, "retries": retries}),
+                            ) {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                            if !fallback {
+                                if let Err(e) = repo_shared.lock().unwrap().add_job(&job_identity) {
+                                    *fatal_error.lock().unwrap() = Some(e);
+                                    return;
+                                }
+                            }
+                            stats_shared.lock().unwrap().increment_counter("files.written");
+                            if is_pass {
+                                passed_shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if options.sleep_ms > 0 {
+                                if let Err(e) = abortable_delay(options.sleep_ms, &ctx.cancellation).await {
+                                    *fatal_error.lock().unwrap() = Some(e);
+                                    return;
+                                }
+                            }
+                        }
+                        if let Some(hash) = hash_ref {
+                            if let Err(e) = repo_shared.lock().unwrap().record_job_in_checkpoint(
+                                "jobJudge",
+                                hash,
+                                &preset.name,
+                                &preset.model_id,
+                                id,
+                            ) {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        }
+                        progress_shared.lock().unwrap().complete_with_context(
+                            &[
+                                ("jobId", json!(job.id)),
+                                ("jobTitle", json!(job.title)),
+                                ("outcome", json!(outcome)),
+                            ],
+                            CompleteOptions {
+                                level: warn.then_some(LogLevel::Warn),
+                                suffix: suffix.map(str::to_string),
+                            },
+                        );
+                    }
+                }));
+            }
+            crate::utils::join_all_borrowed(workers).await;
+            if let Some(err) = fatal_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            repo = match std::sync::Arc::try_unwrap(repo_shared) {
+                Ok(m) => m.into_inner().unwrap(),
+                Err(_) => panic!("repo_shared still held"),
+            };
+            stats = match std::sync::Arc::try_unwrap(stats_shared) {
+                Ok(m) => m.into_inner().unwrap(),
+                Err(_) => panic!("stats_shared still held"),
+            };
+            progress = match std::sync::Arc::try_unwrap(progress_shared) {
+                Ok(m) => m.into_inner().unwrap(),
+                Err(_) => panic!("progress_shared still held"),
+            };
+            passed = passed_shared.load(std::sync::atomic::Ordering::SeqCst);
+            current_job_index = current_job_index_shared.load(std::sync::atomic::Ordering::SeqCst);
+        } else {
+            for job in entries {
+                current_job_index += 1;
+                crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
+                let id = job.id.as_deref().unwrap();
+                if processed.contains(id) {
+                    ctx.telemetry.item_completed(None);
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::JobJudge { pending, .. } = m {
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    progress.complete_with_context(
+                        &[
+                            ("jobId", json!(job.id)),
+                            ("jobTitle", json!(job.title)),
+                            ("outcome", json!("checkpoint_skip")),
+                        ],
+                        CompleteOptions {
+                            suffix: Some("already judged from checkpoint".to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+                let outcome: &str;
+                let mut suffix: Option<&str> = None;
+                let mut warn = false;
+                let clean = sanitize_job_for_evaluation(&job);
+                let file_name = filename(&job);
+                let job_identity = identity(&job);
+                if repo.is_job_matched(&job_identity)? {
+                    ctx.telemetry.item_completed(None);
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::JobJudge {
+                            rejected, pending, ..
+                        } = m
+                        {
+                            *rejected = rejected.saturating_add(1);
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    let mut output = serde_json::to_value(clean)?;
+                    output
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("evaluationResult".into(), json!({"duplicate": true}));
+                    write_private_file(
+                        &dupe_dir.join(file_name),
+                        serde_json::to_string_pretty(&output)?.as_bytes(),
+                    )?;
+                    stats.increment_counter("data.duplicatesRemoved");
+                    outcome = "duplicate";
+                    suffix = Some("duplicate skipped");
+                } else if job
+                    .description_text
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
+                {
+                    ctx.telemetry.item_completed(None);
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::JobJudge {
+                            rejected, pending, ..
+                        } = m
+                        {
+                            *rejected = rejected.saturating_add(1);
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    stats.increment_counter("data.recordsFiltered");
+                    outcome = "no_description";
+                    suffix = Some("no description skipped");
+                    warn = true;
+                } else {
+                    ctx.telemetry.item_started(
+                        Some(current_job_index as u64),
+                        Some(total as u64),
+                        job.title.clone(),
+                        job.company.clone(),
+                    );
+                    let call_progress_str = format!("{}/{}", current_job_index, total);
+                    crate::logging::log_kv(
+                        "JobJudge",
+                        &format!(
+                            "Evaluating alignment for job {}/{}: \"{}\"",
+                            current_job_index,
+                            total,
+                            job.title.as_deref().unwrap_or("Untitled")
+                        ),
+                        LogLevel::Info,
+                        &[
+                            ("jobIndex", json!(current_job_index)),
+                            ("totalJobs", json!(total)),
+                            ("jobId", json!(job.id)),
+                            ("jobTitle", json!(job.title)),
+                            ("company", json!(job.company)),
+                        ],
+                    );
+                    let started = Instant::now();
+                    let (analysis, fallback, retries) = evaluate(
+                        ctx,
+                        &service,
+                        &job,
+                        &preset,
+                        options,
+                        &app.resume,
+                        &app.testimonials,
+                        &system,
+                        Some(call_progress_str),
+                    )
+                    .await?;
+                    stats.record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
+                    outcome = if fallback { "fallback" } else { "evaluated" };
+                    if fallback {
+                        suffix = Some("conservative fallback");
+                        warn = true;
+                    }
+                    let is_pass = analysis.is_very_highly_aligned;
+                    let item_elapsed = started.elapsed();
+                    ctx.telemetry.item_completed(Some(item_elapsed));
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::JobJudge {
+                            qualified,
+                            rejected,
+                            pending,
+                        } = m
+                        {
+                            if is_pass {
+                                *qualified = qualified.saturating_add(1);
+                            } else {
+                                *rejected = rejected.saturating_add(1);
+                            }
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    let mut output = serde_json::to_value(clean)?;
+                    output.as_object_mut().unwrap().insert("evaluationResult".into(), json!({"mode": options.eval_mode, "isPass": is_pass, "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), "fallbackUsed": fallback, "analysisResult": analysis, "retryCount": retries}));
+                    let target = if is_pass { &pass_dir } else { &fail_dir };
+                    let target_file = target.join(file_name);
+                    write_private_file(
+                        &target_file,
+                        serde_json::to_string_pretty(&output)?.as_bytes(),
+                    )?;
+                    write_artifact_manifest(
+                        &target_file,
+                        "jobJudge",
+                        json!({"preset": preset.name, "model": preset.model_id, "evaluationMode": options.eval_mode, "passed": is_pass, "retries": retries}),
+                    )?;
+                    if !fallback {
+                        repo.add_job(&job_identity)?;
+                    }
+                    stats.increment_counter("files.written");
+                    if is_pass {
+                        passed += 1;
+                    }
+                    if options.sleep_ms > 0 {
+                        abortable_delay(options.sleep_ms, &ctx.cancellation).await?;
+                    }
+                }
+                if let Some(hash) = &hash {
+                    repo.record_job_in_checkpoint(
+                        "jobJudge",
+                        hash,
+                        &preset.name,
+                        &preset.model_id,
+                        id,
+                    )?;
+                }
                 progress.complete_with_context(
                     &[
                         ("jobId", json!(job.id)),
                         ("jobTitle", json!(job.title)),
-                        ("outcome", json!("checkpoint_skip")),
+                        ("outcome", json!(outcome)),
                     ],
                     CompleteOptions {
-                        suffix: Some("already judged from checkpoint".to_string()),
-                        ..Default::default()
+                        level: warn.then_some(LogLevel::Warn),
+                        suffix: suffix.map(str::to_string),
                     },
                 );
-                continue;
             }
-            let outcome: &str;
-            let mut suffix: Option<&str> = None;
-            let mut warn = false;
-            let clean = sanitize_job_for_evaluation(&job);
-            let file_name = filename(&job);
-            let job_identity = identity(&job);
-            if repo.is_job_matched(&job_identity)? {
-                let mut output = serde_json::to_value(clean)?;
-                output
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("evaluationResult".into(), json!({"duplicate": true}));
-                write_private_file(
-                    &dupe_dir.join(file_name),
-                    serde_json::to_string_pretty(&output)?.as_bytes(),
-                )?;
-                stats.increment_counter("data.duplicatesRemoved");
-                outcome = "duplicate";
-                suffix = Some("duplicate skipped");
-            } else if job
-                .description_text
-                .as_deref()
-                .is_none_or(|text| text.trim().is_empty())
-            {
-                stats.increment_counter("data.recordsFiltered");
-                outcome = "no_description";
-                suffix = Some("no description skipped");
-                warn = true;
-            } else {
-                let call_progress_str = format!("{}/{}", current_job_index, total);
-                crate::logging::log_kv(
-                    "JobJudge",
-                    &format!(
-                        "Evaluating alignment for job {}/{}: \"{}\"",
-                        current_job_index,
-                        total,
-                        job.title.as_deref().unwrap_or("Untitled")
-                    ),
-                    LogLevel::Info,
-                    &[
-                        ("jobIndex", json!(current_job_index)),
-                        ("totalJobs", json!(total)),
-                        ("jobId", json!(job.id)),
-                        ("jobTitle", json!(job.title)),
-                        ("company", json!(job.company)),
-                    ],
-                );
-                let started = Instant::now();
-                let (analysis, fallback, retries) = evaluate(
-                    ctx,
-                    &service,
-                    &job,
-                    &preset,
-                    options,
-                    &app.resume,
-                    &app.testimonials,
-                    &system,
-                    Some(call_progress_str),
-                )
-                .await?;
-                stats.record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
-                outcome = if fallback { "fallback" } else { "evaluated" };
-                if fallback {
-                    suffix = Some("conservative fallback");
-                    warn = true;
-                }
-                let is_pass = analysis.is_very_highly_aligned;
-                let mut output = serde_json::to_value(clean)?;
-                output.as_object_mut().unwrap().insert("evaluationResult".into(), json!({"mode": options.eval_mode, "isPass": is_pass, "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), "fallbackUsed": fallback, "analysisResult": analysis, "retryCount": retries}));
-                let target = if is_pass { &pass_dir } else { &fail_dir };
-                let target_file = target.join(file_name);
-                write_private_file(
-                    &target_file,
-                    serde_json::to_string_pretty(&output)?.as_bytes(),
-                )?;
-                write_artifact_manifest(
-                    &target_file,
-                    "jobJudge",
-                    json!({"preset": preset.name, "model": preset.model_id, "evaluationMode": options.eval_mode, "passed": is_pass, "retries": retries}),
-                )?;
-                if !fallback {
-                    repo.add_job(&job_identity)?;
-                }
-                stats.increment_counter("files.written");
-                if is_pass {
-                    passed += 1;
-                }
-                if options.sleep_ms > 0 {
-                    abortable_delay(options.sleep_ms, &ctx.cancellation).await?;
-                }
-            }
-            if let Some(hash) = &hash {
-                repo.record_job_in_checkpoint(
-                    "jobJudge",
-                    hash,
-                    &preset.name,
-                    &preset.model_id,
-                    id,
-                )?;
-            }
-            progress.complete_with_context(
-                &[
-                    ("jobId", json!(job.id)),
-                    ("jobTitle", json!(job.title)),
-                    ("outcome", json!(outcome)),
-                ],
-                CompleteOptions {
-                    level: warn.then_some(LogLevel::Warn),
-                    suffix: suffix.map(str::to_string),
-                },
-            );
         }
         // Node stores the literal "completed" output hash for jobJudge (not the
         // artifact's real hash), so whole-file completion never triggers the

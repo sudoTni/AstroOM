@@ -8,7 +8,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 
 use serde_json::{json, Map, Value};
 
@@ -45,6 +44,7 @@ pub struct LlmRequest {
     pub timeout_ms: u64,
     pub show_reasoning_tokens: bool,
     pub show_response_stream: bool,
+    pub suppress_stream_display: bool,
     pub reasoning_effort: Option<String>,
     pub provider_routing: Option<ProviderRouting>,
     pub json_mode: bool,
@@ -64,6 +64,7 @@ impl Default for LlmRequest {
             timeout_ms: crate::constants::DEFAULT_TIMEOUT_MS,
             show_reasoning_tokens: false,
             show_response_stream: false,
+            suppress_stream_display: false,
             reasoning_effort: None,
             provider_routing: None,
             json_mode: false,
@@ -94,6 +95,7 @@ pub struct LlmResponse {
     pub usage: Option<crate::llm::usage::OpenRouterCallUsage>,
     pub response_id: Option<String>,
     pub model: Option<String>,
+    pub upstream_provider: Option<String>,
 }
 
 /// Centralized LLM service (Node: the `LLMService` singleton class).
@@ -460,13 +462,58 @@ impl LlmService {
             payload_logs::write_llm_payload_log(&ctx.paths.log_dir, stage, &wire_body)
         });
 
-        let response = match request.provider {
+        let call_res = match request.provider {
             Provider::Openai | Provider::Openrouter | Provider::Cerebras | Provider::Poe => {
                 call_openai_compatible(ctx, provider_config, request, self.usage_tracker.as_ref())
-                    .await?
+                    .await
             }
             Provider::Gemini | Provider::Mistral => unreachable!("handled before provider lookup"),
         };
+        let response = match call_res {
+            Ok(resp) => resp,
+            Err(err) => {
+                ctx.telemetry.llm_call_completed(
+                    Some(&request.model),
+                    Some(&provider_name),
+                    0,
+                    0,
+                    0,
+                    0.0,
+                    start.elapsed(),
+                    false,
+                );
+                return Err(err);
+            }
+        };
+
+        // Telemetry recording for LLM calls (success).
+        let (in_tok, out_tok, tot_tok, cost) = match &response.usage {
+            Some(b) => (
+                b.input_tokens as u64,
+                b.output_tokens as u64,
+                b.total_tokens as u64,
+                b.cost_usd,
+            ),
+            None => (
+                response.token_usage.prompt_tokens as u64,
+                response.token_usage.completion_tokens as u64,
+                response.token_usage.total_tokens as u64,
+                0.0,
+            ),
+        };
+        ctx.telemetry.llm_call_completed(
+            response.model.as_deref().or(Some(&request.model)),
+            response
+                .upstream_provider
+                .as_deref()
+                .or(Some(&provider_name)),
+            in_tok,
+            out_tok,
+            tot_tok,
+            cost,
+            start.elapsed(),
+            true,
+        );
 
         // OpenRouter usage accounting (Node: post-call tracker recording).
         if let (Some(tracker), Some(accounting_id)) = (&self.usage_tracker, &accounting_id) {
@@ -476,14 +523,20 @@ impl LlmService {
                 if recorded {
                     let totals = guard.get_summary();
                     drop(guard);
+                    let provider_display = response
+                        .upstream_provider
+                        .as_deref()
+                        .unwrap_or(&provider_name);
+                    let provider_suffix = format!(", provider={provider_display}");
                     logging::log_kv(
                         "LLMService",
                         &format!(
-                            "OpenRouter usage recorded: input={}, output={}, total={}, cost={}; pipeline total={} tokens, {}",
+                            "OpenRouter usage recorded: input={}, output={}, total={}, cost={}{}; pipeline total={} tokens, {}",
                             billing.input_tokens,
                             billing.output_tokens,
                             billing.total_tokens,
                             format_usd(billing.cost_usd),
+                            provider_suffix,
                             totals.total_tokens,
                             format_usd(totals.cost_usd)
                         ),
@@ -491,6 +544,7 @@ impl LlmService {
                         &[
                             ("event", json!("openrouter.usage.call")),
                             ("model", json!(billing.model.as_deref().unwrap_or(&request.model))),
+                            ("provider", json!(provider_display)),
                             ("inputTokens", json!(billing.input_tokens)),
                             ("outputTokens", json!(billing.output_tokens)),
                             ("totalTokens", json!(billing.total_tokens)),
@@ -895,42 +949,7 @@ fn truncate_at_word_boundary(text: &str, max_length: usize) -> String {
     }
 }
 
-/// Drive a set of borrowed futures to completion concurrently, round-robin
-/// polling with yields between passes (no `futures` crate dependency).
-/// Preserves input order.
-async fn join_all_borrowed<T>(futures: Vec<Pin<Box<dyn Future<Output = T> + '_>>>) -> Vec<T> {
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut slots: Vec<Option<Pin<Box<dyn Future<Output = T> + '_>>>> =
-        futures.into_iter().map(Some).collect();
-    let mut results: Vec<Option<T>> = Vec::with_capacity(slots.len());
-    for _ in 0..slots.len() {
-        results.push(None);
-    }
-
-    loop {
-        let mut any_pending = false;
-        for (index, slot) in slots.iter_mut().enumerate() {
-            let Some(future) = slot else { continue };
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(value) => {
-                    results[index] = Some(value);
-                    *slot = None;
-                }
-                Poll::Pending => any_pending = true,
-            }
-        }
-        if !any_pending {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    results
-        .into_iter()
-        .map(|result| result.expect("join_all_borrowed result"))
-        .collect()
-}
+use crate::utils::join_all_borrowed;
 
 #[cfg(test)]
 mod tests {
@@ -969,6 +988,7 @@ mod tests {
             llm_base_url_override: None,
             indeed_api_key: None,
             usage_tracker: None,
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryStore::new()),
             cancellation: tokio_util::sync::CancellationToken::new(),
             run_started_at_ms: 0,
         }
@@ -1462,6 +1482,7 @@ mod tests {
             timeout_ms: 180_000,
             show_reasoning_tokens: true,
             show_response_stream: false,
+            suppress_stream_display: false,
             reasoning_effort: Some("medium".to_string()),
             provider_routing: Some(ProviderRouting {
                 order: None,

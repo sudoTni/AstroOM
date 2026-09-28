@@ -2163,7 +2163,7 @@ function getRearJobTitlePortion(metadata) {
  */
 function getLinkedInDocBaseName(metadata, config) {
   const rearPortion = getRearJobTitlePortion(metadata).replace(/\.pdf$/i, '');
-  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate';
+  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate Name';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
   return `${applicantPrefix}_LinkedIn_${rearPortion}`;
 }
@@ -2223,7 +2223,7 @@ function generateLinkedInDoc(targetFolder, metadata, jobUrl, config) {
  * Computes a standardized folder name for an application's rendered package materials.
  */
 function getRenderPackageFolderName(metadata, config) {
-  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate';
+  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate Name';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
 
   const manualResumeName = getMetadataValue(metadata, 'Resume Filename') || getMetadataValue(metadata, 'Materials Filename');

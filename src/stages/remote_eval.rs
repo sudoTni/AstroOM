@@ -19,11 +19,12 @@ use crate::presets::{
     load_veritas_system_prompt,
 };
 use crate::statistics::create_statistics_collector;
+use crate::telemetry::StageMetrics;
 use crate::types::{LogLevel, ProviderRouting};
 use crate::utils::progress::{CompleteOptions, ProgressOptions, ProgressReporter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ pub struct RemoteEvalOptions {
     pub show_reasoning: bool,
     /// Node `showResponseStream` (standalone default false; pipeline default true).
     pub show_stream: bool,
+    pub concurrent: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +272,7 @@ async fn evaluate_remote_status(
                     timeout_ms: 30_000,
                     show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
                     show_response_stream: options.show_stream,
+                    suppress_stream_display: options.concurrent > 1,
                     reasoning_effort: options
                         .reasoning_effort
                         .as_deref()
@@ -284,7 +287,12 @@ async fn evaluate_remote_status(
             )
             .await;
         match response.and_then(|response| parse_remote_eval_results(&response.content)) {
-            Ok(results) => return Ok((results.into_iter().next().unwrap(), false, attempt)),
+            Ok(results) => {
+                if attempt > 0 {
+                    ctx.telemetry.retry_streak_reset();
+                }
+                return Ok((results.into_iter().next().unwrap(), false, attempt));
+            }
             Err(error) => {
                 if ctx.cancellation.is_cancelled() {
                     return Err(AppError::message(format!(
@@ -294,6 +302,7 @@ async fn evaluate_remote_status(
                 }
                 last_error = Some(error);
                 if attempt < 2 {
+                    ctx.telemetry.retry_recorded();
                     abortable_delay(
                         options
                             .retry_delay_ms
@@ -452,124 +461,400 @@ pub async fn run(ctx: &RunContext, options: &RemoteEvalOptions) -> Result<Remote
     ]);
     let mut evaluated = 0;
     let mut processed_ids = processed_ids;
-    for (index, job) in jobs.iter().enumerate() {
-        crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
-        let id = job.id.as_deref().expect("read_jobs creates an id");
-        if processed_ids.contains(id) {
+    if options.concurrent > 1 && !jobs.is_empty() {
+        let queue = std::sync::Arc::new(tokio::sync::Mutex::new(VecDeque::from(
+            jobs.iter().cloned().enumerate().collect::<Vec<_>>(),
+        )));
+        let passed_jobs_shared = std::sync::Arc::new(std::sync::Mutex::new(passed_jobs));
+        let processed_ids_shared = std::sync::Arc::new(std::sync::Mutex::new(processed_ids));
+        let stats_shared = std::sync::Arc::new(std::sync::Mutex::new(stats));
+        let progress_shared = std::sync::Arc::new(std::sync::Mutex::new(progress));
+        let repository_shared = std::sync::Arc::new(std::sync::Mutex::new(repository));
+        let evaluated_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fatal_error: std::sync::Arc<std::sync::Mutex<Option<AppError>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let concurrency = options.concurrent.min(jobs.len()).max(1);
+
+        let total_jobs = jobs.len();
+        let input_hash = &checkpoint.input_hash;
+        let mut workers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> =
+            Vec::new();
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let passed_jobs_shared = passed_jobs_shared.clone();
+            let processed_ids_shared = processed_ids_shared.clone();
+            let stats_shared = stats_shared.clone();
+            let progress_shared = progress_shared.clone();
+            let repository_shared = repository_shared.clone();
+            let evaluated_shared = evaluated_shared.clone();
+            let fatal_error = fatal_error.clone();
+            let service = &service;
+            let preset = &preset;
+            let system_prompt = &system_prompt;
+            let input_hash = input_hash;
+
+            workers.push(Box::pin(async move {
+                loop {
+                    if ctx.cancellation.is_cancelled() || fatal_error.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let task = {
+                        let mut q = queue.lock().await;
+                        q.pop_front()
+                    };
+                    let Some((index, job)) = task else { break };
+                    let id = job.id.as_deref().expect("read_jobs creates an id");
+                    if processed_ids_shared.lock().unwrap().contains(id) {
+                        ctx.telemetry.item_completed(None);
+                        ctx.telemetry.update_stage_metrics(|m| {
+                            if let StageMetrics::RemoteEval { pending, .. } = m {
+                                *pending = pending.saturating_sub(1);
+                            }
+                        });
+                        progress_shared.lock().unwrap().complete_with_context(
+                            &[
+                                ("jobId", serde_json::json!(job.id)),
+                                ("jobTitle", serde_json::json!(job.title)),
+                                ("outcome", serde_json::json!("checkpoint_skip")),
+                            ],
+                            CompleteOptions {
+                                suffix: Some("already evaluated from checkpoint".to_string()),
+                                ..Default::default()
+                            },
+                        );
+                        continue;
+                    }
+
+                    ctx.telemetry.item_started(
+                        Some((index + 1) as u64),
+                        Some(total_jobs as u64),
+                        job.title.clone(),
+                        job.company.clone(),
+                    );
+                    let item_start = Instant::now();
+
+                    let (result, fallback_used, retries) = if job
+                        .description_text
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty())
+                    {
+                        let call_progress_str = format!("{}/{}", index + 1, total_jobs);
+                        crate::logging::log_kv(
+                            "RemoteEval",
+                            &format!(
+                                "Evaluating remote status for job {}/{}: \"{}\"",
+                                index + 1,
+                                total_jobs,
+                                job.title.as_deref().unwrap_or("Untitled")
+                            ),
+                            LogLevel::Info,
+                            &[
+                                ("jobIndex", serde_json::json!(index + 1)),
+                                ("totalJobs", serde_json::json!(total_jobs)),
+                                ("jobId", serde_json::json!(job.id)),
+                                ("jobTitle", serde_json::json!(job.title)),
+                                ("company", serde_json::json!(job.company)),
+                            ],
+                        );
+                        let started = Instant::now();
+                        let outcome = match evaluate_remote_status(
+                            ctx,
+                            service,
+                            &job,
+                            preset,
+                            options,
+                            system_prompt,
+                            Some(call_progress_str),
+                        )
+                        .await
+                        {
+                            Ok(res) => res,
+                            Err(e) => {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        };
+                        stats_shared
+                            .lock()
+                            .unwrap()
+                            .record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
+                        evaluated_shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        outcome
+                    } else {
+                        (
+                            RemoteEvalResult {
+                                job_title: job.title.clone().unwrap_or_default(),
+                                is_confirmed_remote: false,
+                                rationale: "Job has no description to evaluate.".to_string(),
+                                confidence: 0.0,
+                            },
+                            true,
+                            0,
+                        )
+                    };
+                    let confirmed_remote = result.is_confirmed_remote;
+                    let item_elapsed = item_start.elapsed();
+                    ctx.telemetry.item_completed(Some(item_elapsed));
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::RemoteEval {
+                            eligible,
+                            rejected,
+                            pending,
+                        } = m
+                        {
+                            if confirmed_remote {
+                                *eligible = eligible.saturating_add(1);
+                            } else {
+                                *rejected = rejected.saturating_add(1);
+                            }
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    {
+                        let mut passed_guard = passed_jobs_shared.lock().unwrap();
+                        if confirmed_remote {
+                            let mut confirmed = job.clone();
+                            confirmed.is_confirmed_remote = Some(true);
+                            confirmed.remote_eval_metadata = Some(RemoteEvalMetadata {
+                                job_title: Some(result.job_title),
+                                rationale: Some(result.rationale),
+                                confidence: Some(result.confidence),
+                                timestamp: Some(
+                                    chrono::Utc::now()
+                                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                ),
+                                fallback_used: Some(fallback_used),
+                                retry_count: Some(retries as i64),
+                            });
+                            passed_guard.retain(|existing| existing.id.as_deref() != Some(id));
+                            passed_guard.push(confirmed);
+                        } else {
+                            stats_shared
+                                .lock()
+                                .unwrap()
+                                .increment_counter("data.recordsFiltered");
+                        }
+                        if let Err(e) = write_json_atomic_private(
+                            &options.output_file,
+                            &serde_json::to_value(&*passed_guard).unwrap(),
+                        ) {
+                            *fatal_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                    if options.use_checkpoints {
+                        if let Err(e) = repository_shared.lock().unwrap().record_job_in_checkpoint(
+                            "remoteEval",
+                            input_hash,
+                            &preset.name,
+                            &preset.model_id,
+                            id,
+                        ) {
+                            *fatal_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                    processed_ids_shared.lock().unwrap().insert(id.to_string());
+                    progress_shared.lock().unwrap().complete_with_context(
+                        &[
+                            ("jobId", serde_json::json!(job.id)),
+                            ("jobTitle", serde_json::json!(job.title)),
+                            (
+                                "outcome",
+                                serde_json::json!(if confirmed_remote {
+                                    "passed"
+                                } else {
+                                    "filtered"
+                                }),
+                            ),
+                        ],
+                        CompleteOptions {
+                            level: fallback_used.then_some(LogLevel::Warn),
+                            suffix: fallback_used.then(|| "conservative fallback".to_string()),
+                        },
+                    );
+                    if options.sleep_ms > 0 {
+                        if let Err(e) = abortable_delay(options.sleep_ms, &ctx.cancellation).await {
+                            *fatal_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+        crate::utils::join_all_borrowed(workers).await;
+        if let Some(err) = fatal_error.lock().unwrap().take() {
+            return Err(err);
+        }
+        passed_jobs = match std::sync::Arc::try_unwrap(passed_jobs_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("passed_jobs_shared still referenced"),
+        };
+        let _ = match std::sync::Arc::try_unwrap(processed_ids_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("processed_ids_shared still referenced"),
+        };
+        stats = match std::sync::Arc::try_unwrap(stats_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("stats_shared still referenced"),
+        };
+        repository = match std::sync::Arc::try_unwrap(repository_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("repository_shared still referenced"),
+        };
+        evaluated = evaluated_shared.load(std::sync::atomic::Ordering::SeqCst);
+    } else {
+        for (index, job) in jobs.iter().enumerate() {
+            crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
+            let id = job.id.as_deref().expect("read_jobs creates an id");
+            if processed_ids.contains(id) {
+                ctx.telemetry.item_completed(None);
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::RemoteEval { pending, .. } = m {
+                        *pending = pending.saturating_sub(1);
+                    }
+                });
+                progress.complete_with_context(
+                    &[
+                        ("jobId", serde_json::json!(job.id)),
+                        ("jobTitle", serde_json::json!(job.title)),
+                        ("outcome", serde_json::json!("checkpoint_skip")),
+                    ],
+                    CompleteOptions {
+                        suffix: Some("already evaluated from checkpoint".to_string()),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+
+            ctx.telemetry.item_started(
+                Some((index + 1) as u64),
+                Some(jobs.len() as u64),
+                job.title.clone(),
+                job.company.clone(),
+            );
+            let item_start = Instant::now();
+
+            let (result, fallback_used, retries) = if job
+                .description_text
+                .as_deref()
+                .is_some_and(|description| !description.trim().is_empty())
+            {
+                let call_progress_str = format!("{}/{}", index + 1, jobs.len());
+                crate::logging::log_kv(
+                    "RemoteEval",
+                    &format!(
+                        "Evaluating remote status for job {}/{}: \"{}\"",
+                        index + 1,
+                        jobs.len(),
+                        job.title.as_deref().unwrap_or("Untitled")
+                    ),
+                    LogLevel::Info,
+                    &[
+                        ("jobIndex", serde_json::json!(index + 1)),
+                        ("totalJobs", serde_json::json!(jobs.len())),
+                        ("jobId", serde_json::json!(job.id)),
+                        ("jobTitle", serde_json::json!(job.title)),
+                        ("company", serde_json::json!(job.company)),
+                    ],
+                );
+                let started = Instant::now();
+                let outcome = evaluate_remote_status(
+                    ctx,
+                    &service,
+                    job,
+                    &preset,
+                    options,
+                    &system_prompt,
+                    Some(call_progress_str),
+                )
+                .await?;
+                // The Node collector records a successful provider call once the
+                // conservative fallback has been produced as well.
+                stats.record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
+                evaluated += 1;
+                outcome
+            } else {
+                (
+                    RemoteEvalResult {
+                        job_title: job.title.clone().unwrap_or_default(),
+                        is_confirmed_remote: false,
+                        rationale: "Job has no description to evaluate.".to_string(),
+                        confidence: 0.0,
+                    },
+                    true,
+                    0,
+                )
+            };
+            let confirmed_remote = result.is_confirmed_remote;
+            let item_elapsed = item_start.elapsed();
+            ctx.telemetry.item_completed(Some(item_elapsed));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::RemoteEval {
+                    eligible,
+                    rejected,
+                    pending,
+                } = m
+                {
+                    if confirmed_remote {
+                        *eligible = eligible.saturating_add(1);
+                    } else {
+                        *rejected = rejected.saturating_add(1);
+                    }
+                    *pending = pending.saturating_sub(1);
+                }
+            });
+            if result.is_confirmed_remote {
+                let mut confirmed = job.clone();
+                confirmed.is_confirmed_remote = Some(true);
+                confirmed.remote_eval_metadata = Some(RemoteEvalMetadata {
+                    job_title: Some(result.job_title),
+                    rationale: Some(result.rationale),
+                    confidence: Some(result.confidence),
+                    timestamp: Some(
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ),
+                    fallback_used: Some(fallback_used),
+                    retry_count: Some(retries as i64),
+                });
+                passed_jobs.retain(|existing| existing.id.as_deref() != Some(id));
+                passed_jobs.push(confirmed);
+            } else {
+                stats.increment_counter("data.recordsFiltered");
+            }
+            write_json_atomic_private(&options.output_file, &serde_json::to_value(&passed_jobs)?)?;
+            if options.use_checkpoints {
+                repository.record_job_in_checkpoint(
+                    "remoteEval",
+                    &checkpoint.input_hash,
+                    &preset.name,
+                    &preset.model_id,
+                    id,
+                )?;
+            }
+            processed_ids.insert(id.to_string());
             progress.complete_with_context(
                 &[
                     ("jobId", serde_json::json!(job.id)),
                     ("jobTitle", serde_json::json!(job.title)),
-                    ("outcome", serde_json::json!("checkpoint_skip")),
+                    (
+                        "outcome",
+                        serde_json::json!(if confirmed_remote {
+                            "passed"
+                        } else {
+                            "filtered"
+                        }),
+                    ),
                 ],
                 CompleteOptions {
-                    suffix: Some("already evaluated from checkpoint".to_string()),
-                    ..Default::default()
+                    level: fallback_used.then_some(LogLevel::Warn),
+                    suffix: fallback_used.then(|| "conservative fallback".to_string()),
                 },
             );
-            continue;
-        }
-        let (result, fallback_used, retries) = if job
-            .description_text
-            .as_deref()
-            .is_some_and(|description| !description.trim().is_empty())
-        {
-            let call_progress_str = format!("{}/{}", index + 1, jobs.len());
-            crate::logging::log_kv(
-                "RemoteEval",
-                &format!(
-                    "Evaluating remote status for job {}/{}: \"{}\"",
-                    index + 1,
-                    jobs.len(),
-                    job.title.as_deref().unwrap_or("Untitled")
-                ),
-                LogLevel::Info,
-                &[
-                    ("jobIndex", serde_json::json!(index + 1)),
-                    ("totalJobs", serde_json::json!(jobs.len())),
-                    ("jobId", serde_json::json!(job.id)),
-                    ("jobTitle", serde_json::json!(job.title)),
-                    ("company", serde_json::json!(job.company)),
-                ],
-            );
-            let started = Instant::now();
-            let outcome = evaluate_remote_status(
-                ctx,
-                &service,
-                job,
-                &preset,
-                options,
-                &system_prompt,
-                Some(call_progress_str),
-            )
-            .await?;
-            // The Node collector records a successful provider call once the
-            // conservative fallback has been produced as well.
-            stats.record_api_call(true, started.elapsed().as_secs_f64() * 1000.0);
-            evaluated += 1;
-            outcome
-        } else {
-            (
-                RemoteEvalResult {
-                    job_title: job.title.clone().unwrap_or_default(),
-                    is_confirmed_remote: false,
-                    rationale: "Job has no description to evaluate.".to_string(),
-                    confidence: 0.0,
-                },
-                true,
-                0,
-            )
-        };
-        let confirmed_remote = result.is_confirmed_remote;
-        if result.is_confirmed_remote {
-            let mut confirmed = job.clone();
-            confirmed.is_confirmed_remote = Some(true);
-            confirmed.remote_eval_metadata = Some(RemoteEvalMetadata {
-                job_title: Some(result.job_title),
-                rationale: Some(result.rationale),
-                confidence: Some(result.confidence),
-                timestamp: Some(
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                ),
-                fallback_used: Some(fallback_used),
-                retry_count: Some(retries as i64),
-            });
-            passed_jobs.retain(|existing| existing.id.as_deref() != Some(id));
-            passed_jobs.push(confirmed);
-        } else {
-            stats.increment_counter("data.recordsFiltered");
-        }
-        write_json_atomic_private(&options.output_file, &serde_json::to_value(&passed_jobs)?)?;
-        if options.use_checkpoints {
-            repository.record_job_in_checkpoint(
-                "remoteEval",
-                &checkpoint.input_hash,
-                &preset.name,
-                &preset.model_id,
-                id,
-            )?;
-        }
-        processed_ids.insert(id.to_string());
-        progress.complete_with_context(
-            &[
-                ("jobId", serde_json::json!(job.id)),
-                ("jobTitle", serde_json::json!(job.title)),
-                (
-                    "outcome",
-                    serde_json::json!(if confirmed_remote {
-                        "passed"
-                    } else {
-                        "filtered"
-                    }),
-                ),
-            ],
-            CompleteOptions {
-                level: fallback_used.then_some(LogLevel::Warn),
-                suffix: fallback_used.then(|| "conservative fallback".to_string()),
-            },
-        );
-        if options.sleep_ms > 0 {
-            abortable_delay(options.sleep_ms, &ctx.cancellation).await?;
+            if options.sleep_ms > 0 {
+                abortable_delay(options.sleep_ms, &ctx.cancellation).await?;
+            }
         }
     }
     crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;

@@ -19,6 +19,16 @@
 			"temperature": 1.0,
 			"topP": 0.95,
 			"maxTokens": 64000
+		},
+		"jc_sba": {
+			"name": "jc_sba",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "stealth/space-bunny-alpha",
+			"promptTemplate": "./prompts/jc_prompt-mini.txt",
+			"temperature": 1.0,
+			"topP": 1.0,
+			"maxTokens": 64000
 		}
 	},
 	"remoteEval": {
@@ -40,6 +50,16 @@
 			"promptTemplate": "./prompts/re_prompt01-mini.txt",
 			"temperature": 1.0,
 			"topP": 0.95,
+			"maxTokens": 64000
+		},
+		"re_sba": {
+			"name": "re_sba",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "stealth/space-bunny-alpha",
+			"promptTemplate": "./prompts/re_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 1.0,
 			"maxTokens": 64000
 		}
 	},
@@ -63,6 +83,16 @@
 			"temperature": 1.0,
 			"topP": 0.95,
 			"maxTokens": 64000
+		},
+		"jep_sba": {
+			"name": "jep_sba",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "stealth/space-bunny-alpha",
+			"promptTemplate": "./prompts/jep_prompt05-re-mini.txt",
+			"temperature": 1.0,
+			"topP": 1.0,
+			"maxTokens": 64000
 		}
 	},
 	"makeMaterials": {
@@ -84,6 +114,16 @@
 			"promptTemplate": "./prompts/rop_prompt01-mini.txt",
 			"temperature": 1.0,
 			"topP": 0.95,
+			"maxTokens": 64000
+		},
+		"rop_sba": {
+			"name": "rop_sba",
+			"provider": "openrouter",
+			"base_url": "https://openrouter.ai/api/v1",
+			"modelId": "stealth/space-bunny-alpha",
+			"promptTemplate": "./prompts/rop_prompt01-mini.txt",
+			"temperature": 1.0,
+			"topP": 1.0,
 			"maxTokens": 64000
 		}
 	}

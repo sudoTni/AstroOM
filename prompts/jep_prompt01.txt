@@ -1,11 +1,11 @@
 ### Job Evaluation Prompt (JEP)
 
-You are evaluating a target job description against fixed “The candidate’s Rules” failure conditions, using the candidate’s resume only for Rules 12 and 13. If the targJD fails any rule, the entire job is a failure (isVeryHighlyAligned = false). Output only the specified JSON array.
+You are evaluating a target job description against fixed “Candidate’s Rules” failure conditions, using the candidate’s resume only for Rules 12 and 13. If the targJD fails any rule, the entire job is a failure (isVeryHighlyAligned = false). Output only the specified JSON array.
 
 ### Inputs
-- the candidate’s Rules: Use exactly as provided. Do not reinterpret or modify.
+- Candidate’s Rules: Use exactly as provided. Do not reinterpret or modify.
 - targJD: Full target Job Description text.
-- myResume: the candidate’s resume text. Only use for Rules 12 and 13.
+- myResume: The candidate’s resume text. Only use for Rules 12 and 13.
 
 ### Output
 - JSON array of objects, each with:
@@ -36,8 +36,8 @@ From the targJD, extract the following, defaulting to “Not Specified” if abs
 
 If information is scattered (e.g., in multiple sections), consolidate. Prefer explicit statements over implications. If hourly pay is given and full-time is implied, annualize using 40 hrs/week and 52 weeks to estimate the upper bound; if unsure, treat as “Not Specified.”
 
-### the candidate’s Rules - Rule Evaluation
-Apply the candidate’s Rules exactly as written. A single failure flips the overall result to false.
+### Candidate’s Rules - Rule Evaluation
+Apply Candidate’s Rules exactly as written. A single failure flips the overall result to false.
 
 - Rule 1 — Culture/Company
   - Fail if language indicates potentially toxic, overly bureaucratic, or technologically stagnant environment. Evidence includes phrases like “must strictly follow rigid processes without deviation,” “no remote tools,” “legacy-only stack with no modernization,” or overtly aggressive/hostile tone.
@@ -55,7 +55,7 @@ Apply the candidate’s Rules exactly as written. A single failure flips the ove
 - Rule 4 — Employment Type
   - Fail if Part-time, Contract, or Temporary. Pass if “Not Specified.”
 - Rule 5 — Residency
-  - Fail if residency requirements explicitly exclude Watervliet, NY, USA (e.g., “must reside in CA only,” “cannot hire NY residents”). General “US only” is fine.
+  - Fail if residency requirements explicitly exclude New York State, USA (or candidate's home state) (e.g., “must reside in CA only,” “cannot hire NY residents”). General “US only” is fine.
 - Rule 6 — Security Clearance
   - Fail if a clearance is required prior to hire, is not Public Trust, and the JD does not state it can be obtained post-hire. Public Trust required is acceptable.
 - Rule 7 — Travel
@@ -141,7 +141,7 @@ You are provided with two key inputs: `targJD` and `myResume`.
 {targJD}
 ```
 
-#### 2. `myResume` (the candidate's Resume)
+#### 2. `myResume` (Candidate's Resume)
 
 ```text
 {myResume}

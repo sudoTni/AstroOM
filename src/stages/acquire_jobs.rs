@@ -468,6 +468,7 @@ mod tests {
             llm_base_url_override: None,
             indeed_api_key: None,
             usage_tracker: None,
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryStore::new()),
             cancellation: CancellationToken::new(),
             run_started_at_ms: 0,
         }

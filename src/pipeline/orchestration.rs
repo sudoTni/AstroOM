@@ -12,6 +12,7 @@ use crate::presets::{get_preset, load_presets};
 use crate::stages::{
     acquire_jobs, enrich_jobs, job_cloth, job_judge, make_materials, process_data, remote_eval,
 };
+use crate::telemetry::{StageKind, StageMetrics};
 use crate::types::{should_execute_phase, LogLevel, Provider, ProviderRouting};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -98,12 +99,37 @@ async fn resolve_stage_provider_routing(
 pub struct PipelineResult {
     pub completed_phases: Vec<String>,
     pub remote_eval_skipped: bool,
+    pub degraded: bool,
 }
 fn path(config: &PipelineConfig, name: &str) -> std::path::PathBuf {
     config.data_dir.join(name)
 }
 fn run_phase(config: &PipelineConfig, name: &str) -> bool {
     should_execute_phase(name, config.resume.as_deref())
+}
+
+fn count_json_array_file(path: &std::path::Path) -> Option<u64> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value.as_array().map(|arr| arr.len() as u64)
+}
+
+fn collect_material_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_material_files(&path, files);
+            } else if path.extension().is_some_and(|e| e == "txt")
+                && !path.to_string_lossy().ends_with(".manifest.json")
+            {
+                files.push(path);
+            }
+        }
+    }
 }
 
 pub async fn execute(ctx: &RunContext, config: &PipelineConfig) -> Result<PipelineResult> {
@@ -227,7 +253,48 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
         let clothed = path(config, "clothed_jobs_indeed.json");
         let enriched = path(config, "clothed_jobs_enriched.json");
         let remote = path(config, "remote_eval_pass.json");
+
+        // Pre-populate funnel metrics if resuming with existing artifacts on disk
+        if config.resume.is_some() {
+            let acq_indeed = count_json_array_file(&acquired_indeed).unwrap_or(0);
+            let acq_linkedin = count_json_array_file(&acquired_linkedin).unwrap_or(0);
+            let total_acq = acq_indeed + acq_linkedin;
+            if total_acq > 0 {
+                ctx.telemetry
+                    .update_funnel(|f| f.acquired = Some(total_acq));
+            }
+            if let Some(cnt) = count_json_array_file(&processed) {
+                ctx.telemetry
+                    .update_funnel(|f| f.unique_or_processed = Some(cnt));
+            }
+            if let Some(cnt) = count_json_array_file(&clothed) {
+                ctx.telemetry.update_funnel(|f| f.cloth_passed = Some(cnt));
+            }
+            if let Some(cnt) = count_json_array_file(&remote) {
+                ctx.telemetry
+                    .update_funnel(|f| f.remote_eligible = Some(cnt));
+            }
+            let pass_dir = config.data_dir.join("astroapply_eval_pass");
+            if let Ok(entries) = std::fs::read_dir(&pass_dir) {
+                let pass_count = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                    .count() as u64;
+                if pass_count > 0 {
+                    ctx.telemetry
+                        .update_funnel(|f| f.qualified = Some(pass_count));
+                }
+            }
+            let mut mat_files = Vec::new();
+            collect_material_files(&config.materials_dir, &mut mat_files);
+            if !mat_files.is_empty() {
+                ctx.telemetry
+                    .update_funnel(|f| f.materials_completed = Some(mat_files.len() as u64));
+            }
+        }
+
         if !config.skip_acquisition && run_phase(config, "acquireJobs") {
+            ctx.telemetry.stage_started(StageKind::AcquireJobs, None);
             let stage_started = std::time::Instant::now();
             let sites_list: Vec<String> = config
                 .sites
@@ -270,6 +337,14 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                 },
             )
             .await?;
+            ctx.telemetry
+                .update_funnel(|f| f.acquired = Some(acquisition.jobs as u64));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::Acquire { acquired, .. } = m {
+                    *acquired = acquisition.jobs as u64;
+                }
+            });
+            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 1/8: Acquisition completed",
@@ -299,12 +374,6 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             );
         }
         if run_phase(config, "processData") {
-            let stage_started = std::time::Instant::now();
-            crate::logging::log(
-                "Pipeline",
-                "Stage 2/8: Normalizing and filtering acquired jobs...",
-                LogLevel::Info,
-            );
             // Match Node resolvePipelineAcquisitionInputFiles: only the
             // per-source artifacts for the selected sites, never a directory
             // scan (which could pick up stale sibling artifacts).
@@ -323,6 +392,25 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             }
             let mut seen = std::collections::HashSet::new();
             normalization_input_files.retain(|file| seen.insert(file.clone()));
+
+            let total_input: u64 = normalization_input_files
+                .iter()
+                .filter_map(|file| count_json_array_file(file))
+                .sum();
+            ctx.telemetry.stage_started(
+                StageKind::ProcessData,
+                if total_input > 0 {
+                    Some(total_input)
+                } else {
+                    None
+                },
+            );
+            let stage_started = std::time::Instant::now();
+            crate::logging::log(
+                "Pipeline",
+                "Stage 2/8: Normalizing and filtering acquired jobs...",
+                LogLevel::Info,
+            );
             let process_result = process_data::run(
                 ctx,
                 &process_data::ProcessDataOptions {
@@ -341,6 +429,27 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                 },
             )
             .await?;
+            ctx.telemetry.update_funnel(|f| {
+                f.unique_or_processed = Some(process_result.output_record_count as u64)
+            });
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::ProcessData {
+                    input,
+                    kept,
+                    duplicates,
+                    company_filtered,
+                    previously_seen,
+                    ..
+                } = m
+                {
+                    *input = process_result.records_merged as u64;
+                    *kept = process_result.output_record_count as u64;
+                    *duplicates = process_result.duplicates_removed as u64;
+                    *company_filtered = process_result.filtered_entries as u64;
+                    *previously_seen = process_result.job_db_cool_off_skipped_entries as u64;
+                }
+            });
+            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 2/8: Normalization completed",
@@ -376,6 +485,16 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             );
         }
         if run_phase(config, "jobCloth") {
+            let processed_count = count_json_array_file(&processed);
+            let batch_size = if config.batch_size > 0 {
+                config.batch_size
+            } else {
+                100
+            };
+            let total_batches =
+                processed_count.map(|c| (c as f64 / batch_size as f64).ceil() as u64);
+            ctx.telemetry
+                .stage_started(StageKind::JobCloth, total_batches);
             let stage_started = std::time::Instant::now();
             crate::logging::log(
                 "Pipeline",
@@ -415,6 +534,17 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                 },
             )
             .await?;
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::JobCloth {
+                    successful_jobs, ..
+                } = m
+                {
+                    *successful_jobs = cloth_output.len() as u64;
+                }
+            });
+            ctx.telemetry
+                .update_funnel(|f| f.cloth_passed = Some(cloth_output.len() as u64));
+            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 3/8: JobCloth completed",
@@ -456,6 +586,22 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
         let mut post_enrichment_input = clothed.clone();
         if run_phase(config, "enrichJobs") {
             if has_linkedin_jobs && !cloth_jobs.is_empty() {
+                let to_enrich_count = cloth_jobs
+                    .iter()
+                    .filter(|job| {
+                        (job.source.as_deref() == Some("linkedin")
+                            || job
+                                .url
+                                .as_deref()
+                                .is_some_and(|u| u.contains("linkedin.com")))
+                            && job
+                                .description_text
+                                .as_deref()
+                                .is_none_or(|text| text.trim().is_empty())
+                    })
+                    .count() as u64;
+                ctx.telemetry
+                    .stage_started(StageKind::EnrichJobs, Some(to_enrich_count));
                 let stage_started = std::time::Instant::now();
                 crate::logging::log(
                     "Pipeline",
@@ -475,6 +621,12 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     },
                 )
                 .await?;
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::EnrichJobs { enriched, .. } = m {
+                        *enriched = enrich_result.enriched_count as u64;
+                    }
+                });
+                ctx.telemetry.item_completed(None);
                 crate::logging::log_kv(
                     "Pipeline",
                     "Stage 4/8: LinkedIn Enrichment completed",
@@ -515,6 +667,9 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
         }
         let judge_input = if config.remote_only {
             if run_phase(config, "remoteEval") {
+                let input_count = count_json_array_file(&post_enrichment_input);
+                ctx.telemetry
+                    .stage_started(StageKind::RemoteEval, input_count);
                 let stage_started = std::time::Instant::now();
                 crate::logging::log(
                     "Pipeline",
@@ -547,9 +702,13 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                         use_checkpoints: true,
                         show_reasoning: true,
                         show_stream: true,
+                        concurrent: config.re_concurrent,
                     },
                 )
                 .await?;
+                ctx.telemetry
+                    .update_funnel(|f| f.remote_eligible = Some(remote_result.passed as u64));
+                ctx.telemetry.item_completed(None);
                 crate::logging::log_kv(
                     "Pipeline",
                     "Stage 5/8: RemoteEval completed",
@@ -574,6 +733,10 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                         remote.display()
                     )));
                 }
+                if let Some(passed) = count_json_array_file(&remote) {
+                    ctx.telemetry
+                        .update_funnel(|f| f.remote_eligible = Some(passed));
+                }
                 crate::logging::log(
                     "Pipeline",
                     &format!(
@@ -586,6 +749,10 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             remote
         } else {
             result.remote_eval_skipped = true;
+            if let Some(cnt) = count_json_array_file(&post_enrichment_input) {
+                ctx.telemetry
+                    .update_funnel(|f| f.remote_eligible = Some(cnt));
+            }
             crate::logging::log(
                 "Pipeline",
                 "Stage 5/8: RemoteEval skipped (--remote-only is disabled).",
@@ -594,6 +761,9 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             post_enrichment_input
         };
         if run_phase(config, "jobJudge") {
+            let input_count = count_json_array_file(&judge_input);
+            ctx.telemetry
+                .stage_started(StageKind::JobJudge, input_count);
             let stage_started = std::time::Instant::now();
             crate::logging::log(
                 "Pipeline",
@@ -627,9 +797,13 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     provider_routing: judge_routing,
                     show_reasoning: true,
                     show_stream: true,
+                    concurrent: config.jj_concurrent,
                 },
             )
             .await?;
+            ctx.telemetry
+                .update_funnel(|f| f.qualified = Some(judge_result.passed as u64));
+            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 6/8: JobJudge completed",
@@ -645,6 +819,17 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             );
             result.completed_phases.push("jobJudge".into());
         } else {
+            let pass_dir = config.data_dir.join("astroapply_eval_pass");
+            if let Ok(entries) = std::fs::read_dir(&pass_dir) {
+                let pass_count = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                    .count() as u64;
+                if pass_count > 0 {
+                    ctx.telemetry
+                        .update_funnel(|f| f.qualified = Some(pass_count));
+                }
+            }
             crate::logging::log(
                 "Pipeline",
                 &format!(
@@ -655,6 +840,23 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             );
         }
         if !config.skip_materials && run_phase(config, "makeMaterials") {
+            let pass_dir = config.data_dir.join("astroapply_eval_pass");
+            let pass_count = std::fs::read_dir(&pass_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            ctx.telemetry.stage_started(
+                StageKind::MakeMaterials,
+                if pass_count > 0 {
+                    Some(pass_count)
+                } else {
+                    None
+                },
+            );
             let stage_started = std::time::Instant::now();
             crate::logging::log(
                 "Pipeline",
@@ -695,21 +897,41 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     show_reasoning: true,
                     show_stream: true,
                     suppress_errors: true,
+                    concurrent: config.mm_concurrent,
                 },
             )
             .await?;
-            crate::logging::log_kv(
-                "Pipeline",
-                "Stage 7/8: MakeMaterials completed",
-                LogLevel::Success,
-                &[
-                    ("generated", serde_json::json!(materials_result.generated)),
-                    (
-                        "durationMs",
-                        serde_json::json!(stage_started.elapsed().as_secs_f64() * 1000.0),
-                    ),
-                ],
-            );
+            ctx.telemetry
+                .update_funnel(|f| f.materials_completed = Some(materials_result.generated as u64));
+            ctx.telemetry.item_completed(None);
+            if materials_result.generated == 0 {
+                result.degraded = true;
+                crate::logging::log_kv(
+                    "Pipeline",
+                    "Stage 7/8: MakeMaterials finished with 0 deliverables generated",
+                    LogLevel::Warn,
+                    &[
+                        ("generated", serde_json::json!(0)),
+                        (
+                            "durationMs",
+                            serde_json::json!(stage_started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                    ],
+                );
+            } else {
+                crate::logging::log_kv(
+                    "Pipeline",
+                    "Stage 7/8: MakeMaterials completed",
+                    LogLevel::Success,
+                    &[
+                        ("generated", serde_json::json!(materials_result.generated)),
+                        (
+                            "durationMs",
+                            serde_json::json!(stage_started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                    ],
+                );
+            }
             result.completed_phases.push("makeMaterials".into());
         } else {
             let reason = if !run_phase(config, "makeMaterials") {
@@ -728,40 +950,60 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
         }
         if run_phase(config, "deployment") {
             if config.deploy {
-                let stage_started = std::time::Instant::now();
-                let destination = config
-                    .deploy_destination
-                    .as_deref()
-                    .expect("validated deploy destination");
-                crate::logging::log_kv(
-                    "Pipeline",
-                    "Stage 8/8: Deploying materials...",
-                    LogLevel::Info,
-                    &[("destination", serde_json::json!(destination))],
-                );
-                let deploy_result = crate::pipeline::deploy::deploy(
-                    ctx,
-                    &config.materials_dir,
-                    &config.deployed_materials_dir,
-                    destination,
-                )
-                .await?;
-                crate::logging::log_kv(
-                    "Pipeline",
-                    &format!(
-                        "Stage 8/8: Deployment completed (deployed {} material items).",
-                        deploy_result.deployed
-                    ),
-                    LogLevel::Success,
-                    &[
-                        ("deployedCount", serde_json::json!(deploy_result.deployed)),
-                        (
-                            "durationMs",
-                            serde_json::json!(stage_started.elapsed().as_secs_f64() * 1000.0),
+                if result.degraded {
+                    crate::logging::log(
+                        "Pipeline",
+                        "Stage 8/8: Deployment skipped (pipeline degraded: 0 materials generated).",
+                        LogLevel::Warn,
+                    );
+                } else {
+                    let mut deploy_files = Vec::new();
+                    collect_material_files(&config.materials_dir, &mut deploy_files);
+                    ctx.telemetry
+                        .stage_started(StageKind::DeployMaterials, Some(deploy_files.len() as u64));
+                    let stage_started = std::time::Instant::now();
+                    let destination = config
+                        .deploy_destination
+                        .as_deref()
+                        .expect("validated deploy destination");
+                    crate::logging::log_kv(
+                        "Pipeline",
+                        "Stage 8/8: Deploying materials...",
+                        LogLevel::Info,
+                        &[("destination", serde_json::json!(destination))],
+                    );
+                    let deploy_result = crate::pipeline::deploy::deploy(
+                        ctx,
+                        &config.materials_dir,
+                        &config.deployed_materials_dir,
+                        destination,
+                    )
+                    .await?;
+                    ctx.telemetry
+                        .update_funnel(|f| f.deployed = Some(deploy_result.deployed as u64));
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::DeployMaterials { deployed, .. } = m {
+                            *deployed = deploy_result.deployed as u64;
+                        }
+                    });
+                    ctx.telemetry.item_completed(None);
+                    crate::logging::log_kv(
+                        "Pipeline",
+                        &format!(
+                            "Stage 8/8: Deployment completed (deployed {} material items).",
+                            deploy_result.deployed
                         ),
-                    ],
-                );
-                result.completed_phases.push("deployment".into());
+                        LogLevel::Success,
+                        &[
+                            ("deployedCount", serde_json::json!(deploy_result.deployed)),
+                            (
+                                "durationMs",
+                                serde_json::json!(stage_started.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                        ],
+                    );
+                    result.completed_phases.push("deployment".into());
+                }
             } else {
                 crate::logging::log(
                     "Pipeline",
@@ -780,24 +1022,53 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             );
         }
         let duration_ms = run_started.elapsed().as_secs_f64() * 1000.0;
-        crate::logging::log_kv(
-            "Pipeline",
-            &format!(
-                "Pipeline completed successfully in {}.",
-                crate::logging::formatter::format_duration(duration_ms)
-            ),
-            LogLevel::Success,
-            &[
-                ("durationMs", serde_json::json!(duration_ms)),
-                (
-                    "stages",
-                    serde_json::json!({
-                        "completedPhases": result.completed_phases,
-                        "remoteEvalSkipped": result.remote_eval_skipped,
-                    }),
+        if result.degraded {
+            let banner = "================================================================================\n\
+                          [WARN] [DEGRADED] PIPELINE FINISHED IN DEGRADED STATE\n\
+                          Stage 7/8 (MakeMaterials) generated 0 deliverables.\n\
+                          Inspect ./logs/mm_payload_logs/ for LLM call reasoning and errors.\n\
+                          ================================================================================";
+            crate::logging::log("Pipeline", banner, LogLevel::Warn);
+            crate::logging::log_kv(
+                "Pipeline",
+                &format!(
+                    "Pipeline finished with warnings (degraded) in {}.",
+                    crate::logging::formatter::format_duration(duration_ms)
                 ),
-            ],
-        );
+                LogLevel::Warn,
+                &[
+                    ("durationMs", serde_json::json!(duration_ms)),
+                    ("degraded", serde_json::json!(true)),
+                    (
+                        "stages",
+                        serde_json::json!({
+                            "completedPhases": result.completed_phases,
+                            "remoteEvalSkipped": result.remote_eval_skipped,
+                        }),
+                    ),
+                ],
+            );
+        } else {
+            crate::logging::log_kv(
+                "Pipeline",
+                &format!(
+                    "Pipeline completed successfully in {}.",
+                    crate::logging::formatter::format_duration(duration_ms)
+                ),
+                LogLevel::Success,
+                &[
+                    ("durationMs", serde_json::json!(duration_ms)),
+                    (
+                        "stages",
+                        serde_json::json!({
+                            "completedPhases": result.completed_phases,
+                            "remoteEvalSkipped": result.remote_eval_skipped,
+                        }),
+                    ),
+                ],
+            );
+        }
+        ctx.telemetry.item_started(None, None, None, None);
         Ok(result)
     };
     let outcome = run.await;

@@ -107,14 +107,17 @@ impl LiveStreamDisplay {
     /// Write one content delta through the response fader, closing the
     /// reasoning section first when it is still open.
     pub fn write_content(&mut self, chunk: &str) {
-        if !self.show_response || chunk.is_empty() {
+        if chunk.is_empty() {
+            return;
+        }
+        if self.printed_reasoning_header {
+            write_live_stream_end(GradientKey::Reasoning);
+            self.printed_reasoning_header = false;
+        }
+        if !self.show_response {
             return;
         }
         if !self.printed_response_header {
-            if self.printed_reasoning_header {
-                write_live_stream_end(GradientKey::Reasoning);
-                self.printed_reasoning_header = false;
-            }
             write_live_stream_start("Response Stream", GradientKey::Streaming);
             self.printed_response_header = true;
         }
@@ -147,6 +150,7 @@ pub struct StreamState {
     pub response_id: Option<String>,
     pub model: Option<String>,
     pub final_usage: Option<Value>,
+    pub upstream_provider: Option<String>,
 }
 
 /// Result of handling one SSE line.
@@ -212,6 +216,26 @@ pub fn handle_sse_line(
             .filter(|s| !s.is_empty())
         {
             state.model = Some(m.to_string());
+        }
+    }
+    if state.upstream_provider.is_none() {
+        if let Some(p) = chunk
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            state.upstream_provider = Some(p.to_string());
+        } else if let Some(summary) = chunk
+            .get("openrouter_metadata")
+            .and_then(|m| m.get("summary"))
+            .and_then(Value::as_str)
+        {
+            if let Some(selected) = summary.split(',').find_map(|part| {
+                let trimmed = part.trim();
+                trimmed.strip_prefix("selected=").map(str::to_string)
+            }) {
+                state.upstream_provider = Some(selected);
+            }
         }
     }
     if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -322,17 +346,27 @@ async fn consume_sse(
     line_sink: &mut dyn FnMut(&str) -> Result<bool>,
 ) -> Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut total_lines = 0usize;
     loop {
         let chunk = tokio::select! {
-            chunk = source.next_chunk() => chunk,
+            chunk = source.next_chunk() => chunk.map_err(|mut err| {
+                err.message = format!(
+                    "{} (stream severed after {} bytes, {} complete lines)",
+                    err.message, total_bytes, total_lines
+                );
+                err
+            }),
             _ = cancellation.cancelled() => {
                 return Err(AppError::message("Pipeline cancelled before operation started"));
             }
         }?;
         match chunk {
             Some(bytes) => {
+                total_bytes += bytes.len();
                 buffer.extend_from_slice(&bytes);
                 for line in take_complete_lines(&mut buffer) {
+                    total_lines += 1;
                     if !line_sink(&line)? {
                         return Ok(());
                     }
@@ -399,9 +433,20 @@ pub async fn stream_openai_compatible(
         ));
     }
 
-    let mut state = StreamState::default();
-    let mut display =
-        LiveStreamDisplay::new(request.show_reasoning_tokens, request.show_response_stream);
+    let upstream_provider = response
+        .headers()
+        .get("x-openrouter-provider")
+        .or_else(|| response.headers().get("x-provider-name"))
+        .and_then(|val| val.to_str().ok())
+        .map(str::to_string);
+
+    let mut state = StreamState {
+        upstream_provider,
+        ..Default::default()
+    };
+    let show_reasoning = request.show_reasoning_tokens && !request.suppress_stream_display;
+    let show_response = request.show_response_stream && !request.suppress_stream_display;
+    let mut display = LiveStreamDisplay::new(show_reasoning, show_response);
     let mut detector = StreamRepetitionDetector::new();
     let provider_name = request.provider.to_string();
     let model = request.model.clone();
@@ -478,6 +523,7 @@ pub async fn stream_openai_compatible(
         usage: billing_usage,
         response_id: state.response_id,
         model: Some(state.model.unwrap_or_else(|| request.model.clone())),
+        upstream_provider: state.upstream_provider,
     })
 }
 
@@ -634,5 +680,44 @@ mod tests {
             vec!["line two".to_string(), "line three".to_string()]
         );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn write_content_closes_reasoning_header_when_response_stream_disabled() {
+        let mut display = LiveStreamDisplay::new(true, false);
+        display.write_reasoning("pondering");
+        assert!(display.printed_reasoning_header);
+        assert!(!display.printed_response_header);
+
+        // When content arrives, reasoning must be closed even if response is not shown
+        display.write_content("answer text");
+        assert!(!display.printed_reasoning_header);
+        assert!(!display.printed_response_header);
+    }
+
+    #[test]
+    fn write_content_transitions_reasoning_to_response_when_response_stream_enabled() {
+        let mut display = LiveStreamDisplay::new(true, true);
+        display.write_reasoning("pondering");
+        assert!(display.printed_reasoning_header);
+        assert!(!display.printed_response_header);
+
+        // When content arrives with response enabled, reasoning is closed and response opened
+        display.write_content("answer text");
+        assert!(!display.printed_reasoning_header);
+        assert!(display.printed_response_header);
+
+        // Normal completion closes response header
+        display.finish();
+        assert!(!display.printed_response_header);
+    }
+
+    #[tokio::test]
+    async fn upstream_provider_parsed_from_chunk() {
+        let bytes = b"data: {\"id\":\"gen-1\",\"model\":\"test-model\",\"provider\":\"GMICloud\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n".to_vec();
+        let (state, result) = run_sse(bytes).await;
+        result.expect("stream should succeed");
+        assert_eq!(state.upstream_provider.as_deref(), Some("GMICloud"));
+        assert_eq!(state.content, "hello");
     }
 }

@@ -23,7 +23,7 @@ You may make reasonable common-sense inferences only when strongly supported by 
 # INPUTS
 
 1. `targJD` — Target Job Description text.
-2. `myResume` — the candidate's Resume text.
+2. `myResume` — The candidate's Resume text.
 3. `myTestimonials` — Testimonials regarding the candidate.
 
 ---
@@ -302,7 +302,7 @@ Do not treat an unknown employment type as sufficiently confirmed for a "very hi
 
 ## GATE 3 — RESIDENCY REQUIREMENTS
 
-FAIL only if an explicit residency requirement excludes Watervliet, New York / New York State.
+FAIL only if an explicit residency requirement excludes New York State (or candidate's home state).
 
 Examples:
 
@@ -430,10 +430,10 @@ Internally determine from `myResume`:
 
 Score:
 
-* **20:** the candidate's titled cybersecurity experience alone meets or exceeds the JD's relevant security requirement.
+* **20:** The candidate's titled cybersecurity experience alone meets or exceeds the JD's relevant security requirement.
 * **18:** Requirement is slightly above titled cybersecurity experience, but strongly supported by broader IT experience plus documented security responsibilities.
 * **15:** Requirement significantly exceeds titled cybersecurity experience, but the combined security experience, IT foundation, and documented achievements make candidacy credible.
-* **12:** the candidate meets a broader IT experience requirement even though security-specific years are lower.
+* **12:** The candidate meets a broader IT experience requirement even though security-specific years are lower.
 * **10:** Relevant experience requirement is Not Specified.
 * **8:** Requirement is moderately above the candidate's relevant experience and creates meaningful screening risk.
 * **5:** Requirement is significantly above the candidate's relevant background and interview probability is low.
@@ -457,14 +457,14 @@ Internally determine from `myResume`:
 
 Score:
 
-* **20:** the candidate's directly relevant professional IT/support experience meets or exceeds the JD's stated support/IT requirement.
+* **20:** The candidate's directly relevant professional IT/support experience meets or exceeds the JD's stated support/IT requirement.
 * **18:** Requirement is slightly above directly comparable titled support experience, but is strongly supported by broader enterprise IT, endpoint, infrastructure, troubleshooting, and remote-support experience.
 * **15:** Requirement exceeds the most directly comparable support experience, but the candidate's combined enterprise IT foundation, support history, endpoint work, and documented achievements make candidacy credible.
-* **12:** the candidate meets a broader IT experience requirement even though the exact support specialization or title history is less direct.
+* **12:** The candidate meets a broader IT experience requirement even though the exact support specialization or title history is less direct.
 * **10:** Relevant experience requirement is Not Specified.
 * **8:** Requirement is moderately above the candidate's relevant support background or demands a specialized support domain not strongly documented.
 * **5:** Requirement is significantly above the candidate's directly relevant support background and creates substantial screening risk.
-* **0:** Requirement is far beyond the candidate's career stage or substantially outside his support/enterprise IT background.
+* **0:** Requirement is far beyond the candidate's career stage or substantially outside their support/enterprise IT background.
 
 Do not artificially discount enterprise IT, desktop support, endpoint support, remote troubleshooting, systems administration, or end-user support simply because the position is not cybersecurity-focused.
 
@@ -809,7 +809,7 @@ Do not confuse required travel with optional company events, voluntary conferenc
 
 Maximum: **5 points**
 
-The candidate holds a Bachelor of Arts in Psychology.
+The candidate holds a Bachelor's degree (non-technical field).
 
 Evaluate both the **degree level** and any explicitly required **field of study**.
 
@@ -822,10 +822,10 @@ Score:
 * **3:** A specific technical or role-related Bachelor's field is preferred but not mandatory.
 * **3:** A specific technical or role-related Bachelor's degree is required, but the JD explicitly permits equivalent professional experience and the candidate's documented experience reasonably supports that equivalence.
 * **1:** Master's degree is preferred but not required.
-* **0:** A specific Bachelor's field is explicitly mandatory, no equivalent-experience provision is allowed, and the candidate's Bachelor of Arts in Psychology does not satisfy the stated field requirement.
+* **0:** A specific Bachelor's field is explicitly mandatory, no equivalent-experience provision is allowed, and the candidate's non-technical degree does not satisfy the stated field requirement.
 * **0:** Master's or PhD is explicitly mandatory and no acceptable equivalence provision is stated.
 
-Do not award full credit merely because the candidate has a Bachelor's degree if the JD explicitly mandates a specific field of study that his degree does not satisfy.
+Do not award full credit merely because the candidate has a Bachelor's degree if the JD explicitly mandates a specific field of study that their degree does not satisfy.
 
 Do not penalize the candidate for holding a nontechnical Bachelor's degree when the JD only requires an unspecified Bachelor's degree.
 

@@ -21,6 +21,7 @@ pub mod presets;
 pub mod runtime_paths;
 pub mod stages;
 pub mod statistics;
+pub mod telemetry;
 pub mod types;
 pub mod utils;
 

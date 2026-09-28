@@ -179,6 +179,7 @@ impl GlobalArgs {
                 .map(|key| key.trim().to_owned())
                 .filter(|key| !key.is_empty()),
             usage_tracker: None,
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryStore::new()),
             cancellation: tokio_util::sync::CancellationToken::new(),
             run_started_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

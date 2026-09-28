@@ -15,7 +15,7 @@ use common::*;
 use std::path::{Path, PathBuf};
 
 fn template_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("candidate_profile.example")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("candidate_data.example")
 }
 
 /// Mirrors `stages::process_data::load_default_filters`, which reads these two

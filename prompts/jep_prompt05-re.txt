@@ -9,7 +9,7 @@ POST-REMOTE-PREFILTER
 
 Please act as an expert talent-acquisition analyst and rigorous weighted-assessment engine.
 
-Please analyze `targJD` against the candidate's `myResume` and `candidateEvidenceProfile` to determine whether the opportunity is very highly aligned with his documented background, preferences, interview readiness, and realistic offer-conversion likelihood.
+Please analyze `targJD` against the candidate's `myResume` and `candidateEvidenceProfile` to determine whether the opportunity is very highly aligned with their documented background, preferences, interview readiness, and realistic offer-conversion likelihood.
 
 Evaluate Security/SecOps/Cybersecurity, Remote Support/Enterprise IT/Endpoint Support, materially hybrid Security+Support, and other roles as applicable.
 
@@ -396,7 +396,7 @@ without affirmative non-waivable pre-hire language.
 FAIL only if all five are true:
 
 1. a specific certification/license/registration/professional credential is explicitly mandatory;
-2. The candidate lacks it according to `myResume`;
+2. the candidate lacks it according to `myResume`;
 3. the JD affirmatively establishes active/pre-existing possession before employment/application, such as:
    * `must currently hold`;
    * `required at time of application`;
@@ -984,7 +984,7 @@ Maximum:
 
 The candidate holds:
 
-`Bachelor of Arts in Psychology`
+`Bachelor's Degree (Non-Technical Field)`
 
 Evaluate degree level and required field.
 
@@ -995,12 +995,12 @@ Evaluate degree level and required field.
 * `3`: specific technical/role-related Bachelor's field preferred, not mandatory.
 * `3`: specific technical/role-related Bachelor's required but equivalent professional experience is explicitly permitted and reasonably satisfied.
 * `1`: Master's preferred, not required.
-* `0`: specific Bachelor's field explicitly mandatory, no equivalent-experience provision, and Psychology does not satisfy it.
+* `0`: specific Bachelor's field explicitly mandatory, no equivalent-experience provision, and a non-technical degree does not satisfy it.
 * `0`: Master's/PhD explicitly mandatory with no acceptable equivalence.
 
 Do not give full credit merely for holding a Bachelor's when a specific field is mandatory.
 
-Do not penalize the Psychology degree when any Bachelor's suffices.
+Do not penalize the non-technical degree when any Bachelor's suffices.
 
 Never invent equivalent-experience permission.
 
@@ -1193,7 +1193,7 @@ Never claim:
 
 * CrowdStrike when only Carbon Black is documented;
 * CISSP if not held;
-* Computer Science when the degree is Psychology;
+* Computer Science when the degree is in a non-technical field;
 * cybersecurity years that are unrelated IT;
 * named technical proficiency based only on qualitative praise.
 
@@ -1211,7 +1211,7 @@ The relevant standard is not merely:
 
 but also:
 
-`Could the candidate credibly explain why his documented background makes him a strong candidate today?`
+`Could the candidate credibly explain why their documented background makes them a strong candidate today?`
 
 ---
 
@@ -1444,7 +1444,7 @@ The candidate is repeatedly described as:
 - effective at diagnosing support problems;
 - proactive in taking ownership rather than leaving users uncertain about resolution.
 
-His support behavior demonstrates persistence, practical troubleshooting judgment, and strong issue ownership.
+Their support behavior demonstrates persistence, practical troubleshooting judgment, and strong issue ownership.
 
 
 ### COMMUNICATION
@@ -1469,7 +1469,7 @@ The candidate demonstrates strong follow-through by:
 - maintaining ownership through resolution;
 - following up after support activity when appropriate.
 
-His service behavior reflects responsibility for outcomes rather than merely completing isolated technical actions.
+Their service behavior reflects responsibility for outcomes rather than merely completing isolated technical actions.
 
 
 ### CUSTOMER / USER SERVICE
@@ -1484,14 +1484,14 @@ The candidate is repeatedly described as:
 - accommodating;
 - professional.
 
-He combines technical support with a strong customer-service orientation.
+They combine technical support with a strong customer-service orientation.
 
-Users consistently describe positive service experiences and express high levels of appreciation for his assistance.
+Users consistently describe positive service experiences and express high levels of appreciation for their assistance.
 
 
 ### USER-CENTERED SUPPORT
 
-The candidate demonstrates sensitivity to the operational needs of the people he supports.
+The candidate demonstrates sensitivity to the operational needs of the people they support.
 
 Supported behaviors include:
 
@@ -1501,21 +1501,21 @@ Supported behaviors include:
 - helping users remain productive during technical difficulties;
 - adapting support delivery to user circumstances.
 
-His approach is service-oriented rather than purely technology-oriented.
+Their approach is service-oriented rather than purely technology-oriented.
 
 
 ### OPERATIONAL CONTINUITY
 
 The candidate demonstrates a strong focus on maintaining user and business continuity during technical problems.
 
-Documented qualitative evidence supports that he:
+Documented qualitative evidence supports that they:
 
-- works to minimize disruption;
-- prioritizes restoration of productive working conditions;
-- supports users through equipment or endpoint-related problems;
-- considers the practical operational consequences of technical failures.
+- work to minimize disruption;
+- prioritize restoration of productive working conditions;
+- support users through equipment or endpoint-related problems;
+- consider the practical operational consequences of technical failures.
 
-In healthcare-support contexts, users specifically valued his contribution to maintaining workflows that affected employee and patient experience.
+In healthcare-support contexts, users specifically valued their contribution to maintaining workflows that affected employee and patient experience.
 
 This profile does not independently establish proficiency with any specific healthcare or technical platform.
 
@@ -1530,7 +1530,7 @@ The candidate is repeatedly characterized as:
 - willing to assist others;
 - dependable in shared operational environments.
 
-His interpersonal style supports effective collaboration with both technical and nontechnical users.
+Their interpersonal style supports effective collaboration with both technical and nontechnical users.
 
 
 ### PROFESSIONALISM
@@ -1544,7 +1544,7 @@ The candidate consistently demonstrates:
 - accountability;
 - calm user interaction.
 
-Users describe him as someone they trust and value working with.
+Users describe them as someone they trust and value working with.
 
 
 ### SUPPORT EFFECTIVENESS
@@ -1556,7 +1556,7 @@ Users repeatedly report:
 - successful issue resolution;
 - useful troubleshooting;
 - meaningful operational assistance;
-- confidence in his support;
+- confidence in their support;
 - positive impact on their ability to work.
 
 This evidence supports qualitative conclusions about support effectiveness.
@@ -1580,7 +1580,7 @@ It does not independently establish professional use of a specific remote-suppor
 
 ### INTERVIEW-RELEVANT QUALITATIVE STRENGTHS
 
-When relevant to the JD, the candidate has strong evidence supporting his ability to credibly discuss:
+When relevant to the JD, the candidate has strong evidence supporting their ability to credibly discuss:
 
 - customer-service philosophy;
 - issue ownership;

@@ -19,6 +19,7 @@ use crate::presets::{
     get_preset, load_and_replace_prompt_template, load_presets, load_veritas_system_prompt,
 };
 use crate::statistics::{create_statistics_collector, StatisticsCollector};
+use crate::telemetry::StageMetrics;
 use crate::types::LogLevel;
 use crate::types::Provider;
 use crate::types::ProviderRouting;
@@ -26,6 +27,7 @@ use crate::utils::progress::{CompleteOptions, ProgressOptions, ProgressReporter}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +66,7 @@ pub struct JobClothOptions {
     pub show_reasoning: bool,
     /// Node `showResponseStream` (standalone default false; pipeline default true).
     pub show_stream: bool,
+    pub concurrent: usize,
 }
 
 impl Default for JobClothOptions {
@@ -85,6 +88,7 @@ impl Default for JobClothOptions {
             circuit_timeout_s: 60,
             show_reasoning: false,
             show_stream: false,
+            concurrent: 3,
         }
     }
 }
@@ -252,6 +256,7 @@ async fn call_llm_for_titles(
                 timeout_ms: options.openai_timeout_s.saturating_mul(1000),
                 show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
                 show_response_stream: options.show_stream,
+                suppress_stream_display: options.concurrent > 1,
                 reasoning_effort: options.reasoning_effort.clone(),
                 provider_routing: options.provider_routing.clone(),
                 json_mode: true,
@@ -498,12 +503,25 @@ pub async fn run(
         ("uniqueJobTitles", json!(titles.len())),
         ("batchSize", json!(options.batch)),
     ]);
+    ctx.telemetry.set_progress_total(planned_calls as u64);
+    ctx.telemetry.update_stage_metrics(|m| {
+        if let StageMetrics::JobCloth { total_batches, .. } = m {
+            *total_batches = Some(planned_calls as u64);
+        }
+    });
 
     if options.batch == 0 {
         let mut processed_count = 0usize;
         while processed_count < titles.len() {
             crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
             let remaining = &titles[processed_count..];
+            ctx.telemetry.item_started(
+                Some(1),
+                Some(1),
+                Some(format!("All {} job titles", remaining.len())),
+                None,
+            );
+            let item_start = Instant::now();
             let mut newly_processed = 0usize;
             let mut last_error: Option<AppError> = None;
             let success = if circuit.check_state() {
@@ -531,6 +549,7 @@ pub async fn run(
                 .await
                 {
                     Ok(results) => {
+                        ctx.telemetry.retry_streak_reset();
                         stats.record_api_call(true, call_started.elapsed().as_secs_f64() * 1000.0);
                         circuit.record_success();
                         newly_processed = results.len();
@@ -541,6 +560,7 @@ pub async fn run(
                         complete
                     }
                     Err(error) => {
+                        ctx.telemetry.retry_recorded();
                         stats.record_api_call(false, call_started.elapsed().as_secs_f64() * 1000.0);
                         crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
                         circuit.record_failure();
@@ -550,6 +570,19 @@ pub async fn run(
                 }
             };
             if !success {
+                ctx.telemetry.record_error();
+                ctx.telemetry.item_completed(Some(item_start.elapsed()));
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::JobCloth {
+                        completed_batches,
+                        errors,
+                        ..
+                    } = m
+                    {
+                        *completed_batches = completed_batches.saturating_add(1);
+                        *errors = errors.saturating_add(1);
+                    }
+                });
                 if options.sleep_ms > 0 {
                     crate::logging::log(
                         "JobCloth",
@@ -569,6 +602,18 @@ pub async fn run(
                 )));
             }
             processed_count += newly_processed;
+            ctx.telemetry.item_completed(Some(item_start.elapsed()));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::JobCloth {
+                    completed_batches,
+                    successful_jobs,
+                    ..
+                } = m
+                {
+                    *completed_batches = completed_batches.saturating_add(1);
+                    *successful_jobs = newly_processed as u64;
+                }
+            });
             progress.complete_with_context(
                 &[
                     ("jobTitlesCompleted", json!(processed_count)),
@@ -577,11 +622,311 @@ pub async fn run(
                 CompleteOptions::default(),
             );
         }
+    } else if options.concurrent > 1 {
+        let batches: std::collections::VecDeque<(usize, Vec<String>)> = titles
+            .chunks(options.batch)
+            .enumerate()
+            .map(|(i, c)| (i, c.to_vec()))
+            .collect();
+        let total_batches = batches.len();
+        let queue = std::sync::Arc::new(tokio::sync::Mutex::new(batches));
+        let circuit_shared = std::sync::Arc::new(std::sync::Mutex::new(circuit));
+        let stats_shared = std::sync::Arc::new(std::sync::Mutex::new(stats));
+        let progress_shared = std::sync::Arc::new(std::sync::Mutex::new(progress));
+        let analyses_shared = std::sync::Arc::new(std::sync::Mutex::new(analyses));
+        let fatal_error: std::sync::Arc<std::sync::Mutex<Option<AppError>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let concurrency = options.concurrent.min(total_batches).max(1);
+
+        let mut workers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> =
+            Vec::new();
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let circuit_shared = circuit_shared.clone();
+            let stats_shared = stats_shared.clone();
+            let progress_shared = progress_shared.clone();
+            let analyses_shared = analyses_shared.clone();
+            let fatal_error = fatal_error.clone();
+            let service = &service;
+            let preset = &preset;
+            let system = &system;
+            let resume = &resume;
+
+            workers.push(Box::pin(async move {
+                loop {
+                    if ctx.cancellation.is_cancelled() || fatal_error.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let task = {
+                        let mut q = queue.lock().await;
+                        q.pop_front()
+                    };
+                    let Some((batch_index, batch_titles)) = task else { break };
+
+                    ctx.telemetry.item_started(
+                        Some((batch_index + 1) as u64),
+                        Some(total_batches as u64),
+                        Some(format!("Batch {}/{} ({} titles)", batch_index + 1, total_batches, batch_titles.len())),
+                        None,
+                    );
+                    let batch_start = Instant::now();
+
+                    crate::logging::log_kv(
+                        "JobCloth",
+                        &format!(
+                            "Processing batch {}/{} ({} job titles)",
+                            batch_index + 1,
+                            total_batches,
+                            batch_titles.len()
+                        ),
+                        LogLevel::Info,
+                        &[
+                            ("batchNumber", json!(batch_index + 1)),
+                            ("totalBatches", json!(total_batches)),
+                            ("jobTitlesInBatch", json!(batch_titles.len())),
+                        ],
+                    );
+
+                    let mut batch_success = false;
+                    let mut batch_results: Vec<JobAnalysis> = Vec::new();
+                    let mut batch_last_error: Option<AppError> = None;
+
+                    for batch_attempt in 1..=options.batch_retry_attempts {
+                        if batch_attempt > 1 {
+                            ctx.telemetry.retry_recorded();
+                            let delay = options
+                                .batch_retry_delay_ms
+                                .saturating_mul(2u64.saturating_pow(batch_attempt - 2));
+                            if let Err(e) = abortable_delay(delay, &ctx.cancellation).await {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        }
+                        let is_tripped = circuit_shared.lock().unwrap().check_state();
+                        if is_tripped {
+                            let error = AppError::message(format!(
+                                "Circuit breaker is tripped. Skipping batch {}.",
+                                batch_index + 1
+                            ));
+                            circuit_shared.lock().unwrap().record_failure();
+                            batch_last_error = Some(error);
+                            continue;
+                        }
+                        let call_started = std::time::Instant::now();
+                        let call_progress_str = format!("{}/{}", batch_index + 1, total_batches);
+                        match call_llm_for_titles(
+                            ctx,
+                            &service,
+                            &preset,
+                            provider,
+                            &system,
+                            &resume,
+                            &batch_titles,
+                            false,
+                            options,
+                            Some(call_progress_str),
+                        )
+                        .await
+                        {
+                            Ok(results) => {
+                                ctx.telemetry.retry_streak_reset();
+                                stats_shared.lock().unwrap().record_api_call(true, call_started.elapsed().as_secs_f64() * 1000.0);
+                                circuit_shared.lock().unwrap().record_success();
+                                batch_results = results;
+                                batch_success = true;
+                                batch_last_error = None;
+                                break;
+                            }
+                            Err(error) => {
+                                if batch_attempt < options.batch_retry_attempts && !ctx.cancellation.is_cancelled() {
+                                    ctx.telemetry.retry_recorded();
+                                }
+                                stats_shared.lock().unwrap().record_api_call(false, call_started.elapsed().as_secs_f64() * 1000.0);
+                                if ctx.cancellation.is_cancelled() {
+                                    *fatal_error.lock().unwrap() = Some(AppError::message("Pipeline cancelled"));
+                                    return;
+                                }
+                                circuit_shared.lock().unwrap().record_failure();
+                                batch_last_error = Some(error);
+                            }
+                        }
+                    }
+
+                    if batch_success {
+                        ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                        let count = batch_results.len() as u64;
+                        ctx.telemetry.update_stage_metrics(|m| {
+                            if let StageMetrics::JobCloth { completed_batches, successful_jobs, .. } = m {
+                                *completed_batches = completed_batches.saturating_add(1);
+                                *successful_jobs = successful_jobs.saturating_add(count);
+                            }
+                        });
+                        progress_shared.lock().unwrap().complete_with_context(
+                            &[
+                                ("batchNumber", json!(batch_index + 1)),
+                                ("totalBatches", json!(total_batches)),
+                                ("jobTitlesInBatch", json!(batch_titles.len())),
+                            ],
+                            CompleteOptions::default(),
+                        );
+                        analyses_shared.lock().unwrap().extend(batch_results);
+                    } else if options.job_title_retry_attempts > 0 {
+                        crate::logging::log(
+                            "JobCloth",
+                            &format!(
+                                "Batch {} failed, attempting individual job title retries...",
+                                batch_index + 1
+                            ),
+                            LogLevel::Warn,
+                        );
+                        circuit_shared.lock().unwrap().reset();
+                        for title in &batch_titles {
+                            let mut success = false;
+                            let mut retry_count = 0u32;
+                            let mut last_error: Option<AppError> = None;
+                            while retry_count < options.job_title_retry_attempts && !success {
+                                if circuit_shared.lock().unwrap().check_state() {
+                                    let error = AppError::message(format!(
+                                        "Circuit breaker is tripped. Skipping job title: {title}"
+                                    ));
+                                    circuit_shared.lock().unwrap().record_failure();
+                                    last_error = Some(error);
+                                    retry_count += 1;
+                                    continue;
+                                }
+                                let call_started = std::time::Instant::now();
+                                let call_progress_str = format!("{}/{}", batch_index + 1, total_batches);
+                                match call_llm_for_titles(
+                                    ctx,
+                                    &service,
+                                    &preset,
+                                    provider,
+                                    &system,
+                                    &resume,
+                                    std::slice::from_ref(title),
+                                    true,
+                                    options,
+                                    Some(call_progress_str),
+                                )
+                                .await
+                                {
+                                    Ok(results) if !results.is_empty() => {
+                                        ctx.telemetry.retry_streak_reset();
+                                        stats_shared.lock().unwrap().record_api_call(
+                                            true,
+                                            call_started.elapsed().as_secs_f64() * 1000.0,
+                                        );
+                                        circuit_shared.lock().unwrap().record_success();
+                                        analyses_shared.lock().unwrap().extend(results);
+                                        success = true;
+                                    }
+                                    Ok(_) => {
+                                        stats_shared.lock().unwrap().record_api_call(
+                                            true,
+                                            call_started.elapsed().as_secs_f64() * 1000.0,
+                                        );
+                                        circuit_shared.lock().unwrap().record_failure();
+                                        retry_count += 1;
+                                    }
+                                    Err(error) => {
+                                        if retry_count + 1 < options.job_title_retry_attempts && !ctx.cancellation.is_cancelled() {
+                                            ctx.telemetry.retry_recorded();
+                                        }
+                                        stats_shared.lock().unwrap().record_api_call(
+                                            false,
+                                            call_started.elapsed().as_secs_f64() * 1000.0,
+                                        );
+                                        if ctx.cancellation.is_cancelled() {
+                                            *fatal_error.lock().unwrap() = Some(AppError::message("Pipeline cancelled"));
+                                            return;
+                                        }
+                                        circuit_shared.lock().unwrap().record_failure();
+                                        last_error = Some(error);
+                                        retry_count += 1;
+                                        if retry_count < options.job_title_retry_attempts {
+                                            let delay = 1000u64
+                                                .saturating_mul(2u64.saturating_pow(retry_count - 1));
+                                            if let Err(e) = abortable_delay(delay, &ctx.cancellation).await {
+                                                *fatal_error.lock().unwrap() = Some(e);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !success {
+                                ctx.telemetry.record_error();
+                                ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                                ctx.telemetry.update_stage_metrics(|m| {
+                                    if let StageMetrics::JobCloth { completed_batches, errors, .. } = m {
+                                        *completed_batches = completed_batches.saturating_add(1);
+                                        *errors = errors.saturating_add(1);
+                                    }
+                                });
+                                let message = last_error.map(|e| e.message).unwrap_or_default();
+                                *fatal_error.lock().unwrap() = Some(AppError::message(format!(
+                                    "Failed to process job title {title} after individual retries: {message}"
+                                )));
+                                return;
+                            }
+                        }
+                        ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                        ctx.telemetry.update_stage_metrics(|m| {
+                            if let StageMetrics::JobCloth { completed_batches, successful_jobs, .. } = m {
+                                *completed_batches = completed_batches.saturating_add(1);
+                                *successful_jobs = successful_jobs.saturating_add(batch_titles.len() as u64);
+                            }
+                        });
+                    } else {
+                        ctx.telemetry.record_error();
+                        ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                        ctx.telemetry.update_stage_metrics(|m| {
+                            if let StageMetrics::JobCloth { completed_batches, errors, .. } = m {
+                                *completed_batches = completed_batches.saturating_add(1);
+                                *errors = errors.saturating_add(1);
+                            }
+                        });
+                        let message = batch_last_error.map(|e| e.message).unwrap_or_default();
+                        *fatal_error.lock().unwrap() = Some(AppError::message(format!(
+                            "Failed to process batch {} after {} attempts: {}",
+                            batch_index + 1,
+                            options.batch_retry_attempts,
+                            message
+                        )));
+                        return;
+                    }
+                }
+            }));
+        }
+        crate::utils::join_all_borrowed(workers).await;
+        if let Some(err) = fatal_error.lock().unwrap().take() {
+            return Err(err);
+        }
+        stats = match std::sync::Arc::try_unwrap(stats_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("stats_shared still referenced"),
+        };
+        analyses = match std::sync::Arc::try_unwrap(analyses_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("analyses_shared still referenced"),
+        };
     } else {
         let mut titles_seen = 0usize;
         let total_batches = titles.chunks(options.batch).len();
         for (batch_index, batch_titles) in titles.chunks(options.batch).enumerate() {
             crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
+            ctx.telemetry.item_started(
+                Some((batch_index + 1) as u64),
+                Some(total_batches as u64),
+                Some(format!(
+                    "Batch {}/{} ({} titles)",
+                    batch_index + 1,
+                    total_batches,
+                    batch_titles.len()
+                )),
+                None,
+            );
+            let batch_start = Instant::now();
             crate::logging::log_kv(
                 "JobCloth",
                 &format!(
@@ -602,6 +947,7 @@ pub async fn run(
             let mut batch_last_error: Option<AppError> = None;
             for batch_attempt in 1..=options.batch_retry_attempts {
                 if batch_attempt > 1 {
+                    ctx.telemetry.retry_recorded();
                     let delay = options
                         .batch_retry_delay_ms
                         .saturating_mul(2u64.saturating_pow(batch_attempt - 2));
@@ -633,6 +979,7 @@ pub async fn run(
                 .await
                 {
                     Ok(results) => {
+                        ctx.telemetry.retry_streak_reset();
                         stats.record_api_call(true, call_started.elapsed().as_secs_f64() * 1000.0);
                         circuit.record_success();
                         batch_results = results;
@@ -641,6 +988,11 @@ pub async fn run(
                         break;
                     }
                     Err(error) => {
+                        if batch_attempt < options.batch_retry_attempts
+                            && !ctx.cancellation.is_cancelled()
+                        {
+                            ctx.telemetry.retry_recorded();
+                        }
                         stats.record_api_call(false, call_started.elapsed().as_secs_f64() * 1000.0);
                         crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
                         circuit.record_failure();
@@ -649,6 +1001,19 @@ pub async fn run(
                 }
             }
             if batch_success {
+                ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                let count = batch_results.len() as u64;
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::JobCloth {
+                        completed_batches,
+                        successful_jobs,
+                        ..
+                    } = m
+                    {
+                        *completed_batches = completed_batches.saturating_add(1);
+                        *successful_jobs = successful_jobs.saturating_add(count);
+                    }
+                });
                 progress.complete_with_context(
                     &[
                         ("batchNumber", json!(batch_index + 1)),
@@ -700,6 +1065,7 @@ pub async fn run(
                         .await
                         {
                             Ok(results) if !results.is_empty() => {
+                                ctx.telemetry.retry_streak_reset();
                                 stats.record_api_call(
                                     true,
                                     call_started.elapsed().as_secs_f64() * 1000.0,
@@ -717,6 +1083,11 @@ pub async fn run(
                                 retry_count += 1;
                             }
                             Err(error) => {
+                                if retry_count + 1 < options.job_title_retry_attempts
+                                    && !ctx.cancellation.is_cancelled()
+                                {
+                                    ctx.telemetry.retry_recorded();
+                                }
                                 stats.record_api_call(
                                     false,
                                     call_started.elapsed().as_secs_f64() * 1000.0,
@@ -747,8 +1118,34 @@ pub async fn run(
                         );
                     }
                 }
+                ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::JobCloth {
+                        completed_batches,
+                        successful_jobs,
+                        ..
+                    } = m
+                    {
+                        *completed_batches = completed_batches.saturating_add(1);
+                        *successful_jobs =
+                            successful_jobs.saturating_add(batch_titles.len() as u64);
+                    }
+                });
             }
             if !batch_success && batch_results.is_empty() {
+                ctx.telemetry.record_error();
+                ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::JobCloth {
+                        completed_batches,
+                        errors,
+                        ..
+                    } = m
+                    {
+                        *completed_batches = completed_batches.saturating_add(1);
+                        *errors = errors.saturating_add(1);
+                    }
+                });
                 let message = batch_last_error
                     .map(|error| error.message)
                     .unwrap_or_else(|| "unknown error".to_string());
@@ -775,6 +1172,19 @@ pub async fn run(
         }
     }
     let passing = passing_jobs(&jobs, &analyses);
+    ctx.telemetry.update_stage_metrics(|m| {
+        if let StageMetrics::JobCloth {
+            successful_jobs,
+            filtered_jobs,
+            ..
+        } = m
+        {
+            *successful_jobs = passing.len() as u64;
+            *filtered_jobs = jobs.len().saturating_sub(passing.len()) as u64;
+        }
+    });
+    ctx.telemetry
+        .update_funnel(|f| f.cloth_passed = Some(passing.len() as u64));
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }

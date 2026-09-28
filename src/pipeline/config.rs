@@ -42,6 +42,10 @@ pub struct PipelineConfig {
     pub routing_remoteeval: Option<ProviderRouting>,
     pub routing_jobjudge: Option<ProviderRouting>,
     pub routing_makematerials: Option<ProviderRouting>,
+    pub jc_concurrent: usize,
+    pub re_concurrent: usize,
+    pub jj_concurrent: usize,
+    pub mm_concurrent: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +89,10 @@ pub struct PipelineConfigArgs {
     pub provider_quant_remoteeval: Option<Vec<String>>,
     pub provider_quant_jobjudge: Option<Vec<String>>,
     pub provider_quant_makematerials: Option<Vec<String>>,
+    pub jc_concurrent: usize,
+    pub re_concurrent: usize,
+    pub jj_concurrent: usize,
+    pub mm_concurrent: usize,
 }
 
 /// Node buildStageRouting: merges a stage's explicit `only` list, its
@@ -148,6 +156,18 @@ pub fn build(ctx: &RunContext, args: PipelineConfigArgs) -> Result<PipelineConfi
         return Err(AppError::message(
             "--astro_auto_provider-top must be an integer of at least 1.",
         ));
+    }
+    if args.jc_concurrent == 0 {
+        return Err(AppError::message("--jc-concurrent must be at least 1"));
+    }
+    if args.re_concurrent == 0 {
+        return Err(AppError::message("--re-concurrent must be at least 1"));
+    }
+    if args.jj_concurrent == 0 {
+        return Err(AppError::message("--jj-concurrent must be at least 1"));
+    }
+    if args.mm_concurrent == 0 {
+        return Err(AppError::message("--mm-concurrent must be at least 1"));
     }
     let routing_jobcloth = build_stage_routing(
         args.provider_only_jobcloth,
@@ -229,6 +249,10 @@ pub fn build(ctx: &RunContext, args: PipelineConfigArgs) -> Result<PipelineConfi
         routing_remoteeval,
         routing_jobjudge,
         routing_makematerials,
+        jc_concurrent: args.jc_concurrent,
+        re_concurrent: args.re_concurrent,
+        jj_concurrent: args.jj_concurrent,
+        mm_concurrent: args.mm_concurrent,
     })
 }
 

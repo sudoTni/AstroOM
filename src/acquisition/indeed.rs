@@ -24,21 +24,11 @@ pub const INDEED_API_URL: &str = "https://apis.indeed.com/graphql";
 ///
 /// This is not a user secret: Indeed's own mobile application ships the same
 /// identifier to every device, so there is nothing to rotate and nothing to
-/// protect. It is embedded rather than required from a file or the
-/// environment so that relocating the executable, changing platform, or
+/// protect. It is embedded rather than read from a file or the environment
+/// precisely so that relocating the executable, changing platform, or
 /// omitting `.env` cannot stop the scraper from working.
-///
-/// A deployment that would rather supply its own credential from an external
-/// secret source can set [`INDEED_API_KEY_ENV`]; see
-/// [`resolve_indeed_api_key`] for the full precedence order.
 pub const DEFAULT_INDEED_CLIENT_KEY: &str =
     "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8";
-
-/// Environment variable that overrides the compiled-in Indeed client key.
-///
-/// Consulted ahead of [`DEFAULT_INDEED_CLIENT_KEY`] so the credential can be
-/// kept in a secret manager or a git-ignored `.env` rather than in source.
-pub const INDEED_API_KEY_ENV: &str = "ASTROOM_INDEED_API_KEY";
 
 const INDEED_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1";
 
@@ -228,39 +218,17 @@ fn representation_for(format: DescriptionFormat) -> DescriptionRepresentation {
 
 /// Resolves the credential to send as `indeed-api-key`.
 ///
-/// Precedence, highest first:
-///
-/// 1. an explicit non-blank `--indeed-api-key`;
-/// 2. a non-blank `$ASTROOM_INDEED_API_KEY` ([`INDEED_API_KEY_ENV`]), so the
-///    credential can be supplied from an external secret source;
-/// 3. the compiled-in public client identifier, which keeps a zero-config
-///    install scraping exactly as it always has.
-///
-/// A blank or whitespace-only value at any level is treated as absent and
-/// falls through, so an empty variable cannot silently break acquisition.
+/// An explicit non-blank `--indeed-api-key` wins; otherwise the compiled-in
+/// client identifier is used. Extracted so the precedence is directly
+/// testable without opening a socket.
 pub fn resolve_indeed_api_key(query: &AcquisitionQuery) -> String {
-    resolve_indeed_api_key_with(
-        query.indeed_api_key.as_deref(),
-        std::env::var(INDEED_API_KEY_ENV).ok(),
-    )
-}
-
-/// [`resolve_indeed_api_key`] with the two candidate sources supplied
-/// explicitly, so the precedence order is testable without mutating the
-/// process environment (which is global, and therefore racy under a parallel
-/// test runner).
-pub fn resolve_indeed_api_key_with(flag_value: Option<&str>, env_value: Option<String>) -> String {
-    non_blank(flag_value)
-        .or_else(|| non_blank(env_value.as_deref()))
-        .unwrap_or_else(|| DEFAULT_INDEED_CLIENT_KEY.to_string())
-}
-
-/// The trimmed value, or `None` when absent, empty, or whitespace-only.
-fn non_blank(value: Option<&str>) -> Option<String> {
-    value
+    query
+        .indeed_api_key
+        .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|key| !key.is_empty())
         .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_INDEED_CLIENT_KEY.to_string())
 }
 
 /// The header that carries the credential. Part of Indeed's request contract:

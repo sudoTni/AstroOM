@@ -388,6 +388,45 @@ where
     }
 }
 
+/// Drive a set of borrowed futures to completion concurrently, round-robin
+/// polling with yields between passes (no `futures` crate dependency).
+/// Preserves input order.
+pub async fn join_all_borrowed<T>(
+    futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + '_>>>,
+) -> Vec<T> {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut slots: Vec<Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + '_>>>> =
+        futures.into_iter().map(Some).collect();
+    let mut results: Vec<Option<T>> = Vec::with_capacity(slots.len());
+    for _ in 0..slots.len() {
+        results.push(None);
+    }
+
+    loop {
+        let mut any_pending = false;
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let Some(future) = slot else { continue };
+            match future.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(value) => {
+                    results[index] = Some(value);
+                    *slot = None;
+                }
+                std::task::Poll::Pending => any_pending = true,
+            }
+        }
+        if !any_pending {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.expect("join_all_borrowed result"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::BANNER;

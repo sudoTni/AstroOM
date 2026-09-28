@@ -120,16 +120,15 @@ ARGS=(
   --job-provider indeed,linkedin
   --search-terms-file "${PROFILE_DIR}/search_terms.txt"
   --api-key "$AOM_OR_API_KEY"
-  --jobcloth-preset "jc_glm-5.3-flash"
-  --remoteeval-preset "re_glm-5.3-flash"
-  --jobjudge-preset "jep_glm-5.3-flash"
-  --makematerials-preset "rop_glm-5.3-flash"
+  --jobcloth-preset "jc_sba"
+  --remoteeval-preset "re_sba"
+  --jobjudge-preset "jep_sba"
+  --makematerials-preset "rop_sba"
   --batch 10 --sleep 2 --results-wanted 200 --hours-old 24
-  --jc-provider astro_auto_provider --jc-provider-quant fp8 --jc-reasoning-effort low
-  --re-provider astro_auto_provider --re-provider-quant fp8 --re-reasoning-level high
-  --jj-provider astro_auto_provider --j-provider-quant fp8 --jj-reasoning-effort high
-  --mm-provider astro_auto_provider --mm-provider-quant fp8 --mm-reasoning-effort high
-  --astro_auto_provider-top 3
+  --jc-reasoning-effort high
+  --re-reasoning-level high
+  --jj-reasoning-effort high
+  --mm-reasoning-effort high
   --remote-only true --track-or-costs --internet-watchdog --log-cool-offs
 )
 

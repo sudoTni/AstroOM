@@ -11,13 +11,15 @@ use crate::presets::{
     get_preset, load_and_replace_prompt_template, load_presets, load_veritas_system_prompt,
 };
 use crate::statistics::create_statistics_collector;
+use crate::telemetry::StageMetrics;
 use crate::types::{LogLevel, ProviderRouting};
 use crate::utils::progress::{CompleteOptions, ProgressOptions, ProgressReporter};
 use crate::utils::shared::load_application_data;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct MakeMaterialsOptions {
@@ -46,6 +48,7 @@ pub struct MakeMaterialsOptions {
     /// reports success. Standalone commands rethrow it. When true, errors are
     /// swallowed (and the stats export is skipped, matching the pipeline).
     pub suppress_errors: bool,
+    pub concurrent: usize,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,6 +323,7 @@ async fn run_inner(
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         .replace([':', '.'], "-");
     let mut generated = 0;
+    let mut failed = 0;
     let total_jobs = jobs.len();
     let mut progress = ProgressReporter::new(ProgressOptions {
         label: "Stage 7/8: MakeMaterials".into(),
@@ -333,192 +337,765 @@ async fn run_inner(
         ("totalJobs", json!(total_jobs)),
         ("preset", json!(preset.name)),
     ]);
-    for (index, (job, payload)) in jobs.iter().zip(job_payloads.iter()).enumerate() {
-        crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
-        let id = job_keys[index].clone();
-        if processed_ids.contains(&id) {
+    ctx.telemetry.set_progress_total(total_jobs as u64);
+    ctx.telemetry.update_stage_metrics(|m| {
+        if let StageMetrics::MakeMaterials { pending, .. } = m {
+            *pending = total_jobs as u64;
+        }
+    });
+    if options.concurrent > 1 && !jobs.is_empty() {
+        let items: Vec<_> = jobs
+            .iter()
+            .zip(job_payloads.iter())
+            .enumerate()
+            .map(|(i, (j, p))| (i, j.clone(), p.clone(), job_keys[i].clone()))
+            .collect();
+        let queue = std::sync::Arc::new(tokio::sync::Mutex::new(VecDeque::from(items)));
+        let repo_shared = std::sync::Arc::new(std::sync::Mutex::new(repo));
+        let stats_mutex = std::sync::Mutex::new(&mut *stats);
+        let progress_shared = std::sync::Arc::new(std::sync::Mutex::new(progress));
+        let generated_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fatal_error: std::sync::Arc<std::sync::Mutex<Option<AppError>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let concurrency = options.concurrent.min(total_jobs).max(1);
+
+        let service = &service;
+        let preset = &preset;
+        let system = &system;
+        let resume = &resume;
+        let title = &title;
+        let summary = &summary;
+        let skills = &skills;
+        let testimonials = &testimonials;
+        let signature = &signature;
+        let timestamp = &timestamp;
+        let processed_ids = &processed_ids;
+        let stats_mutex = &stats_mutex;
+
+        let mut workers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> =
+            Vec::new();
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let repo_shared = repo_shared.clone();
+            let progress_shared = progress_shared.clone();
+            let generated_shared = generated_shared.clone();
+            let failed_shared = failed_shared.clone();
+            let fatal_error = fatal_error.clone();
+
+            workers.push(Box::pin(async move {
+                loop {
+                    if ctx.cancellation.is_cancelled() || fatal_error.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let task = {
+                        let mut q = queue.lock().await;
+                        q.pop_front()
+                    };
+                    let Some((index, job, payload, id)) = task else { break };
+                    if processed_ids.contains(&id) {
+                        ctx.telemetry.item_completed(None);
+                        ctx.telemetry.update_stage_metrics(|m| {
+                            if let StageMetrics::MakeMaterials { pending, .. } = m {
+                                *pending = pending.saturating_sub(1);
+                            }
+                        });
+                        progress_shared.lock().unwrap().complete_with_context(
+                            &[
+                                ("jobId", json!(id)),
+                                ("jobTitle", json!(job.title)),
+                                ("outcome", json!("checkpoint_skip")),
+                            ],
+                            CompleteOptions {
+                                suffix: Some("already generated from checkpoint".to_string()),
+                                ..Default::default()
+                            },
+                        );
+                        continue;
+                    }
+
+                    ctx.telemetry.item_started(
+                        Some((index + 1) as u64),
+                        Some(total_jobs as u64),
+                        job.title.clone(),
+                        job.company.clone(),
+                    );
+                    let item_start = Instant::now();
+
+                    let mut fields = HashMap::new();
+                    fields.insert("targJD".into(), payload);
+                    fields.insert("myResume".into(), resume.clone());
+                    fields.insert("myProfessionalTitle".into(), title.clone());
+                    fields.insert("myProfessionalSummary".into(), summary.clone());
+                    fields.insert("myKeySkills".into(), skills.clone());
+                    fields.insert("myTestimonials".into(), testimonials.clone());
+                    fields.insert(
+                        "cover_length".into(),
+                        if preset.model_id.contains("gpt-4.1") {
+                            "280".into()
+                        } else {
+                            options.cover_length.to_string()
+                        },
+                    );
+                    let prompt = match load_and_replace_prompt_template(&preset.prompt_template, &fields) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            *fatal_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    };
+                    let call_progress_str = format!("{}/{}", index + 1, total_jobs);
+                    crate::logging::log_kv(
+                        "MakeMaterials",
+                        &format!(
+                            "Generating materials for job {}/{}: \"{}\"",
+                            index + 1,
+                            total_jobs,
+                            job.title.as_deref().unwrap_or("Untitled")
+                        ),
+                        LogLevel::Info,
+                        &[
+                            ("jobIndex", json!(index + 1)),
+                            ("totalJobs", json!(total_jobs)),
+                            ("jobId", json!(id)),
+                            ("jobTitle", json!(job.title)),
+                            ("company", json!(job.company)),
+                        ],
+                    );
+                    let mut material_outcome = None;
+                    let mut last_error: Option<AppError> = None;
+                    for attempt in 0..3 {
+                        let api_started = std::time::Instant::now();
+                        let response = service
+                            .call(
+                                ctx,
+                                LlmRequest {
+                                    provider,
+                                    model: preset.model_id.clone(),
+                                    messages: vec![
+                                        ChatMessage {
+                                            role: "system".into(),
+                                            content: system.clone(),
+                                        },
+                                        ChatMessage {
+                                            role: "user".into(),
+                                            content: prompt.clone(),
+                                        },
+                                    ],
+                                    temperature: options.temperature.unwrap_or(preset.temperature),
+                                    top_p: options.top_p.unwrap_or(preset.top_p),
+                                    max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
+                                    timeout_ms: 30_000,
+                                    show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
+                                    show_response_stream: options.show_stream,
+                                    suppress_stream_display: options.concurrent > 1,
+                                    reasoning_effort: options.reasoning_effort.clone(),
+                                    provider_routing: options.provider_routing.clone(),
+                                    json_mode: false,
+                                    stage: Some("makeMaterials".into()),
+                                    call_progress: Some(call_progress_str.clone()),
+                                },
+                            )
+                            .await;
+
+                        match response {
+                            Ok(response) => {
+                                stats_mutex.lock().unwrap().record_api_call(true, api_started.elapsed().as_secs_f64() * 1000.0);
+                                match parse_materials_response(&response.content) {
+                                    Ok(mat) => {
+                                        ctx.telemetry.retry_streak_reset();
+                                        material_outcome = Some(mat);
+                                        break;
+                                    }
+                                    Err(parse_err) => {
+                                        if attempt < 2 {
+                                            ctx.telemetry.retry_recorded();
+                                        }
+                                        crate::logging::log(
+                                            "MakeMaterials",
+                                            &format!(
+                                                "Failed to parse generated materials response for job {} (attempt {}/3): {}",
+                                                id,
+                                                attempt + 1,
+                                                parse_err.message
+                                            ),
+                                            LogLevel::Warn,
+                                        );
+                                        last_error = Some(parse_err);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                stats_mutex.lock().unwrap().record_api_call(false, api_started.elapsed().as_secs_f64() * 1000.0);
+                                if error.code == "PATHOLOGICAL_REASONING_REPETITION" {
+                                    stats_mutex.lock().unwrap().record_repetition_error();
+                                }
+                                if attempt < 2 && !ctx.cancellation.is_cancelled() {
+                                    ctx.telemetry.retry_recorded();
+                                }
+                                if ctx.cancellation.is_cancelled() {
+                                    *fatal_error.lock().unwrap() = Some(error);
+                                    return;
+                                }
+                                crate::logging::log(
+                                    "MakeMaterials",
+                                    &format!(
+                                        "LLM call failed for job {} (attempt {}/3): {}",
+                                        id,
+                                        attempt + 1,
+                                        error.message
+                                    ),
+                                    LogLevel::Warn,
+                                );
+                                last_error = Some(error);
+                            }
+                        }
+
+                        if attempt < 2 {
+                            let delay = 2_u64.pow((attempt + 1) as u32) * 1000;
+                            if let Err(e) = abortable_delay(delay, &ctx.cancellation).await {
+                                *fatal_error.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        }
+                    }
+
+                    let material = match material_outcome {
+                        Some(mat) => mat,
+                        None => {
+                            let err_msg = last_error
+                                .map(|e| e.message)
+                                .unwrap_or_else(|| "Unknown error generating materials".to_string());
+                            failed_shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            stats_mutex.lock().unwrap().record_error("material_generation_failed", &err_msg);
+                            ctx.telemetry.record_error();
+                            ctx.telemetry.item_completed(Some(item_start.elapsed()));
+                            ctx.telemetry.update_stage_metrics(|m| {
+                                if let StageMetrics::MakeMaterials { failed_packages, pending, .. } = m {
+                                    *failed_packages = failed_packages.saturating_add(1);
+                                    *pending = pending.saturating_sub(1);
+                                }
+                            });
+                            crate::logging::log_kv(
+                                "MakeMaterials",
+                                &format!(
+                                    "Failed to generate materials for job {} ({}/{}): {}",
+                                    id,
+                                    index + 1,
+                                    total_jobs,
+                                    err_msg
+                                ),
+                                LogLevel::Error,
+                                &[
+                                    ("jobId", json!(id)),
+                                    ("jobTitle", json!(job.title)),
+                                    ("company", json!(job.company)),
+                                    ("error", json!(err_msg)),
+                                ],
+                            );
+                            progress_shared.lock().unwrap().complete_with_context(
+                                &[
+                                    ("jobId", json!(id)),
+                                    ("jobTitle", json!(job.title)),
+                                    ("company", json!(job.company)),
+                                    ("outcome", json!("failed")),
+                                ],
+                                CompleteOptions::default(),
+                            );
+                            if index + 1 < total_jobs {
+                                let delay = if options.jitter {
+                                    options.sleep_min_ms
+                                        + rand::random::<u64>()
+                                            % (options.sleep_max_ms.saturating_sub(options.sleep_min_ms) + 1)
+                                } else {
+                                    3_000
+                                };
+                                if let Err(e) = abortable_delay(delay, &ctx.cancellation).await {
+                                    *fatal_error.lock().unwrap() = Some(e);
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    let safe_job_title = material
+                        .resume_filename
+                        .replacen("Candidate_Materials_", "", 1)
+                        .replacen("Candidate_Resume_", "", 1)
+                        .replacen("Michael_Martini_Materials_", "", 1);
+                    let dir = ctx
+                        .paths
+                        .materials_dir
+                        .join(format!("{}_{}", safe(&safe_job_title), timestamp));
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        *fatal_error.lock().unwrap() = Some(e.into());
+                        return;
+                    }
+                    let output = dir.join(format!("{}.txt", safe(&material.resume_filename)));
+                    let body_title = job
+                        .title
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("N/A");
+                    let body_company = job
+                        .company
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("N/A");
+                    let body_url = job
+                        .url
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("N/A");
+                    let body_id = job
+                        .id
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("N/A");
+                    let body_posted_date = job
+                        .posted_date
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("N/A");
+                    let body = format!("# Job Metadata\n\n**Job Title:** {}\n**Company:** {}\n**Job URL:** {}\n**Job ID:** {}\n**Posted Date:** {}\n\n---\n\n# Materials Filename\n\n{}\n\n# Cover Letter Filename\n\n{}\n\n# Optimized & Tailored Professional Title\n\n{}\n\n# Optimized & Tailored Professional Summary\n\n{}\n\n# Optimized & Tailored Key Skills\n\n{}\n\n# Optimized & Tailored Cover Letter\n\n{}", body_title, body_company, body_url, body_id, body_posted_date, material.resume_filename, material.cover_letter_filename.unwrap_or_else(|| "Cover letter filename not generated.".into()), material.professional_title, material.professional_summary, material.key_skills, material.cover_letter);
+                    if let Err(e) = write_private_file(&output, body.as_bytes()) {
+                        *fatal_error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                    if let Err(e) = write_artifact_manifest(
+                        &output,
+                        "makeMaterials",
+                        serde_json::json!({"preset":preset.name,"model":preset.model_id,"jobTitle":body_title,"company":body_company}),
+                    ) {
+                        *fatal_error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                    if let Err(e) = repo_shared.lock().unwrap().record_job_in_checkpoint(
+                        "makeMaterials",
+                        signature,
+                        &preset.name,
+                        &preset.model_id,
+                        &id,
+                    ) {
+                        *fatal_error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                    stats_mutex.lock().unwrap().increment_counter("files.written");
+                    stats_mutex.lock().unwrap().increment_counter("materials.generated");
+                    generated_shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ctx.telemetry.item_completed(Some(item_start.elapsed()));
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::MakeMaterials { completed_packages, pending, .. } = m {
+                            *completed_packages = completed_packages.saturating_add(1);
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    ctx.telemetry.update_funnel(|f| {
+                        let current = f.materials_completed.unwrap_or(0);
+                        f.materials_completed = Some(current + 1);
+                    });
+                    progress_shared.lock().unwrap().complete_with_context(
+                        &[
+                            ("jobId", json!(id)),
+                            ("jobTitle", json!(job.title)),
+                            ("company", json!(job.company)),
+                            ("outcome", json!("generated")),
+                        ],
+                        CompleteOptions::default(),
+                    );
+                    if index + 1 < total_jobs {
+                        let delay = if options.jitter {
+                            options.sleep_min_ms
+                                + rand::random::<u64>()
+                                    % (options.sleep_max_ms.saturating_sub(options.sleep_min_ms) + 1)
+                        } else {
+                            3_000
+                        };
+                        if let Err(e) = abortable_delay(delay, &ctx.cancellation).await {
+                            *fatal_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+        crate::utils::join_all_borrowed(workers).await;
+        if let Some(err) = fatal_error.lock().unwrap().take() {
+            return Err(err);
+        }
+        repo = match std::sync::Arc::try_unwrap(repo_shared) {
+            Ok(m) => m.into_inner().unwrap(),
+            Err(_) => panic!("repo_shared still held"),
+        };
+        generated = generated_shared.load(std::sync::atomic::Ordering::SeqCst);
+        failed = failed_shared.load(std::sync::atomic::Ordering::SeqCst);
+    } else {
+        for (index, (job, payload)) in jobs.iter().zip(job_payloads.iter()).enumerate() {
+            crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
+            let id = job_keys[index].clone();
+            if processed_ids.contains(&id) {
+                ctx.telemetry.item_completed(None);
+                ctx.telemetry.update_stage_metrics(|m| {
+                    if let StageMetrics::MakeMaterials { pending, .. } = m {
+                        *pending = pending.saturating_sub(1);
+                    }
+                });
+                progress.complete_with_context(
+                    &[
+                        ("jobId", json!(id)),
+                        ("jobTitle", json!(job.title)),
+                        ("outcome", json!("checkpoint_skip")),
+                    ],
+                    CompleteOptions {
+                        suffix: Some("already generated from checkpoint".to_string()),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+            let mut fields = HashMap::new();
+            fields.insert("targJD".into(), payload.clone());
+            fields.insert("myResume".into(), resume.clone());
+            fields.insert("myProfessionalTitle".into(), title.clone());
+            fields.insert("myProfessionalSummary".into(), summary.clone());
+            fields.insert("myKeySkills".into(), skills.clone());
+            fields.insert("myTestimonials".into(), testimonials.clone());
+            fields.insert(
+                "cover_length".into(),
+                if preset.model_id.contains("gpt-4.1") {
+                    "280".into()
+                } else {
+                    options.cover_length.to_string()
+                },
+            );
+            let prompt = load_and_replace_prompt_template(&preset.prompt_template, &fields)?;
+            let call_progress_str = format!("{}/{}", index + 1, total_jobs);
+            ctx.telemetry.item_started(
+                Some((index + 1) as u64),
+                Some(total_jobs as u64),
+                job.title.clone(),
+                job.company.clone(),
+            );
+            let item_start = Instant::now();
+            crate::logging::log_kv(
+                "MakeMaterials",
+                &format!(
+                    "Generating materials for job {}/{}: \"{}\"",
+                    index + 1,
+                    total_jobs,
+                    job.title.as_deref().unwrap_or("Untitled")
+                ),
+                LogLevel::Info,
+                &[
+                    ("jobIndex", json!(index + 1)),
+                    ("totalJobs", json!(total_jobs)),
+                    ("jobId", json!(id)),
+                    ("jobTitle", json!(job.title)),
+                    ("company", json!(job.company)),
+                ],
+            );
+            let mut material_outcome = None;
+            let mut last_error: Option<AppError> = None;
+            for attempt in 0..3 {
+                let api_started = std::time::Instant::now();
+                let response = service
+                    .call(
+                        ctx,
+                        LlmRequest {
+                            provider,
+                            model: preset.model_id.clone(),
+                            messages: vec![
+                                ChatMessage {
+                                    role: "system".into(),
+                                    content: system.clone(),
+                                },
+                                ChatMessage {
+                                    role: "user".into(),
+                                    content: prompt.clone(),
+                                },
+                            ],
+                            temperature: options.temperature.unwrap_or(preset.temperature),
+                            top_p: options.top_p.unwrap_or(preset.top_p),
+                            max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
+                            timeout_ms: 30_000,
+                            show_reasoning_tokens: !ctx.display.hide_reasoning
+                                && options.show_reasoning,
+                            show_response_stream: options.show_stream,
+                            suppress_stream_display: false,
+                            reasoning_effort: options.reasoning_effort.clone(),
+                            provider_routing: options.provider_routing.clone(),
+                            json_mode: false,
+                            stage: Some("makeMaterials".into()),
+                            call_progress: Some(call_progress_str.clone()),
+                        },
+                    )
+                    .await;
+
+                match response {
+                    Ok(response) => {
+                        stats.record_api_call(true, api_started.elapsed().as_secs_f64() * 1000.0);
+                        match parse_materials_response(&response.content) {
+                            Ok(mat) => {
+                                ctx.telemetry.retry_streak_reset();
+                                material_outcome = Some(mat);
+                                break;
+                            }
+                            Err(parse_err) => {
+                                if attempt < 2 {
+                                    ctx.telemetry.retry_recorded();
+                                }
+                                crate::logging::log(
+                                "MakeMaterials",
+                                &format!(
+                                    "Failed to parse generated materials response for job {} (attempt {}/3): {}",
+                                    id,
+                                    attempt + 1,
+                                    parse_err.message
+                                ),
+                                LogLevel::Warn,
+                            );
+                                last_error = Some(parse_err);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        stats.record_api_call(false, api_started.elapsed().as_secs_f64() * 1000.0);
+                        if error.code == "PATHOLOGICAL_REASONING_REPETITION" {
+                            stats.record_repetition_error();
+                        }
+                        if attempt < 2 && !ctx.cancellation.is_cancelled() {
+                            ctx.telemetry.retry_recorded();
+                        }
+                        if ctx.cancellation.is_cancelled() {
+                            return Err(error);
+                        }
+                        crate::logging::log(
+                            "MakeMaterials",
+                            &format!(
+                                "LLM call failed for job {} (attempt {}/3): {}",
+                                id,
+                                attempt + 1,
+                                error.message
+                            ),
+                            LogLevel::Warn,
+                        );
+                        last_error = Some(error);
+                    }
+                }
+
+                if attempt < 2 {
+                    let delay = 2_u64.pow((attempt + 1) as u32) * 1000;
+                    abortable_delay(delay, &ctx.cancellation).await?;
+                }
+            }
+
+            let material = match material_outcome {
+                Some(mat) => mat,
+                None => {
+                    let err_msg = last_error
+                        .map(|e| e.message)
+                        .unwrap_or_else(|| "Unknown error generating materials".to_string());
+                    failed += 1;
+                    stats.record_error("material_generation_failed", &err_msg);
+                    ctx.telemetry.record_error();
+                    ctx.telemetry.item_completed(Some(item_start.elapsed()));
+                    ctx.telemetry.update_stage_metrics(|m| {
+                        if let StageMetrics::MakeMaterials {
+                            failed_packages,
+                            pending,
+                            ..
+                        } = m
+                        {
+                            *failed_packages = failed_packages.saturating_add(1);
+                            *pending = pending.saturating_sub(1);
+                        }
+                    });
+                    crate::logging::log_kv(
+                        "MakeMaterials",
+                        &format!(
+                            "Failed to generate materials for job {} ({}/{}): {}",
+                            id,
+                            index + 1,
+                            total_jobs,
+                            err_msg
+                        ),
+                        LogLevel::Error,
+                        &[
+                            ("jobId", json!(id)),
+                            ("jobTitle", json!(job.title)),
+                            ("company", json!(job.company)),
+                            ("error", json!(err_msg)),
+                        ],
+                    );
+                    progress.complete_with_context(
+                        &[
+                            ("jobId", json!(id)),
+                            ("jobTitle", json!(job.title)),
+                            ("company", json!(job.company)),
+                            ("outcome", json!("failed")),
+                        ],
+                        CompleteOptions::default(),
+                    );
+                    if index + 1 < jobs.len() {
+                        let delay = if options.jitter {
+                            options.sleep_min_ms
+                                + rand::random::<u64>()
+                                    % (options.sleep_max_ms.saturating_sub(options.sleep_min_ms)
+                                        + 1)
+                        } else {
+                            3_000
+                        };
+                        abortable_delay(delay, &ctx.cancellation).await?;
+                    }
+                    continue;
+                }
+            };
+            let safe_job_title = material
+                .resume_filename
+                .replacen("Candidate_Materials_", "", 1)
+                .replacen("Candidate_Resume_", "", 1)
+                .replacen("Michael_Martini_Materials_", "", 1);
+            let dir =
+                ctx.paths
+                    .materials_dir
+                    .join(format!("{}_{}", safe(&safe_job_title), timestamp));
+            std::fs::create_dir_all(&dir)?;
+            let output = dir.join(format!("{}.txt", safe(&material.resume_filename)));
+            let body_title = job
+                .title
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("N/A");
+            let body_company = job
+                .company
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("N/A");
+            let body_url = job
+                .url
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("N/A");
+            let body_id = job
+                .id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("N/A");
+            let body_posted_date = job
+                .posted_date
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("N/A");
+            let body = format!("# Job Metadata\n\n**Job Title:** {}\n**Company:** {}\n**Job URL:** {}\n**Job ID:** {}\n**Posted Date:** {}\n\n---\n\n# Materials Filename\n\n{}\n\n# Cover Letter Filename\n\n{}\n\n# Optimized & Tailored Professional Title\n\n{}\n\n# Optimized & Tailored Professional Summary\n\n{}\n\n# Optimized & Tailored Key Skills\n\n{}\n\n# Optimized & Tailored Cover Letter\n\n{}", body_title, body_company, body_url, body_id, body_posted_date, material.resume_filename, material.cover_letter_filename.unwrap_or_else(|| "Cover letter filename not generated.".into()), material.professional_title, material.professional_summary, material.key_skills, material.cover_letter);
+            write_private_file(&output, body.as_bytes())?;
+            write_artifact_manifest(
+                &output,
+                "makeMaterials",
+                serde_json::json!({"preset":preset.name,"model":preset.model_id,"jobTitle":body_title,"company":body_company}),
+            )?;
+            repo.record_job_in_checkpoint(
+                "makeMaterials",
+                &signature,
+                &preset.name,
+                &preset.model_id,
+                &id,
+            )?;
+            stats.increment_counter("files.written");
+            stats.increment_counter("materials.generated");
+            generated += 1;
+            ctx.telemetry.item_completed(Some(item_start.elapsed()));
+            ctx.telemetry.update_stage_metrics(|m| {
+                if let StageMetrics::MakeMaterials {
+                    completed_packages,
+                    pending,
+                    ..
+                } = m
+                {
+                    *completed_packages = completed_packages.saturating_add(1);
+                    *pending = pending.saturating_sub(1);
+                }
+            });
+            ctx.telemetry.update_funnel(|f| {
+                let current = f.materials_completed.unwrap_or(0);
+                f.materials_completed = Some(current + 1);
+            });
             progress.complete_with_context(
                 &[
                     ("jobId", json!(id)),
                     ("jobTitle", json!(job.title)),
-                    ("outcome", json!("checkpoint_skip")),
+                    ("company", json!(job.company)),
+                    ("outcome", json!("generated")),
                 ],
-                CompleteOptions {
-                    suffix: Some("already generated from checkpoint".to_string()),
-                    ..Default::default()
-                },
+                CompleteOptions::default(),
             );
-            continue;
+            if index + 1 < jobs.len() {
+                let delay = if options.jitter {
+                    options.sleep_min_ms
+                        + rand::random::<u64>()
+                            % (options.sleep_max_ms.saturating_sub(options.sleep_min_ms) + 1)
+                } else {
+                    // Node's non-jitter path uses `args.sleep ?? 3`; makeMaterials
+                    // defines no --sleep option, so it is always 3 seconds.
+                    3_000
+                };
+                abortable_delay(delay, &ctx.cancellation).await?;
+            }
         }
-        let mut fields = HashMap::new();
-        fields.insert("targJD".into(), payload.clone());
-        fields.insert("myResume".into(), resume.clone());
-        fields.insert("myProfessionalTitle".into(), title.clone());
-        fields.insert("myProfessionalSummary".into(), summary.clone());
-        fields.insert("myKeySkills".into(), skills.clone());
-        fields.insert("myTestimonials".into(), testimonials.clone());
-        fields.insert(
-            "cover_length".into(),
-            if preset.model_id.contains("gpt-4.1") {
-                "280".into()
-            } else {
-                options.cover_length.to_string()
-            },
-        );
-        let prompt = load_and_replace_prompt_template(&preset.prompt_template, &fields)?;
-        let call_progress_str = format!("{}/{}", index + 1, total_jobs);
-        crate::logging::log_kv(
-            "MakeMaterials",
-            &format!(
-                "Generating materials for job {}/{}: \"{}\"",
-                index + 1,
-                total_jobs,
-                job.title.as_deref().unwrap_or("Untitled")
-            ),
-            LogLevel::Info,
-            &[
-                ("jobIndex", json!(index + 1)),
-                ("totalJobs", json!(total_jobs)),
-                ("jobId", json!(id)),
-                ("jobTitle", json!(job.title)),
-                ("company", json!(job.company)),
-            ],
-        );
-        let api_started = std::time::Instant::now();
-        let response = service
-            .call(
-                ctx,
-                LlmRequest {
-                    provider,
-                    model: preset.model_id.clone(),
-                    messages: vec![
-                        ChatMessage {
-                            role: "system".into(),
-                            content: system.clone(),
-                        },
-                        ChatMessage {
-                            role: "user".into(),
-                            content: prompt,
-                        },
-                    ],
-                    temperature: options.temperature.unwrap_or(preset.temperature),
-                    top_p: options.top_p.unwrap_or(preset.top_p),
-                    max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
-                    timeout_ms: 30_000,
-                    show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
-                    show_response_stream: options.show_stream,
-                    reasoning_effort: options.reasoning_effort.clone(),
-                    provider_routing: options.provider_routing.clone(),
-                    json_mode: false,
-                    stage: Some("makeMaterials".into()),
-                    call_progress: Some(call_progress_str),
-                },
-            )
-            .await;
-        let response = match response {
-            Ok(response) => {
-                stats.record_api_call(true, api_started.elapsed().as_secs_f64() * 1000.0);
-                response
-            }
-            Err(error) => {
-                stats.record_api_call(false, api_started.elapsed().as_secs_f64() * 1000.0);
-                if error.code == "PATHOLOGICAL_REASONING_REPETITION" {
-                    stats.record_repetition_error();
-                }
-                return Err(error);
-            }
-        };
-        let material = parse_materials_response(&response.content)?;
-        let safe_job_title = material
-            .resume_filename
-            .replacen("Candidate_Materials_", "", 1);
-        let dir = ctx
-            .paths
-            .materials_dir
-            .join(format!("{}_{}", safe(&safe_job_title), timestamp));
-        std::fs::create_dir_all(&dir)?;
-        let output = dir.join(format!("{}.txt", safe(&material.resume_filename)));
-        let body_title = job
-            .title
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("N/A");
-        let body_company = job
-            .company
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("N/A");
-        let body_url = job
-            .url
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("N/A");
-        let body_id = job
-            .id
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("N/A");
-        let body_posted_date = job
-            .posted_date
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("N/A");
-        let body = format!("# Job Metadata\n\n**Job Title:** {}\n**Company:** {}\n**Job URL:** {}\n**Job ID:** {}\n**Posted Date:** {}\n\n---\n\n# Materials Filename\n\n{}\n\n# Cover Letter Filename\n\n{}\n\n# Optimized & Tailored Professional Title\n\n{}\n\n# Optimized & Tailored Professional Summary\n\n{}\n\n# Optimized & Tailored Key Skills\n\n{}\n\n# Optimized & Tailored Cover Letter\n\n{}", body_title, body_company, body_url, body_id, body_posted_date, material.resume_filename, material.cover_letter_filename.unwrap_or_else(|| "Cover letter filename not generated.".into()), material.professional_title, material.professional_summary, material.key_skills, material.cover_letter);
-        write_private_file(&output, body.as_bytes())?;
-        write_artifact_manifest(
-            &output,
-            "makeMaterials",
-            serde_json::json!({"preset":preset.name,"model":preset.model_id,"jobTitle":body_title,"company":body_company}),
-        )?;
-        repo.record_job_in_checkpoint(
+    }
+    // A materials checkpoint represents a batch/directory, not one output
+    // file. Only mark it complete if all jobs succeeded.
+    if failed == 0 {
+        repo.complete_stage_checkpoint(
             "makeMaterials",
             &signature,
             &preset.name,
             &preset.model_id,
-            &id,
+            "completed",
+            jobs.len() as i64,
         )?;
-        stats.increment_counter("files.written");
-        stats.increment_counter("materials.generated");
-        generated += 1;
-        progress.complete_with_context(
-            &[
-                ("jobId", json!(id)),
-                ("jobTitle", json!(job.title)),
-                ("company", json!(job.company)),
-                ("outcome", json!("generated")),
-            ],
-            CompleteOptions::default(),
+    } else {
+        crate::logging::log(
+            "MakeMaterials",
+            &format!(
+                "Batch finished with {failed} failure(s). Successfully generated {generated}/{} materials.",
+                jobs.len()
+            ),
+            LogLevel::Warn,
         );
-        if index + 1 < jobs.len() {
-            let delay = if options.jitter {
-                options.sleep_min_ms
-                    + rand::random::<u64>()
-                        % (options.sleep_max_ms.saturating_sub(options.sleep_min_ms) + 1)
-            } else {
-                // Node's non-jitter path uses `args.sleep ?? 3`; makeMaterials
-                // defines no --sleep option, so it is always 3 seconds.
-                3_000
-            };
-            abortable_delay(delay, &ctx.cancellation).await?;
-        }
     }
-    // A materials checkpoint represents a batch/directory, not one output
-    // file.  Mark it complete directly so the batch signature is reusable.
-    repo.complete_stage_checkpoint(
-        "makeMaterials",
-        &signature,
-        &preset.name,
-        &preset.model_id,
-        "completed",
-        jobs.len() as i64,
-    )?;
     repo.close()?;
     stats.record_operation("makeMaterials.complete", true);
-    crate::logging::log(
-        "MakeMaterials",
-        &format!("Successfully generated materials for {generated} job(s)"),
-        LogLevel::Success,
-    );
+    if generated == 0 && (failed > 0 || !jobs.is_empty()) {
+        crate::logging::log(
+            "MakeMaterials",
+            &format!(
+                "Stage 7/8 failed to produce deliverables: 0/{} materials generated ({failed} failure(s)).",
+                jobs.len()
+            ),
+            LogLevel::Warn,
+        );
+        let banner = "================================================================================\n\
+                      [WARN] [DEGRADED] MakeMaterials produced 0 deliverables!\n\
+                      Inspect ./logs/mm_payload_logs/ for LLM call reasoning and errors.\n\
+                      ================================================================================";
+        crate::logging::log("MakeMaterials", banner, LogLevel::Warn);
+    } else {
+        crate::logging::log(
+            "MakeMaterials",
+            &format!("Successfully generated materials for {generated} job(s)"),
+            if failed == 0 {
+                LogLevel::Success
+            } else {
+                LogLevel::Info
+            },
+        );
+    }
+    if generated == 0 && failed > 0 && !options.suppress_errors {
+        return Err(AppError::message(format!(
+            "Failed to generate materials for any of the {failed} job(s)"
+        )));
+    }
     Ok(MakeMaterialsResult {
         generated,
         materials_dir: ctx.paths.materials_dir.clone(),
@@ -533,5 +1110,11 @@ mod tests {
         let value = parse_materials_response("# Resume Filename\nA\n# Optimized & Tailored Professional Title\nT\n# Optimized & Tailored Professional Summary\nS\n# Optimized & Tailored Key Skills\nK\n# Optimized & Tailored Cover Letter\nC").unwrap();
         assert_eq!(value.resume_filename, "A");
         assert_eq!(value.cover_letter, "C");
+    }
+
+    #[test]
+    fn parse_materials_response_rejects_missing_sections() {
+        let result = parse_materials_response("# Resume Filename\nA\n# Cover Letter\nC");
+        assert!(result.is_err());
     }
 }

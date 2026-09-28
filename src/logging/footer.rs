@@ -164,13 +164,15 @@ enum Layout {
     Compact,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FooterState {
     /// Last row of the application scroll region.
     app_bottom: u16,
     /// First row of the footer.
     footer_top: u16,
     layout: Layout,
+    use_color: bool,
+    telemetry: Option<std::sync::Arc<crate::telemetry::TelemetryStore>>,
 }
 
 static STATE: OnceLock<Mutex<Option<FooterState>>> = OnceLock::new();
@@ -206,11 +208,14 @@ impl Drop for FooterGuard {
 ///
 /// Returns a guard even when the footer is unavailable, so the caller's exit
 /// path needs no conditional cleanup.
-pub fn install(use_color: bool) -> FooterGuard {
+pub fn install(
+    use_color: bool,
+    telemetry: Option<std::sync::Arc<crate::telemetry::TelemetryStore>>,
+) -> FooterGuard {
     if !is_supported(use_color) {
         return FooterGuard { installed: false };
     }
-    match install_inner() {
+    match install_inner(use_color, telemetry) {
         Ok(()) => {
             spawn_animation_thread();
             FooterGuard { installed: true }
@@ -225,7 +230,10 @@ pub fn install(use_color: bool) -> FooterGuard {
     }
 }
 
-fn install_inner() -> std::io::Result<()> {
+fn install_inner(
+    use_color: bool,
+    telemetry: Option<std::sync::Arc<crate::telemetry::TelemetryStore>>,
+) -> std::io::Result<()> {
     let Some((rows, _cols)) = current_terminal_size() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -249,13 +257,15 @@ fn install_inner() -> std::io::Result<()> {
     }
     let app_bottom = rows - footer_rows;
     let footer_top = app_bottom + 1;
-    write_stdout(&install_sequence(app_bottom, footer_top, layout))?;
 
     *state().lock().unwrap_or_else(|e| e.into_inner()) = Some(FooterState {
         app_bottom,
         footer_top,
         layout,
+        use_color,
+        telemetry,
     });
+    write_stdout(&install_sequence(app_bottom, footer_top, layout))?;
     Ok(())
 }
 
@@ -354,7 +364,13 @@ fn resize_sequence(current: &FooterState, desired: &FooterState, time_sec: f64) 
     sequence.push_str(&move_to(clear_top, 1));
     sequence.push_str(ERASE_TO_END_OF_DISPLAY);
     sequence.push_str(&set_scroll_region(desired.app_bottom));
-    sequence.push_str(&draw_footer(desired.layout, desired.footer_top, time_sec));
+    sequence.push_str(&draw_footer_inner(
+        desired.layout,
+        desired.footer_top,
+        time_sec,
+        desired.use_color,
+        desired.telemetry.as_deref(),
+    ));
     // Park the cursor last. Drawing the footer leaves it at the end of the
     // footer's final row, which is outside the region; without this the next
     // application line would be written into the banner. The steady-state
@@ -391,51 +407,63 @@ fn spawn_animation_thread() {
 /// Re-evaluates the layout for a resize and repaints. Cheap and side-effect
 /// free when the footer is not installed.
 pub fn repaint(time_sec: f64) {
-    let current = {
-        let guard = state().lock().unwrap_or_else(|e| e.into_inner());
-        *guard
-    };
-    let Some(current) = current else {
-        return;
-    };
+    let (current, desired) = {
+        let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = guard.clone() else {
+            return;
+        };
 
-    let desired = current_terminal_size().and_then(|(rows, cols)| {
-        if cols < MIN_COLS_FOR_FOOTER || rows <= FULL_FOOTER_ROWS {
-            return None;
+        let desired = current_terminal_size().and_then(|(rows, cols)| {
+            if cols < MIN_COLS_FOR_FOOTER || rows <= FULL_FOOTER_ROWS {
+                return None;
+            }
+            let layout = if rows >= MIN_ROWS_FOR_FULL_FOOTER {
+                Layout::Full
+            } else {
+                Layout::Compact
+            };
+            let footer_rows = match layout {
+                Layout::Full => FULL_FOOTER_ROWS,
+                Layout::Compact => COMPACT_FOOTER_ROWS,
+            };
+            Some(FooterState {
+                app_bottom: rows - footer_rows,
+                footer_top: rows - footer_rows + 1,
+                layout,
+                use_color: current.use_color,
+                telemetry: current.telemetry.clone(),
+            })
+        });
+
+        let Some(desired) = desired else {
+            // Too small to keep a footer: restore the terminal and let the plain
+            // output path continue.
+            drop(guard);
+            uninstall();
+            return;
+        };
+
+        let resized = desired.app_bottom != current.app_bottom || desired.layout != current.layout;
+        if resized {
+            *guard = Some(desired.clone());
         }
-        let layout = if rows >= MIN_ROWS_FOR_FULL_FOOTER {
-            Layout::Full
-        } else {
-            Layout::Compact
-        };
-        let footer_rows = match layout {
-            Layout::Full => FULL_FOOTER_ROWS,
-            Layout::Compact => COMPACT_FOOTER_ROWS,
-        };
-        Some(FooterState {
-            app_bottom: rows - footer_rows,
-            footer_top: rows - footer_rows + 1,
-            layout,
-        })
-    });
-
-    let Some(desired) = desired else {
-        // Too small to keep a footer: restore the terminal and let the plain
-        // output path continue.
-        uninstall();
-        return;
+        (current, desired)
     };
 
-    let resized = desired.app_bottom != current.app_bottom || desired.layout != current.layout;
-    let sequence = if resized {
-        *state().lock().unwrap_or_else(|e| e.into_inner()) = Some(desired);
+    let sequence = if desired.app_bottom != current.app_bottom || desired.layout != current.layout {
         resize_sequence(&current, &desired, time_sec)
     } else {
         // Steady state: bracket the footer write so the animation never
         // disturbs the application's cursor position.
         let mut sequence = String::new();
         sequence.push_str(SAVE_CURSOR);
-        sequence.push_str(&draw_footer(desired.layout, desired.footer_top, time_sec));
+        sequence.push_str(&draw_footer_inner(
+            desired.layout,
+            desired.footer_top,
+            time_sec,
+            desired.use_color,
+            desired.telemetry.as_deref(),
+        ));
         sequence.push_str(RESTORE_CURSOR);
         sequence
     };
@@ -447,13 +475,27 @@ pub fn repaint(time_sec: f64) {
 /// `time_sec` drives the same wave equation the startup banner uses, so the
 /// footer animates identically to the intro animation rather than being a
 /// different-looking effect.
-///
-/// The frame must **not** end with a newline. The footer occupies the last rows
-/// of the screen, so a trailing linefeed lands the cursor on the bottom row —
-/// outside the scroll region, where a further linefeed scrolls the entire
-/// screen and tears the banner out of its footer. Each frame therefore ends
-/// with the last glyph, and the cursor is repositioned explicitly.
 fn draw_footer(layout: Layout, top: u16, time_sec: f64) -> String {
+    let (use_color, telemetry) = {
+        let guard = state().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .map(|s| (s.use_color, s.telemetry.clone()))
+            .unwrap_or((true, None))
+    };
+    draw_footer_inner(layout, top, time_sec, use_color, telemetry.as_deref())
+}
+
+fn draw_footer_inner(
+    layout: Layout,
+    top: u16,
+    time_sec: f64,
+    use_color: bool,
+    telemetry: Option<&crate::telemetry::TelemetryStore>,
+) -> String {
+    let cols = current_terminal_size()
+        .map(|(_, c)| c as usize)
+        .unwrap_or(0);
     // The frame is emitted one row at a time, each terminated by `EL 0` before
     // the line feed, so no stale pixels survive to the right of the logo and no
     // dependence is placed on how a terminal scopes an erase relative to the
@@ -462,7 +504,7 @@ fn draw_footer(layout: Layout, top: u16, time_sec: f64) -> String {
     // would scroll the whole screen rather than the application region.
     let rows: Vec<String> = match layout {
         Layout::Full => render_strike_frame_custom(
-            false,
+            !use_color,
             time_sec,
             0.08 * (time_sec * 2.5).sin(),
             0.92 + 0.08 * (time_sec * 3.2).sin(),
@@ -475,11 +517,35 @@ fn draw_footer(layout: Layout, top: u16, time_sec: f64) -> String {
         Layout::Compact => vec![format!("  ASTROOM {}", crate::constants::APP_VERSION)],
     };
 
+    let telemetry_lines =
+        if layout == Layout::Full && cols >= crate::telemetry::COMPACT_TERMINAL_MIN_COLS {
+            if let Some(store) = telemetry {
+                let snap = store.snapshot();
+                let available_width = cols.saturating_sub(crate::telemetry::TOTAL_LOGO_FOOTPRINT);
+                crate::telemetry::render_telemetry_lines(
+                    &snap,
+                    available_width,
+                    use_color,
+                    std::time::Instant::now(),
+                )
+            } else {
+                vec![String::new(); crate::telemetry::FOOTER_ROW_COUNT]
+            }
+        } else {
+            vec![String::new(); crate::telemetry::FOOTER_ROW_COUNT]
+        };
+
     let mut sequence = String::new();
     sequence.push_str(&move_to(top, 1));
     let last = rows.len().saturating_sub(1);
     for (index, row) in rows.iter().enumerate() {
         sequence.push_str(row.trim_end_matches('\r'));
+        if let Some(telemetry_line) = telemetry_lines.get(index) {
+            if !telemetry_line.is_empty() {
+                sequence.push_str("    ");
+                sequence.push_str(telemetry_line);
+            }
+        }
         sequence.push_str(ERASE_TO_END_OF_LINE);
         if index != last {
             sequence.push('\n');
@@ -624,6 +690,8 @@ mod tests {
                 app_bottom: 31,
                 footer_top: 32,
                 layout,
+                use_color: false,
+                telemetry: None,
             };
             let sequence = uninstall_sequence(&previous);
             assert!(
@@ -668,11 +736,15 @@ mod tests {
                 app_bottom: 31,
                 footer_top: 32,
                 layout,
+                use_color: false,
+                telemetry: None,
             };
             let desired = FooterState {
                 app_bottom: 41,
                 footer_top: 42,
                 layout,
+                use_color: false,
+                telemetry: None,
             };
             let sequence = resize_sequence(&current, &desired, 0.0);
             assert!(
@@ -716,19 +788,25 @@ mod tests {
             app_bottom: 31,
             footer_top: 32,
             layout: Layout::Full,
+            use_color: false,
+            telemetry: None,
         };
         let grown = FooterState {
             app_bottom: 41,
             footer_top: 42,
             layout: Layout::Full,
+            use_color: false,
+            telemetry: None,
         };
         let shrink = FooterState {
             app_bottom: 21,
             footer_top: 22,
             layout: Layout::Full,
+            use_color: false,
+            telemetry: None,
         };
-        for (current, desired) in [(full, grown), (full, shrink)] {
-            let sequence = resize_sequence(&current, &desired, 0.0);
+        for (current, desired) in [(&full, &grown), (&full, &shrink)] {
+            let sequence = resize_sequence(current, desired, 0.0);
             let clear_top = current.footer_top.min(desired.footer_top);
             assert!(
                 sequence.contains(&move_to(clear_top, 1)),
