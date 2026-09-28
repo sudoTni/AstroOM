@@ -40,8 +40,8 @@ Terminal captures are in [`screenshots/`](screenshots).
 ## Privacy & Data Handling
 
 - **AstroOM has no telemetry.** Nothing is phoned home except the requests you explicitly make to the job boards and to your configured LLM provider.
-- **Your personal data lives in one place:** the `profile/` directory you create from `profile.example/`. The application only reads it; it never writes to it and never bundles it into a release.
-- **`profile/` is git-ignored.** Keep your résumé and testimonials out of version control and out of bug reports.
+- **Your personal data lives in one place:** the candidate profile directory, `candidate_profile/` by default. The application only reads it; it never writes to it and never bundles it into a release.
+- **The profile directory is git-ignored.** Keep your résumé and testimonials out of version control and out of bug reports.
 - Profile text is sent to whichever LLM provider your preset names (the shipped presets target OpenRouter). Treat it the same way you would any data you submit to a third-party API.
 - A public Indeed mobile client key is compiled into the binary; it is not a user secret. See "Credentials" below.
 
@@ -95,9 +95,18 @@ Each stage writes a JSON artifact plus a companion `<artifact>.json.manifest.jso
 
 ### 1. Prerequisites
 
-**Option A — use the prebuilt binary.** No toolchain needed.
+**Option A — use a prebuilt binary.** No toolchain needed.
 
-The repository ships prebuilt release binaries at `target/release/astroom` for Linux (`x86_64-unknown-linux-gnu`, glibc) and `target/x86_64-pc-windows-gnu/release/astroom.exe` for Windows (`x86_64-pc-windows-gnu`). They need the `config/`, `prompts/`, and `sysprompts/` directories alongside them, which is why the binaries are distributed inside the repository tree rather than as bare downloads.
+A release binary needs the `config/`, `prompts/`, and `sysprompts/` directories **next to it**. AstroOM locates them relative to its own executable path, not to your working directory and not to wherever it was built, so you can copy the whole directory anywhere:
+
+```
+astro/
+├── astroom            # or astroom.exe
+├── config/presets.json
+├── prompts/
+├── sysprompts/
+└── astro_launcher.bash # or astro_launcher.ps1
+```
 
 ```bash
 # Linux
@@ -109,7 +118,20 @@ The repository ships prebuilt release binaries at `target/release/astroom` for L
 .\target\x86_64-pc-windows-gnu\release\astroom.exe --help
 ```
 
-**Option B — build from source.** Requires the [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; CI uses `dtolnay/rust-toolchain@stable`) and a C compiler (GCC/Clang on Linux; MSVC C++ Build Tools or MinGW-w64 on Windows) for the bundled SQLite build.
+The `data/`, `logs/` and `materials/` directories are created on first run beside the executable. If they are not writable there, pass `--data-dir` / `--log-dir` / `--materials-dir`, or set `ASTROOM_HOME`.
+
+> **Linux runtime prerequisite:** the binary links against OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`) because `reqwest` uses the platform TLS stack. It is dynamically linked; check with `ldd target/release/astroom` before deploying to a minimal image.
+>
+> **Windows runtime prerequisite:** the GNU build needs only the Universal C Runtime, which ships with Windows 10 and later. It does not need OpenSSL (Windows uses Schannel) and does not need `libwinpthread-1.dll`.
+
+**Option B — build from source.** Requires the [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; CI uses `dtolnay/rust-toolchain@stable`).
+
+| | Linux | Windows (`x86_64-pc-windows-gnu`) |
+| :--- | :--- | :--- |
+| Rust target | `x86_64-unknown-linux-gnu` (default) | `rustup target add x86_64-pc-windows-gnu` |
+| C compiler | GCC or Clang, plus `pkg-config` and `libssl-dev` | MinGW-w64 (`gcc`, `g++`) — already on `PATH` in CI |
+| Why a C compiler | bundled SQLite (`rusqlite` `bundled`) and OpenSSL | bundled SQLite |
+| Linker | default | `x86_64-w64-mingw32-gcc`, which rustc selects automatically for this target; override with `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` if needed |
 
 ```bash
 # Clone the repository
@@ -122,24 +144,36 @@ cargo build --release        # -> target/release/astroom
 
 ```powershell
 # Windows (PowerShell)
-cargo build --release        # -> target\release\astroom.exe
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+#   -> target\x86_64-pc-windows-gnu\release\astroom.exe
 ```
+
+Cross-compiling from Linux to `x86_64-pc-windows-gnu` works with the same command as long as MinGW-w64 is installed (`x86_64-w64-mingw32-gcc`). No `.cargo/config.toml` is required: rustc's target specification already selects the MinGW linker for this target.
 
 ### 2. Candidate Profile Setup
 
-AstroOM keeps all personal job-search data outside the code, in a `profile/` directory. The repository ships an annotated template:
+AstroOM keeps all personal job-search data outside the code, in a candidate profile directory. It defaults to `candidate_profile/` and is selected with `--profile-dir`. The repository ships an annotated template — copy it and replace every file:
+
+```bash
+# Linux / macOS
+cp -r candidate_profile.example candidate_profile
+
+# Windows (PowerShell)
+Copy-Item -Recurse candidate_profile.example candidate_profile
+```
+
+See [`candidate_profile.example/README.md`](candidate_profile.example/README.md) for the copy step and a per-field description. You can point `--profile-dir` at any other location if you would rather keep it elsewhere:
 
 ```bash
 # Linux
-cp -r profile.example profile
-```
+./target/release/astroom preflight --profile-dir ~/job-search-profile --json
 
-```powershell
 # Windows (PowerShell)
-Copy-Item -Recurse profile.example profile
+.\astroom.exe preflight --profile-dir $HOME\job-search-profile --json
 ```
 
-Then replace the sample content in each file. See [`profile.example/README.md`](profile.example/README.md) for a per-field table. In short:
+`preflight` fails until the two required files exist and are non-empty, so it is the fastest way to confirm the profile is wired up before spending any tokens. The directory must contain these files:
 
 | File | Required | What goes in it |
 | :--- | :--- | :--- |
@@ -152,14 +186,18 @@ Then replace the sample content in each file. See [`profile.example/README.md`](
 | `company_filters.txt` | no | Company/agency names to exclude (case-insensitive substring match). |
 | `title_filters.txt` | no | Title keywords to exclude (case-insensitive substring match). |
 
-> The template content describes a **fictional** candidate. Replace it before your first run, or the generated application materials will describe someone who does not exist.
+> Everything in `candidate_profile.example/` is placeholder text. Replace all of it, or the generated application materials will describe the placeholder rather than you.
+
+> **Upgrading from an older checkout?** The default profile directory is now `candidate_profile/`, and only the new name is covered by `.gitignore`. If you still have a personal profile directory under the previous name, **rename it** (or move it outside the checkout and keep passing `--profile-dir`). Leaving it in place is not safe: it is no longer git-ignored, so a `git add .` would stage your résumé and testimonials.
 
 ### 3. Credentials
 
-AstroOM itself **reads no environment variables.** Every setting reaches it through an explicit CLI flag, passed with either:
+AstroOM reads **no behavioural configuration from the environment.** Every setting reaches it through an explicit CLI flag, passed with either:
 
 - `--api-key "<YOUR_KEY>"`, or
 - `--api-key-file /path/to/key` (mutually exclusive with `--api-key`).
+
+The only variables AstroOM consults itself are the optional `ASTROOM_HOME` and `ASTROOM_RESOURCE_DIR` path overrides described under *Where AstroOM looks for things*, the optional `ASTROOM_INDEED_API_KEY` Indeed credential override, plus `TERM` / `NO_COLOR` / `CI` for terminal-capability detection. None of them can change what the application does beyond where it reads and writes.
 
 For convenience the wrapper scripts (`astro_launcher.bash` / `astro_launcher.ps1`) read `AOM_OR_API_KEY` from a local `.env` and forward it:
 
@@ -177,7 +215,7 @@ notepad .env          # set AOM_OR_API_KEY
 
 `.env` is git-ignored. Never commit a real key; rotate any key that is ever committed or shared.
 
-The Indeed scraper uses a public Indeed mobile client key that is compiled into the binary. It is not a user secret. Supply your own with `--indeed-api-key` (or `AOM_INDEED_API_KEY`) if you have an Indeed API credential.
+The Indeed scraper uses a public Indeed mobile client key that is compiled into the binary, so a relocated binary scrapes exactly like an in-tree one and no configuration is required. It is not a user secret: Indeed's own mobile application ships the same identifier to every device. If you would rather keep the credential in a secret manager than rely on the compiled-in value, set `ASTROOM_INDEED_API_KEY` (it may be placed in the same git-ignored `.env`, which `astro_launcher.bash` / `astro_launcher.ps1` source for you) or pass `--indeed-api-key` on the command line. Precedence is `--indeed-api-key`, then `ASTROOM_INDEED_API_KEY`, then the compiled-in key; a blank value at either level is ignored rather than sent.
 
 ### 4. Running the Pipeline
 
@@ -194,6 +232,16 @@ Run the full 8-phase pipeline with the wrapper script:
 # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\astro_launcher.ps1
 ```
+
+Both launchers find the executable in this order, so a relocated install works without editing anything:
+
+1. `$ASTROOM_BIN` (`$env:ASTROOM_BIN` on Windows)
+2. `astroom` / `astroom.exe` next to the launcher
+3. `../bin/astroom`
+4. `target/release/astroom` (and `target/x86_64-pc-windows-gnu/release/astroom.exe`)
+5. `astroom` on `PATH`
+
+If none exists the launcher prints every location it searched and exits 1 — *before* it deletes the previous run's logs.
 
 The wrapper applies a tuned policy argv (presets, provider routing, `--remote-only`, cost tracking, internet watchdog) and appends any arguments you pass it **last**, so they override those defaults:
 
@@ -213,7 +261,7 @@ Or invoke the binary directly:
 # Linux
 ./target/release/astroom run-pipeline \
   --job-provider indeed,linkedin \
-  --profile-dir ./profile \
+  --profile-dir ./candidate_profile \
   --api-key "<YOUR_KEY>" \
   --jobcloth-preset jc_glm-5.3-flash \
   --remoteeval-preset re_glm-5.3-flash \
@@ -226,7 +274,7 @@ Or invoke the binary directly:
 # Windows (PowerShell)
 .\target\x86_64-pc-windows-gnu\release\astroom.exe run-pipeline `
   --job-provider indeed,linkedin `
-  --profile-dir .\profile `
+  --profile-dir .\candidate_profile `
   --api-key "<YOUR_KEY>" `
   --jobcloth-preset jc_glm-5.3-flash `
   --remoteeval-preset re_glm-5.3-flash `
@@ -239,12 +287,12 @@ Validate the setup before spending any tokens:
 
 ```bash
 # Linux
-./target/release/astroom preflight --profile-dir ./profile --json
+./target/release/astroom preflight --profile-dir ./candidate_profile --json
 ```
 
 ```powershell
 # Windows (PowerShell)
-.\target\x86_64-pc-windows-gnu\release\astroom.exe preflight --profile-dir .\profile --json
+.\target\x86_64-pc-windows-gnu\release\astroom.exe preflight --profile-dir .\candidate_profile --json
 ```
 
 ---
@@ -263,7 +311,7 @@ All subcommands support `--help` for comprehensive option listings.
 | `jobJudge` | Score and filter jobs based on candidate gates and alignment rules |
 | `makeMaterials` | Generate optimized, tailored resumes and cover letters for qualified opportunities |
 | `preflight` | Validate system prerequisites, runtime paths, API keys, and model presets |
-| `jobDb` | Inspect the local SQLite deduplication repository (`status`, `verify`, `backup`, `rotate-backups`) |
+| `jobdb` | Inspect the local SQLite deduplication repository (`status`, `verify`, `backup`, `rotate-backups`) |
 | `artifact` | Verify an artifact against its companion SHA-256 manifest (`artifact verify <file>`) |
 
 **Stage 5 (Remote Eval) has no standalone subcommand.** It runs inside `run-pipeline` when `--remote-only` is enabled, which is the only supported way to use it.
@@ -303,11 +351,29 @@ To use it:
 
 | Target | Status |
 | :--- | :--- |
-| `x86_64-unknown-linux-gnu` | **Primary target.** Full native Linux support. Prebuilt binary shipped. |
-| `x86_64-pc-windows-gnu` / `x86_64-pc-windows-msvc` | **Windows native.** Full native Windows support via `astro_launcher.ps1` or direct CLI execution. |
+| `x86_64-unknown-linux-gnu` | **Primary target.** Full native support, with the persistent animated banner. |
+| `x86_64-pc-windows-gnu` | **Windows native.** Full support via `astro_launcher.ps1` or direct CLI execution. |
 | Other POSIX (macOS, other Linux architectures) | Build from source with `cargo build --release`. |
 
-AstroOM natively dual-targets Linux and Windows. On Linux, it uses POSIX pipes and descriptors to tee its execution log (`src/logging/execution_log.rs`) and reads `/proc/self/status` for process metrics. On Windows, it uses Win32 standard handle redirection and pipes with virtual terminal processing for ANSI styling.
+AstroOM dual-targets Linux and Windows. Every OS-specific API lives in one auditable place, `src/platform/`:
+
+| Concern | Linux | Windows |
+| :--- | :--- | :--- |
+| Execution log (`src/logging/execution_log.rs`) | File-descriptor tee through POSIX pipes: captures *everything*, including foreign code and child processes. | API-level tee: AstroOM's own output is mirrored to the log file while the standard handles stay untouched, so the console cannot be corrupted. |
+| Artifact and log permissions | Mode `0600` / `0700`. | Inherited from the parent directory's ACL, which is user-private. |
+| Signals | SIGINT and SIGTERM, mapped to exit codes 130 and 143. | Ctrl+C (`CTRL_C_EVENT`), mapped to 130. Windows does not deliver SIGTERM to console processes. |
+| Terminal geometry | `TIOCGWINSZ`. | `GetConsoleScreenBufferInfo`. |
+| ANSI colour | Native. | `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled at startup; if that fails, AstroOM falls back to uncoloured output rather than printing escape sequences literally. |
+| Banner | Persistent animated footer in a scrolling region, preserving full terminal scrollback. | Bounded in-place animation. See below. |
+| Process metrics | `/proc/self/status` and `/proc/self/stat`. | Not available; reported as `0`, as on any non-Linux host. |
+
+### Banner behaviour
+
+On a Unix terminal of at least 30 rows and 64 columns, AstroOM reserves the bottom nine rows for a continuously animated banner and confines application output to the rows above with a DECSTBM scrolling region. Because the region scrolls rather than switching buffers, **the full application output stays in the terminal's native scrollback** and the user can scroll back to the first line. A full-screen or alternate-screen TUI would *not* provide this: the alternate buffer has no history.
+
+The footer is skipped — and the previous bounded in-place animation is used instead — when the terminal is smaller, when `TERM` is unset or `dumb`, when `NO_COLOR` or `CI` is set, when `--no-color`, `--json` or `--no-banner` is given, and **on all of Windows**, where legacy conhost either ignores scrolling regions or leaves one set after exit. In every skipped case the output is plain text with no cursor-control sequences, so redirecting to a file or piping into another program stays clean.
+
+Because the footer is continuous, `--banner-loops` no longer bounds it; the flag still bounds the fallback animation.
 
 ---
 
@@ -321,17 +387,43 @@ cargo test
 
 The test suite is fully offline. LLM-dependent paths run against a local mock OpenAI-compatible server (`tests/common/mod.rs`), and the Node-parity differential tests replay committed oracles from `tests/fixtures/`. The Node oracle generators in `tests/differential/` and the Node-vs-Rust CLI differ (`run_cli_differential.sh`) require a separate Node checkout of the predecessor project and are intentionally not part of `cargo test`.
 
+CI runs the same commands on Linux, plus `clippy`, `test` and a release build for `x86_64-pc-windows-gnu` on a Windows runner. Four integration suites are `#![cfg(unix)]` because they need POSIX facilities the Windows build does not have: `launcher` (bash), `deploy` (a shell `rclone` shim and POSIX signals), `watchdog` (a shell `ping` shim) and `signals` (`kill(2)`). Everything else, including the path-resolution and Indeed-credential suites, runs on both targets.
+
+### Where AstroOM looks for things
+
+Relative paths you type on the command line always resolve against your current working directory. Everything else is resolved from the executable outward:
+
+| What | Resolution order |
+| :--- | :--- |
+| `data/`, `logs/`, `materials/`, profile | explicit flag → `$ASTROOM_HOME` → resource root → executable directory → current directory |
+| `config/`, `prompts/`, `sysprompts/` | `$ASTROOM_RESOURCE_DIR` → executable directory → nearest ancestor that contains `config/presets.json` |
+
+The ancestor search is what keeps in-tree development working: `target/release/astroom` walks up to the repository root. **No build-machine path is compiled into the binary.** When a resource directory genuinely cannot be found, AstroOM says so and lists every location it searched, rather than falling back to a wrong directory or writing data somewhere unexpected.
+
+`ASTROOM_HOME`, `ASTROOM_RESOURCE_DIR` and `ASTROOM_INDEED_API_KEY` are the only environment variables AstroOM reads, and they are all optional — every command works with zero configuration. All other configuration reaches the application through explicit CLI flags.
+
 ### Reproducible releases
 
-`Cargo.lock` is committed. For a release build that contains no machine-specific paths, remap the build paths:
+`Cargo.lock` is committed, so builds are reproducible from the lockfile.
+
+AstroOM no longer embeds its application root at compile time, so a relocated binary needs no `RUSTFLAGS`. Rust still records source paths in panic-location strings, which is harmless debug metadata but does leak the builder's directory layout. If that matters to you, remap it:
 
 ```bash
-RUSTFLAGS="--remap-path-prefix=$(pwd)=/astroom --remap-path-prefix=$HOME=/build" \
+# Order matters: list the general prefix first and the more specific one last,
+# or the general rule wins and the project directory name survives.
+RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$(pwd)=/astroom" \
   cargo build --release
 sha256sum target/release/astroom > astroom-$(cat VERSION)-x86_64-unknown-linux-gnu.sha256
 ```
 
-Without the remap, Rust embeds source paths in panic-location strings, which leaks the builder's directory layout into the artifact.
+To confirm no *runtime* build path survived, check that the only absolute paths left in the binary are the toolchain's own `~/.cargo/registry/...` entries:
+
+```bash
+strings -a target/release/astroom | grep -c 'AstroOM-rust'   # 0 expected at runtime
+strings -a target/release/astroom | grep -c "$HOME"          # 0 expected at runtime
+```
+
+> **Cross-compiling to Windows?** The MinGW linker mangles the *import-library file path* into PE symbol names, and `--remap-path-prefix` is a `rustc` flag that cannot reach them. Build the `.exe` from a directory whose path contains no user or machine name (a container or CI workspace works well), otherwise the builder's home directory is embedded in the artifact.
 
 ---
 

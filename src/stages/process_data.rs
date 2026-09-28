@@ -104,8 +104,16 @@ pub async fn run(ctx: &RunContext, options: &ProcessDataOptions) -> Result<Proce
                 result.remote_filtered_entries += 1;
                 continue;
             }
-            let id = job.id.clone().expect("normalized jobs have an id");
-            let key = title_company_key(&job).expect("normalized jobs have title and company");
+            // `normalize_pipeline_job` and `has_identity` guarantee both of
+            // these, but a counted skip is strictly better than aborting the
+            // process on a malformed input artifact.
+            let (Some(id), Some(key)) = (
+                job.id.clone().filter(|id| !id.trim().is_empty()),
+                title_company_key(&job),
+            ) else {
+                result.retired_or_invalid_entries += 1;
+                continue;
+            };
             if id_index.contains_key(&id) {
                 result.duplicates_removed += 1;
                 continue;
@@ -114,8 +122,9 @@ pub async fn run(ctx: &RunContext, options: &ProcessDataOptions) -> Result<Proce
                 result.duplicates_removed += 1;
                 let existing = &output[existing_index];
                 if should_replace_duplicate(existing, &job) {
-                    let old_id = existing.id.clone().expect("normalized job id");
-                    id_index.remove(&old_id);
+                    if let Some(old_id) = existing.id.clone() {
+                        id_index.remove(&old_id);
+                    }
                     output[existing_index] = job;
                     id_index.insert(id, existing_index);
                 }
@@ -317,9 +326,19 @@ fn normalize_pipeline_job(value: Value) -> Option<JobInterface> {
     // acquiredAt in addition to source/id/title/company; without it a legacy
     // record that happens to carry a `source` field would be misparsed as a
     // canonical job by serde's permissive optional fields.
+    //
+    // The guard only checks that those fields are JSON *strings*, so `""`
+    // satisfies it. `to_legacy_job` then copies the empty values through
+    // unchanged, and `create_job_cloth_match_key` rejects them — which used to
+    // reach an `expect` below and abort the whole process. Reject them here,
+    // alongside the empty checks the legacy branch already applies.
     if CanonicalAcquiredJob::is_valid(&value) {
         if let Ok(canonical) = serde_json::from_value::<CanonicalAcquiredJob>(value.clone()) {
-            return Some(to_legacy_job(&canonical));
+            let job = to_legacy_job(&canonical);
+            if has_identity(&job) {
+                return Some(job);
+            }
+            return None;
         }
     }
     let mut job = serde_json::from_value::<JobInterface>(value).ok()?;
@@ -346,6 +365,18 @@ fn normalize_pipeline_job(value: Value) -> Option<JobInterface> {
         },
     );
     Some(job)
+}
+
+/// A job is usable only when it has a non-blank id, title and company.
+///
+/// The title/company pair is what the jobCloth cool-off key is built from, and
+/// `create_job_cloth_match_key` returns `None` for a blank value; a job that
+/// fails this check has no stable identity and must be counted as invalid
+/// rather than aborting the run.
+fn has_identity(job: &JobInterface) -> bool {
+    job.id.as_deref().is_some_and(|id| !id.trim().is_empty())
+        && job.title.as_deref().is_some_and(|t| !t.trim().is_empty())
+        && job.company.as_deref().is_some_and(|c| !c.trim().is_empty())
 }
 
 fn is_pipeline_url(value: &str) -> bool {
@@ -420,7 +451,8 @@ mod tests {
     fn context(temp: &TempDir) -> RunContext {
         RunContext {
             paths: Paths {
-                project_root: temp.path().to_path_buf(),
+                app_root: temp.path().to_path_buf(),
+                resource_root: None,
                 data_dir: temp.path().join("data"),
                 log_dir: temp.path().join("logs"),
                 materials_dir: temp.path().join("materials"),
@@ -521,9 +553,6 @@ mod tests {
 
     #[tokio::test]
     async fn processing_deduplicates_filters_and_writes_private_manifested_artifact() {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = TempDir::new().unwrap();
         let context = context(&temp);
         std::fs::create_dir_all(&context.paths.data_dir).unwrap();
@@ -565,10 +594,13 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id.as_deref(), Some("one"));
         #[cfg(unix)]
-        assert_eq!(
-            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                crate::platform::private_file::PRIVATE_FILE_MODE
+            );
+        }
         assert!(output.with_extension("json.manifest.json").exists());
     }
 }

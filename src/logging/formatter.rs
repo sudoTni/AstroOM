@@ -312,5 +312,12 @@ pub fn format_json(record: &LogRecord) -> String {
             out.insert("context".to_string(), Value::Object(context.clone()));
         }
     }
-    serde_json::to_string(&Value::Object(out)).unwrap_or_default()
+    // A blank line in --log-format json output would silently break a
+    // downstream JSONL consumer, so emit a parseable stand-in instead.
+    serde_json::to_string(&Value::Object(out)).unwrap_or_else(|error| {
+        format!(
+            "{{\"level\":\"{}\",\"component\":\"AstroOM\",\"message\":\"log record serialization failed: {}\"}}",
+            record.level, error
+        )
+    })
 }

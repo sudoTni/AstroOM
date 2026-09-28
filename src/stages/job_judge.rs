@@ -58,11 +58,33 @@ pub struct JobJudgeResult {
     pub passed: usize,
 }
 
+/// Strips a leading `data/` or `./data/` from a relative input path.
+///
+/// The CLI's documented default is `./data/clothed_jobs_*.json`, which is
+/// relative to the application root. `base_directory` is already the data
+/// directory, so the segment must be removed rather than nested a second
+/// `data` inside it. Both separators are accepted so a path typed as
+/// `.\data\…` on Windows behaves identically.
+fn strip_data_prefix(input: &Path) -> PathBuf {
+    let text = input.to_string_lossy().replace('\\', "/");
+    for prefix in ["./data/", "data/"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return PathBuf::from(rest);
+        }
+    }
+    input.to_path_buf()
+}
+
+/// Resolves `input` against `base_directory` when it is relative.
+///
+/// `base_directory` is the stage's data directory, not the application root: a
+/// relative `--input-file` names the pipeline's artifacts, which live in
+/// `--data-dir`. An absolute path is used unchanged.
 pub fn find_job_files(input: &Path, base_directory: &Path) -> Result<Vec<PathBuf>> {
     let input = if input.is_absolute() {
         input.to_path_buf()
     } else {
-        base_directory.join(input)
+        base_directory.join(strip_data_prefix(input))
     };
     let text = input.to_string_lossy();
     if !text.contains('*') {
@@ -443,6 +465,26 @@ fn filename(job: &JobInterface) -> String {
         + ".json"
 }
 
+/// Removes every regular file directly inside `dir`.
+///
+/// Non-recursive on purpose: these are flat per-job verdict directories, and
+/// recursing risks deleting a sibling pipeline artifact if a path is
+/// misconfigured.
+fn clear_directory(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(ctx: &RunContext, options: &JobJudgeOptions) -> Result<JobJudgeResult> {
     let api_key = ctx
         .api_key
@@ -451,14 +493,17 @@ pub async fn run(ctx: &RunContext, options: &JobJudgeOptions) -> Result<JobJudge
     let presets = load_presets()?;
     let preset = get_preset("jobJudge", &options.preset, &presets)?;
     let provider = preset.provider()?;
-    let data_dir = if options.output_file == Path::new("./data/astroapply_eval_") {
+    // `parent()` yields an empty path for a bare file name such as
+    // `out.json`, and `create_dir_all("")` succeeds, so the naive
+    // `parent().unwrap_or(data_dir)` would put jobDB.sqlite and the evaluation
+    // directories in the process working directory instead of --data-dir.
+    let data_dir = if crate::runtime_paths::is_default_sentinel(
+        &options.output_file,
+        "./data/astroapply_eval_",
+    ) {
         ctx.paths.data_dir.clone()
     } else {
-        options
-            .output_file
-            .parent()
-            .unwrap_or(&ctx.paths.data_dir)
-            .to_path_buf()
+        crate::runtime_paths::parent_or_default(&options.output_file, &ctx.paths.data_dir)
     };
     let pass_dir = data_dir.join("astroapply_eval_pass");
     let fail_dir = data_dir.join("astroapply_eval_fail");
@@ -466,7 +511,7 @@ pub async fn run(ctx: &RunContext, options: &JobJudgeOptions) -> Result<JobJudge
     for dir in [&pass_dir, &fail_dir, &dupe_dir] {
         std::fs::create_dir_all(dir)?;
     }
-    let files = find_job_files(&options.input_file, &ctx.paths.project_root)?;
+    let files = find_job_files(&options.input_file, &ctx.paths.data_dir)?;
     if files.is_empty() {
         return Err(AppError::message(format!(
             "No files matched {}",
@@ -483,6 +528,32 @@ pub async fn run(ctx: &RunContext, options: &JobJudgeOptions) -> Result<JobJudge
     });
     repo.initialize()?;
     repo.cleanup_expired()?;
+
+    // These verdict directories are never emptied between runs, so a re-run
+    // with a different preset or model left the previous run's verdicts in
+    // place — and `makeMaterials` reads *all* of `astroapply_eval_pass`, so it
+    // generated application materials for stale verdicts from a superseded
+    // model. Clear them, unless a resumable checkpoint exists for any input
+    // file: then they *are* the prior work and must be preserved.
+    let resuming = options.use_jobdb
+        && files.iter().any(|file| {
+            compute_file_hash(file).is_ok()
+                && check_stage_checkpoint(
+                    &repo,
+                    "jobJudge",
+                    file,
+                    &pass_dir,
+                    &preset.name,
+                    &preset.model_id,
+                )
+                .is_ok_and(|checkpoint| checkpoint.processed_job_ids.iter().next().is_some())
+        });
+    if !resuming {
+        for dir in [&pass_dir, &fail_dir, &dupe_dir] {
+            clear_directory(dir)?;
+        }
+    }
+
     let app = load_application_data(ctx);
     let system = load_veritas_system_prompt()?;
     let mut service = LlmService::new();

@@ -104,10 +104,25 @@ pub struct LlmResponse {
 pub struct LlmService {
     providers: HashMap<String, ProviderConfig>,
     default_provider: String,
-    request_count: AtomicU64,
-    reserved_output_tokens: AtomicU64,
     success_count: AtomicU64,
     failure_count: AtomicU64,
+    /// Per-provider circuit breakers.
+    ///
+    /// **Not wired into the live request path.** `record_success` and
+    /// `record_failure` are only reached from [`Self::call_with_retries`],
+    /// which is only called from [`Self::batch`], and `batch` has no callers —
+    /// every stage calls [`Self::call`] directly. A breaker whose state is
+    /// never updated can never open, so [`AppError::circuit_open`] is
+    /// unreachable in practice and the ~580 lines in `crate::circuit_breaker`
+    /// are inert for the LLM path.
+    ///
+    /// Stage-level resilience does exist: `stages::job_cloth` carries its own
+    /// `JcCircuitBreaker` (see `stages/job_cloth.rs`) and drives it from the
+    /// real call sites.
+    ///
+    /// Wiring this in is a deliberate behaviour change — it would start failing
+    /// runs that currently succeed — so it is documented rather than done.
+    #[allow(dead_code)]
     circuit_breakers: Mutex<HashMap<String, CircuitBreaker>>,
     usage_tracker: Option<Arc<Mutex<OpenRouterUsageTracker>>>,
 }
@@ -118,18 +133,29 @@ impl Default for LlmService {
     }
 }
 
-/// Port of maskSensitiveData: keep the first/last 4 characters of long
-/// secrets and mask the middle.
+/// Shortest secret we will partially reveal at all.
+const MASK_MIN_PARTIAL_LEN: usize = 12;
+/// Characters left visible at each end of a partially masked secret.
+const MASK_VISIBLE_EDGE: usize = 2;
+
+/// Masks a secret for logging, revealing at most [`MASK_VISIBLE_EDGE`]
+/// characters at each end and nothing at all for shorter values.
+///
+/// The previous rule revealed the first and last 4 characters of anything
+/// longer than 8, which for a 9-character secret printed 8 of its 9 characters
+/// in cleartext. Secrets are also frequently *shorter* than the 8-character
+/// threshold in proxy and internal-token configurations, so those are now
+/// masked completely rather than partially.
 fn mask_sensitive_data(data: &str) -> String {
     let chars: Vec<char> = data.chars().collect();
-    if chars.len() <= 8 {
+    if chars.len() < MASK_MIN_PARTIAL_LEN {
         return "*".repeat(chars.len());
     }
     let masked: String = chars
         .iter()
         .enumerate()
         .map(|(index, c)| {
-            if index < 4 || index >= chars.len() - 4 {
+            if index < MASK_VISIBLE_EDGE || index >= chars.len() - MASK_VISIBLE_EDGE {
                 *c
             } else {
                 '*'
@@ -165,8 +191,6 @@ impl LlmService {
         Self {
             providers: HashMap::new(),
             default_provider: "openrouter".to_string(),
-            request_count: AtomicU64::new(0),
-            reserved_output_tokens: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
             failure_count: AtomicU64::new(0),
             circuit_breakers: Mutex::new(HashMap::new()),
@@ -181,9 +205,6 @@ impl LlmService {
         providers: Vec<ProviderConfig>,
         default_provider: Provider,
     ) -> Result<()> {
-        self.request_count.store(0, Ordering::SeqCst);
-        self.reserved_output_tokens.store(0, Ordering::SeqCst);
-
         if providers.is_empty() {
             return Err(AppError::message("At least one provider must be specified"));
         }
@@ -304,13 +325,14 @@ impl LlmService {
             }
         }
         if let Some(budget) = ctx.budgets.max_llm_requests {
-            if self.request_count.load(Ordering::SeqCst) >= budget {
+            if ctx.budgets.meter.requests() >= budget {
                 return Err(AppError::message(format!(
                     "LLM request budget exhausted ({budget}). Set --max-llm-requests to raise the limit."
                 )));
             }
         }
-        self.request_count.fetch_add(1, Ordering::SeqCst);
+        // Charged only once the request is actually dispatched, so a call that
+        // fails provider resolution does not consume the run-level budget.
 
         let mut request = request;
         if ctx.display.hide_reasoning {
@@ -361,7 +383,7 @@ impl LlmService {
             }
         }
         if let Some(limit) = ctx.budgets.max_total_llm_output_tokens {
-            let reserved = self.reserved_output_tokens.load(Ordering::SeqCst);
+            let reserved = ctx.budgets.meter.reserved_output_tokens();
             if reserved + request.max_tokens as u64 > limit {
                 return Err(AppError::new(
                     "LLM_CALL_FAILED",
@@ -374,9 +396,6 @@ impl LlmService {
                 ));
             }
         }
-        self.reserved_output_tokens
-            .fetch_add(request.max_tokens as u64, Ordering::SeqCst);
-
         // These were explicit throwing stubs in the Node gateway. Preserve
         // that result even when no provider registry was configured.
         match request.provider {
@@ -391,6 +410,12 @@ impl LlmService {
                 "Provider {provider_name} not found and no default provider set"
             ))
         })?;
+
+        // Reserve output tokens now that the provider resolved and the request
+        // is genuinely going out on the wire.
+        ctx.budgets
+            .meter
+            .reserve_output_tokens(request.max_tokens as u64);
 
         let accounting_id =
             if request.provider == Provider::Openrouter && self.usage_tracker.is_some() {
@@ -917,7 +942,8 @@ mod tests {
     fn test_context(budgets: LlmBudgets) -> RunContext {
         RunContext {
             paths: Paths {
-                project_root: PathBuf::from("/tmp"),
+                app_root: PathBuf::from("/tmp"),
+                resource_root: None,
                 data_dir: PathBuf::from("/tmp"),
                 log_dir: PathBuf::from("/tmp"),
                 materials_dir: PathBuf::from("/tmp"),
@@ -1011,19 +1037,37 @@ mod tests {
     // --- budget enforcement (ported from test/llmBudget.test.js) -------------
 
     #[tokio::test]
-    async fn request_budget_prevents_calls_before_provider_activity() {
+    async fn request_budget_is_charged_only_for_dispatched_calls() {
         let ctx = test_context(LlmBudgets {
             max_llm_requests: Some(1),
             ..LlmBudgets::default()
         });
         let service = LlmService::new();
-        // First call fails (no providers configured), but still consumes budget.
+        // The first call fails at provider resolution, which is before dispatch,
+        // so it must not consume the run-level request budget.
         let first = service.call(&ctx, basic_request()).await;
         assert!(first.is_err());
-        // Second call is rejected by the budget before any provider activity.
-        let second = service.call(&ctx, basic_request()).await;
-        let error = second.expect_err("budget should be exhausted");
-        assert!(error.message.contains("LLM request budget exhausted (1)"));
+        assert_eq!(ctx.budgets.meter.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_budget_is_shared_across_stages() {
+        // `--max-llm-requests` is a global, run-level ceiling. Each LLM stage
+        // builds its own `LlmService`; if the counter lived on the service, a
+        // four-stage pipeline could issue four times the requested budget.
+        let ctx = test_context(LlmBudgets {
+            max_llm_requests: Some(2),
+            ..LlmBudgets::default()
+        });
+        let meter = ctx.budgets.meter.clone();
+        for _ in 0..2 {
+            meter.reserve_request();
+        }
+        let error = LlmService::new()
+            .call(&ctx, basic_request())
+            .await
+            .expect_err("budget should be exhausted");
+        assert!(error.message.contains("LLM request budget exhausted (2)"));
     }
 
     #[tokio::test]
@@ -1089,7 +1133,13 @@ mod tests {
         let service = LlmService::new();
         let mut request = basic_request();
         request.max_tokens = 12;
-        assert!(service.call(&ctx, request.clone()).await.is_err()); // reserves 12
+        // This call fails at provider resolution, before dispatch, so it must
+        // not reserve any of the run-level output-token budget.
+        assert!(service.call(&ctx, request.clone()).await.is_err());
+        assert_eq!(ctx.budgets.meter.reserved_output_tokens(), 0);
+
+        // Charge the meter directly to stand in for a dispatched request.
+        ctx.budgets.meter.reserve_output_tokens(12);
         let mut request = basic_request();
         request.max_tokens = 9; // 12 + 9 > 20
         let error = service
@@ -1158,11 +1208,20 @@ mod tests {
     }
 
     #[test]
-    fn mask_sensitive_data_keeps_edges() {
+    fn mask_sensitive_data_never_reveals_a_short_secret() {
+        // Fully masked below the partial-masking threshold, whatever its length.
         assert_eq!(mask_sensitive_data("short"), "*****");
+        // A 9-character secret used to print 8 of its 9 characters; the old
+        // rule revealed the first and last 4 of anything longer than 8.
+        assert_eq!(mask_sensitive_data("abcdefghi"), "*".repeat(9));
+        assert_eq!(mask_sensitive_data(""), "");
+    }
+
+    #[test]
+    fn mask_sensitive_data_keeps_a_narrow_edge_on_long_secrets() {
         assert_eq!(
             mask_sensitive_data("sk-or-verylongsecretkey"),
-            "sk-o***************tkey"
+            "sk*******************ey"
         );
     }
 

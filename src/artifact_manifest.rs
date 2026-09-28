@@ -133,24 +133,17 @@ pub fn verify_artifact_manifest(artifact_path: &Path) -> Result<Value> {
     }
 }
 
-/// Writes a file with mode 0600 (owner-only on Unix), creating or truncating.
+/// Writes a file with owner-only permissions, creating or truncating.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
+    let mut file = crate::platform::private_writer(path)
         .map_err(|err| AppError::message(format!("Failed to create {}: {err}", path.display())))?;
     file.write_all(contents)
         .map_err(|err| AppError::message(format!("Failed to write {}: {err}", path.display())))?;
     Ok(())
 }
 
-/// Atomic write via temp file + rename, mode 0600.
+/// Atomic write via temp file + rename, owner-only permissions.
 /// Temp name: `<file>.<pid>.<ts>.tmp` (same shape as Node).
 pub fn write_json_atomic_private(path: &Path, value: &Value) -> Result<()> {
     let body = serde_json::to_string_pretty(value)?;

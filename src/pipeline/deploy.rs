@@ -109,7 +109,19 @@ pub async fn deploy(
             Ok::<(), AppError>(())
         }
         .await;
-        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(error) = std::fs::remove_dir_all(&staging) {
+            // The staging directory holds un-deployed resume and cover-letter
+            // material, so a failure to remove it is worth reporting.
+            crate::logging::log_kv(
+                "Deployment",
+                &format!(
+                    "Could not remove the deployment staging directory {}: {error}",
+                    staging.display()
+                ),
+                LogLevel::Warn,
+                &[("path", serde_json::json!(staging.display().to_string()))],
+            );
+        }
         outcome?;
     } else {
         crate::logging::log(
@@ -121,7 +133,25 @@ pub async fn deploy(
     for entry in std::fs::read_dir(materials)? {
         let entry = entry?;
         let target = archive.join(entry.file_name());
-        if std::fs::rename(entry.path(), &target).is_err() {
+        if let Err(rename_error) = std::fs::rename(entry.path(), &target) {
+            // A cross-device move is the expected reason to fall back to
+            // copy-then-delete, but a permission failure or a Windows file lock
+            // looks identical here, so the reason is logged rather than lost.
+            crate::logging::log_kv(
+                "Deployment",
+                &format!(
+                    "Rename into the archive failed ({}); falling back to copy: {rename_error}",
+                    target.display()
+                ),
+                LogLevel::Debug,
+                &[
+                    (
+                        "source",
+                        serde_json::json!(entry.path().display().to_string()),
+                    ),
+                    ("target", serde_json::json!(target.display().to_string())),
+                ],
+            );
             if entry.path().is_dir() {
                 copy_dir(&entry.path(), &target)?
             } else {

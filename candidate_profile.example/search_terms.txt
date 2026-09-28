@@ -1,0 +1,7 @@
+# One target job title per line. Blank lines and #-comments are ignored.
+# These are matched against Indeed and LinkedIn search, so prefer the titles
+# postings actually use rather than internal jargon.
+
+Security Engineer
+Cloud Security Engineer
+Security Operations Engineer

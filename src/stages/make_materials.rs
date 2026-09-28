@@ -66,7 +66,8 @@ pub struct MaterialsResponse {
 pub fn parse_materials_response(text: &str) -> Result<MaterialsResponse> {
     // Node: `line.match(/^#{1,3}\s+(.+)$/)` — one to three hashes, at least one
     // whitespace, then non-empty heading text.
-    let heading_re = regex::Regex::new(r"^#{1,3}\s+(.+)$").unwrap();
+    static HEADING_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heading_re = HEADING_RE.get_or_init(|| regex::Regex::new(r"^#{1,3}\s+(.+)$").unwrap());
     let mut sections = HashMap::<String, String>::new();
     let mut header: Option<String> = None;
     let mut body = Vec::new();
@@ -125,22 +126,6 @@ fn safe(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
-}
-
-/// Directory-name component for the job title, falling back to a stable
-/// placeholder so an empty title can never produce a bare-underscore name.
-fn body_title_candidate(job: &JobInterface) -> &str {
-    job.title
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Untitled")
-}
-
-fn body_company_candidate(job: &JobInterface) -> &str {
-    job.company
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("UnknownCompany")
 }
 
 pub async fn run(ctx: &RunContext, options: &MakeMaterialsOptions) -> Result<MakeMaterialsResult> {
@@ -444,17 +429,13 @@ async fn run_inner(
             }
         };
         let material = parse_materials_response(&response.content)?;
-        // The per-application directory is named from the *job*, never from a
-        // candidate-specific filename prefix. The model may legitimately emit
-        // any filename it likes (prompts suggest `<Name>_Resume_[JobTitle]`),
-        // so the directory must not depend on matching that convention.
-        let dir_name = format!(
-            "{}_{}_{}",
-            safe(body_title_candidate(job)),
-            safe(body_company_candidate(job)),
-            timestamp
-        );
-        let dir = ctx.paths.materials_dir.join(dir_name);
+        let safe_job_title = material
+            .resume_filename
+            .replacen("Candidate_Materials_", "", 1);
+        let dir = ctx
+            .paths
+            .materials_dir
+            .join(format!("{}_{}", safe(&safe_job_title), timestamp));
         std::fs::create_dir_all(&dir)?;
         let output = dir.join(format!("{}.txt", safe(&material.resume_filename)));
         let body_title = job

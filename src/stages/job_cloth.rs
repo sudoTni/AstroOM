@@ -377,7 +377,12 @@ pub async fn run(
     let presets = load_presets()?;
     let preset = get_preset("jobCloth", &options.preset, &presets)?;
     let provider = preset.provider()?;
-    let repo_dir = output.parent().unwrap_or(&ctx.paths.data_dir);
+    // `parent()` yields an empty path for a bare file name such as
+    // `out.json`, and `create_dir_all("")` succeeds, so the naive
+    // `parent().unwrap_or(data_dir)` would put jobDB.sqlite in the process
+    // working directory instead of --data-dir. See the same note in
+    // `stages::job_judge::run`.
+    let repo_dir = crate::runtime_paths::parent_or_default(output, &ctx.paths.data_dir).clone();
     let mut repository = JobRepository::new(JobRepositoryConfig {
         db_file_path: repo_dir.join("jobDB.sqlite"),
         legacy_json_path: Some(repo_dir.join("jobDB.json")),
@@ -848,6 +853,11 @@ impl JobAnalysis {
 /// Parse Node-compatible response envelopes: array, `{jobs}`, `{results}`,
 /// `{jobTitles}`, `{data}`, or a single analysis object.
 pub fn parse_analysis_results(content: &str) -> Result<Vec<JobAnalysis>> {
+    // `try_parse_json` never returns `None`: its final fallback is a partial
+    // extraction that yields an empty array when nothing is parseable. So this
+    // guard cannot fire, and an entirely unparseable response would otherwise
+    // arrive here as `Value::Array([])`, become `Ok(vec![])`, be recorded as a
+    // *successful* batch, and silently drop every job title in that batch.
     let value = try_parse_json(content)
         .ok_or_else(|| AppError::message("jobCloth LLM response did not contain valid JSON"))?;
     let values = match value {
@@ -870,6 +880,14 @@ pub fn parse_analysis_results(content: &str) -> Result<Vec<JobAnalysis>> {
             ))
         }
     };
+    // Node ran `z.array(JobAnalysisSchema).min(1)`, so an empty result set was
+    // a parse failure, not a successful empty batch. Matches job_judge and
+    // remote_eval, which already reject the empty array.
+    if values.is_empty() {
+        return Err(AppError::message(
+            "jobCloth response must contain at least one result",
+        ));
+    }
     values.into_iter().map(parse_analysis).collect()
 }
 

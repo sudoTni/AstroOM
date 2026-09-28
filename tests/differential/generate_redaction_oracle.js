@@ -15,10 +15,28 @@ if (!nodeRepo) {
 }
 const redaction = require(path.join(nodeRepo, "dist/logging/redaction.js"));
 
+// The 64-character OpenRouter-shaped value is the one input that cannot be
+// stored literally: GitHub push protection rejects any push containing
+// `sk-or-v1-` + 64 hex characters in a tracked file, test fixtures included. It
+// is emitted as a placeholder and rebuilt by tests/redaction_differential.rs
+// before the oracle is replayed, so the inputs Node saw and the inputs the
+// Rust port sees stay byte-identical.
+//
+// Only `input` is placeholder-substituted. `output` is emitted verbatim, so a
+// regression that leaked the key into the sanitized output would still show up
+// as a fixture diff (and as a push-protection failure) rather than being
+// silently masked here.
+const FAKE_OPENROUTER_KEY = "a".repeat(64);
+const FAKE_OPENROUTER_KEY_PLACEHOLDER = "<FAKE_OPENROUTER_KEY>";
+const placeholderize = (value) =>
+  value.split(FAKE_OPENROUTER_KEY).join(FAKE_OPENROUTER_KEY_PLACEHOLDER);
+
 const strings = [
   "",
   "plain text without secrets",
-  "key=sk-or-v1-" + "a".repeat(64),
+  "key=sk-or-v1-" + FAKE_OPENROUTER_KEY,
+  // 63 characters: one short of the OpenRouter pattern, so it must fall through
+  // to the generic `sk-` rule instead. Kept literal; it matches no secret shape.
   "key=sk-or-v1-" + "a".repeat(63),
   "token sk-abcdefghijklmnopqrstuvwxyz",
   "token sk-short",
@@ -38,7 +56,7 @@ const strings = [
   "x".repeat(10001),
   "x".repeat(20000),
   "prefix " + "y".repeat(20000) + " suffix",
-  "sk-or-v1-" + "a".repeat(64) + " " + "z".repeat(20000),
+  "sk-or-v1-" + FAKE_OPENROUTER_KEY + " " + "z".repeat(20000),
 ];
 
 const contexts = [
@@ -71,7 +89,7 @@ contexts.push(deepObject(9));
 
 const out = {
   strings: strings.map((input) => ({
-    input,
+    input: placeholderize(input),
     output: redaction.sanitizeString(input),
   })),
   contexts: contexts.map((input) => ({
@@ -79,7 +97,4 @@ const out = {
     output: redaction.sanitizeContext(input, 0, new WeakSet()),
   })),
 };
-const syntheticOrKey = "sk-or-v1-" + "a".repeat(64);
-const placeholder = "__SK_OR_V1_64A__";
-const serialized = JSON.stringify(out, null, 2).replaceAll(syntheticOrKey, placeholder);
-console.log(serialized);
+console.log(JSON.stringify(out, null, 2));

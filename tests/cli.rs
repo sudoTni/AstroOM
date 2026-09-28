@@ -66,9 +66,8 @@ fn execution_log_is_created_private_and_directory_is_0700() {
         String::from_utf8_lossy(&output.stderr)
     );
     let log_file = find_file_starting_with(&logs, "astroom_jobdb_").expect("execution log created");
-    assert_eq!(mode_of(&log_file), 0o600);
-    #[cfg(unix)]
-    assert_eq!(mode_of(&logs), 0o700);
+    assert_private_mode(&log_file);
+    assert_private_dir_mode(&logs);
 }
 
 #[test]

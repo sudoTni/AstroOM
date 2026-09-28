@@ -1,0 +1,25 @@
+REPLACE THIS FILE with your full plain-text resume.
+
+Every factual claim in the generated application materials must be defensible
+from this file. If a line here is not true of you, the materials will still
+assert it, because the model is being told to ground its output in this text.
+
+Suggested structure:
+
+  SUMMARY
+  One or two sentences on who you are professionally and what you are looking
+  for.
+
+  EXPERIENCE
+  Reverse chronological. For each role: title, employer, dates, and 3-6 bullets
+  describing what you actually did. Prefer specifics over adjectives.
+
+  SKILLS
+  Concrete technologies you have used in production, not tools you have read
+  about.
+
+  EDUCATION AND CERTIFICATIONS
+  Only what is relevant to the roles you are targeting.
+
+  CLEARANCE AND WORK AUTHORIZATION
+  If applicable to the jobs you want.

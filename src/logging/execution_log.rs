@@ -1,32 +1,44 @@
 //! Execution log tee. Port of AstroEX-node src/logging/executionLog.ts.
 //!
-//! Mirrors stdout and stderr to one execution-scoped, ANSI-free file without
-//! changing the bytes seen by either console stream. Unlike Node (which wraps
-//! the stream write methods), the Rust port redirects file descriptors 1 and 2
-//! on Unix (or standard handles on Windows) through pipes and forwards every chunk
-//! both to the saved original descriptors (with ANSI intact) and to the log file (ANSI-stripped).
+//! Mirrors console output to one execution-scoped, ANSI-free file without
+//! changing the bytes seen by the console. Node wraps the stream write
+//! methods; the Rust port uses the most faithful equivalent per platform:
+//!
+//! * **Unix** — stdout and stderr file descriptors 1 and 2 are redirected
+//!   through pipes and every chunk is forwarded both to the saved original
+//!   descriptors (ANSI intact) and to the log file (ANSI-stripped). This
+//!   captures *everything*, including output from foreign code and child
+//!   processes. It is the historical behaviour, unchanged.
+//!
+//! * **Windows** — the equivalent is an API-level tee: `console_output` writes
+//!   each line to the real console and then hands the text to
+//!   [`mirror_console_bytes`], which appends the ANSI-stripped form to the log
+//!   file. Standard handles are left untouched, so the console cannot be
+//!   corrupted by a failed redirection, and the Windows console keeps working
+//!   exactly as the user's terminal expects.
+//!
+//!   The observable difference is scope, not content: the Windows tee mirrors
+//!   what AstroOM writes through `console_output` (which is every log line,
+//!   every LLM stream delta, the banner, and the re-emitted `rclone` output
+//!   from `write_external_command_output`) rather than raw bytes emitted
+//!   directly against the handle. The only bypasses in the crate are funnelled
+//!   through `console_output` as well — see `write_stdout` in `llm/stream.rs`
+//!   and `display_banner` in `utils/mod.rs`.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-#[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use crate::platform;
+
+/// The single execution-scoped log file for this process.
+struct LogFileState {
+    path: PathBuf,
+    file: Arc<Mutex<File>>,
+}
+
+static LOG_FILE: Mutex<Option<LogFileState>> = Mutex::new(None);
 
 fn safe_identifier(value: &str) -> String {
     static RE_INVALID: OnceLock<regex::Regex> = OnceLock::new();
@@ -59,211 +71,154 @@ fn timestamp_for_file() -> String {
         .replace(&['-', ':', '.'][..], "")
 }
 
-// ---------------------------------------------------------------------------
-// Unix implementation (FD 1 & 2 redirection via libc pipe/dup/dup2)
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct ChannelSync {
-    read_fd: i32,
-    busy: bool,
-    cycles: u64,
-}
-
-#[cfg(unix)]
-struct SharedSync {
-    stdout: Mutex<ChannelSync>,
-    stderr: Mutex<ChannelSync>,
-    condvar: Condvar,
-}
-
-#[cfg(unix)]
-struct ExecutionLogState {
-    path: PathBuf,
-    file: Arc<Mutex<File>>,
-    saved_stdout: i32,
-    saved_stderr: i32,
-    readers: Vec<std::thread::JoinHandle<()>>,
-    sync: Arc<SharedSync>,
-}
-
-#[cfg(unix)]
-static STATE: Mutex<Option<ExecutionLogState>> = Mutex::new(None);
-
-#[cfg(unix)]
+/// Creates the execution log directory (plus the payload log subdirectories)
+/// and the execution-scoped log file. Idempotent: a second call is a no-op.
+///
+/// On Unix this additionally installs the file-descriptor tee; see the module
+/// documentation for the per-platform split.
 pub fn initialize_execution_log(log_dir: &Path, args: &[String]) -> std::io::Result<()> {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.is_some() {
-        return Ok(());
-    }
-
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(log_dir)?;
-    for subdirectory in super::payload_logs::LLM_PAYLOAD_LOG_DIRECTORIES {
-        builder.create(log_dir.join(subdirectory))?;
-    }
-
-    let file_name = format!(
-        "astroom_{}_{}_p{}_{}.log",
-        command_identifier(args),
-        timestamp_for_file(),
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    );
-    let file_path = log_dir.join(file_name);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&file_path)?;
-
-    let saved_stdout = unsafe { libc::dup(1) };
-    if saved_stdout < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let saved_stderr = unsafe { libc::dup(2) };
-    if saved_stderr < 0 {
-        unsafe { libc::close(saved_stdout) };
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mut stdout_pipe = [0i32; 2];
-    if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } != 0 {
-        unsafe {
-            libc::close(saved_stdout);
-            libc::close(saved_stderr);
+    let file = {
+        let mut state = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_some() {
+            return Ok(());
         }
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut stderr_pipe = [0i32; 2];
-    if unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) } != 0 {
-        unsafe {
-            libc::close(saved_stdout);
-            libc::close(saved_stderr);
-            libc::close(stdout_pipe[0]);
-            libc::close(stdout_pipe[1]);
-        }
-        return Err(std::io::Error::last_os_error());
-    }
 
-    let redirected = unsafe {
-        let stdout_result = libc::dup2(stdout_pipe[1], 1);
-        libc::close(stdout_pipe[1]);
-        let stderr_result = libc::dup2(stderr_pipe[1], 2);
-        libc::close(stderr_pipe[1]);
-        stdout_result >= 0 && stderr_result >= 0
+        platform::create_private_dir_all(log_dir)?;
+        for subdirectory in super::payload_logs::LLM_PAYLOAD_LOG_DIRECTORIES {
+            platform::create_private_dir_all(&log_dir.join(subdirectory))?;
+        }
+
+        let file_name = format!(
+            "astroom_{}_{}_p{}_{}.log",
+            command_identifier(args),
+            timestamp_for_file(),
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let file_path = log_dir.join(file_name);
+        let file = platform::private_writer(&file_path)?;
+        let shared = Arc::new(Mutex::new(file));
+        *state = Some(LogFileState {
+            path: file_path,
+            file: Arc::clone(&shared),
+        });
+        shared
     };
-    if !redirected {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::dup2(saved_stdout, 1);
-            libc::dup2(saved_stderr, 2);
-            libc::close(saved_stdout);
-            libc::close(saved_stderr);
-            libc::close(stdout_pipe[0]);
-            libc::close(stderr_pipe[0]);
-        }
-        return Err(error);
-    }
 
-    let shared_file = Arc::new(Mutex::new(file));
-    let sync = Arc::new(SharedSync {
-        stdout: Mutex::new(ChannelSync {
-            read_fd: stdout_pipe[0],
-            busy: false,
-            cycles: 0,
-        }),
-        stderr: Mutex::new(ChannelSync {
-            read_fd: stderr_pipe[0],
-            busy: false,
-            cycles: 0,
-        }),
-        condvar: Condvar::new(),
-    });
-    let readers = vec![
-        spawn_reader(
-            "stdout",
-            stdout_pipe[0],
-            saved_stdout,
-            Arc::clone(&shared_file),
-            Arc::clone(&sync),
-        ),
-        spawn_reader(
-            "stderr",
-            stderr_pipe[0],
-            saved_stderr,
-            Arc::clone(&shared_file),
-            Arc::clone(&sync),
-        ),
-    ];
-
-    *state = Some(ExecutionLogState {
-        path: file_path,
-        file: shared_file,
-        saved_stdout,
-        saved_stderr,
-        readers,
-        sync,
-    });
-    Ok(())
+    // Installed after publishing the file state so that a failure here still
+    // leaves a log file the operator can inspect, and the next call is a no-op.
+    fd_tee::install(file)
 }
 
-#[cfg(unix)]
-pub fn is_stdout_terminal() -> bool {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(state) = state.as_ref() {
-        unsafe { libc::isatty(state.saved_stdout) == 1 }
-    } else {
-        std::io::IsTerminal::is_terminal(&std::io::stdout())
-    }
-}
-
-#[cfg(unix)]
+/// Returns whether the execution log is currently being written.
 pub fn is_tee_active() -> bool {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    state.is_some()
+    LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
-#[cfg(unix)]
-pub fn get_saved_stdout() -> Option<i32> {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    state.as_ref().map(|s| s.saved_stdout)
-}
-
-#[cfg(unix)]
+/// Returns the current execution log file path, if it exists.
 pub fn execution_log_path() -> Option<PathBuf> {
-    STATE
+    LOG_FILE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|state| state.path.clone())
 }
 
+/// Returns whether the process' console is attached to a terminal.
+///
+/// On Unix this must consult the *saved* descriptor once the tee is installed,
+/// because fd 1 is then a pipe rather than the terminal.
+pub fn is_stdout_terminal() -> bool {
+    #[cfg(unix)]
+    {
+        if let Some(saved) = fd_tee::saved_stdout() {
+            return unsafe { libc::isatty(saved) == 1 };
+        }
+    }
+    platform::is_stdout_terminal_raw()
+}
+
+/// The descriptor that really is the user's console, or `None` when the tee
+/// is not installed.
+///
+/// After `initialize_execution_log`, file descriptors 1 and 2 are pipes, so
+/// anything that probes the terminal (size, TTY-ness) must use the descriptor
+/// saved before the redirect.
+pub fn console_stdout_fd() -> Option<i32> {
+    #[cfg(unix)]
+    {
+        fd_tee::saved_stdout()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Appends ANSI-stripped console text to the execution log file.
+///
+/// Compiled to a no-op on Unix: the file-descriptor tee has already captured
+/// every byte, so stripping escapes and re-locking the file here would be
+/// wasted work on the hot logging path (three regex passes plus an allocation
+/// per line). The Windows API-level tee has no such capture and relies on this.
+#[cfg(not(unix))]
+pub fn mirror_console_bytes(text: &str) {
+    let plain_text = crate::logging::strip_ansi(text);
+    if plain_text.is_empty() {
+        return;
+    }
+    let file = {
+        let state = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        match state.as_ref() {
+            Some(state) => Some(Arc::clone(&state.file)),
+            None => None,
+        }
+    };
+    if let Some(file) = file {
+        if let Ok(mut log) = file.lock() {
+            let _ = log.write_all(plain_text.as_bytes());
+        }
+    }
+}
+
+/// See the Unix note above: nothing to do, because the tee already captured it.
 #[cfg(unix)]
+pub fn mirror_console_bytes(_text: &str) {}
+
+/// Flushes pending console output through to its destination and the log file.
+pub fn flush_execution_log() {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    fd_tee::drain();
+    let file = {
+        let state = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        state.as_ref().map(|s| Arc::clone(&s.file))
+    };
+    if let Some(file) = file {
+        if let Ok(file) = file.lock() {
+            let _ = file.sync_data();
+        }
+    }
+}
+
+/// Finalises the execution log: stops the tee, waits for pending output to be
+/// mirrored, rewrites the file ANSI-free, and fsyncs it.
+///
+/// Best-effort, mirroring Node's `close()` semantics.
 pub fn close_execution_log() {
-    let mut state_guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = match state_guard.take() {
-        Some(state) => state,
-        None => return,
+    let taken = {
+        let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    let Some(state) = taken else {
+        return;
     };
 
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-
-    unsafe {
-        libc::dup2(state.saved_stdout, 1);
-        libc::dup2(state.saved_stderr, 2);
-    }
-
-    for reader in state.readers.drain(..) {
-        let _ = reader.join();
-    }
-    unsafe {
-        libc::close(state.saved_stdout);
-        libc::close(state.saved_stderr);
-    }
+    #[cfg(unix)]
+    fd_tee::uninstall();
 
     let final_result = state.file.lock().map(|mut file| {
         if let Ok(contents) = std::fs::read_to_string(&state.path) {
@@ -279,184 +234,7 @@ pub fn close_execution_log() {
     let _ = final_result;
 }
 
-#[cfg(unix)]
-pub fn flush_execution_log() {
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
-    let sync = {
-        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match state.as_ref() {
-            Some(s) => Arc::clone(&s.sync),
-            None => return,
-        }
-    };
-
-    let drain_channel = |channel_name: &str| loop {
-        let (read_fd, is_busy) = {
-            let chan = if channel_name == "stdout" {
-                sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-            } else {
-                sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-            };
-            (chan.read_fd, chan.busy)
-        };
-
-        let mut available: libc::c_int = 0;
-        let ioctl_res = unsafe { libc::ioctl(read_fd, libc::FIONREAD, &mut available) };
-        let has_pending_bytes = ioctl_res == 0 && available > 0;
-
-        if !has_pending_bytes && !is_busy {
-            break;
-        }
-
-        let chan = if channel_name == "stdout" {
-            sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-        } else {
-            sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-        };
-        let _ = sync
-            .condvar
-            .wait_timeout(chan, std::time::Duration::from_millis(50));
-    };
-
-    drain_channel("stderr");
-    drain_channel("stdout");
-
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = state.as_ref() {
-        if let Ok(file) = s.file.lock() {
-            let _ = file.sync_data();
-        }
-    }
-}
-
-#[cfg(unix)]
-fn spawn_reader(
-    channel_name: &'static str,
-    read_fd: i32,
-    mirror_fd: i32,
-    file: Arc<Mutex<File>>,
-    sync: Arc<SharedSync>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        let mut pending: Vec<u8> = Vec::with_capacity(16384);
-        loop {
-            // Signal that we are currently idle and about to block in libc::read
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                chan.busy = false;
-                sync.condvar.notify_all();
-            }
-
-            let read = unsafe {
-                libc::read(
-                    read_fd,
-                    buffer.as_mut_ptr() as *mut libc::c_void,
-                    buffer.len(),
-                )
-            };
-            if read < 0 {
-                if errno_is_eintr() {
-                    continue;
-                }
-                break;
-            }
-            if read == 0 {
-                break;
-            }
-
-            // Signal that we are busy processing new bytes
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                chan.busy = true;
-            }
-
-            pending.extend_from_slice(&buffer[..read as usize]);
-
-            // Check if more data is waiting in the pipe
-            let mut available: libc::c_int = 0;
-            let ioctl_res = unsafe { libc::ioctl(read_fd, libc::FIONREAD, &mut available) };
-            let has_more = ioctl_res == 0 && available > 0;
-
-            let emit_chunk = if has_more && pending.len() < 65536 {
-                if let Some(last_nl) = pending.iter().rposition(|&b| b == b'\n') {
-                    let to_emit = pending.drain(..=last_nl).collect::<Vec<u8>>();
-                    Some(to_emit)
-                } else {
-                    None
-                }
-            } else if !pending.is_empty() {
-                Some(std::mem::take(&mut pending))
-            } else {
-                None
-            };
-
-            if let Some(chunk) = emit_chunk {
-                {
-                    let _guard = crate::logging::console_output::lock_console();
-                    write_all_fd(mirror_fd, &chunk);
-                }
-                let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&chunk));
-                if !plain_text.is_empty() {
-                    if let Ok(mut log) = file.lock() {
-                        let _ = log.write_all(plain_text.as_bytes());
-                    }
-                }
-            }
-
-            // Processing cycle completed
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                chan.cycles += 1;
-                chan.busy = !pending.is_empty();
-                sync.condvar.notify_all();
-            }
-        }
-
-        if !pending.is_empty() {
-            {
-                let _guard = crate::logging::console_output::lock_console();
-                write_all_fd(mirror_fd, &pending);
-            }
-            let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&pending));
-            if !plain_text.is_empty() {
-                if let Ok(mut log) = file.lock() {
-                    let _ = log.write_all(plain_text.as_bytes());
-                }
-            }
-        }
-
-        unsafe { libc::close(read_fd) };
-
-        let mut chan = if channel_name == "stdout" {
-            sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-        } else {
-            sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-        };
-        chan.busy = false;
-        sync.condvar.notify_all();
-    })
-}
-
-#[cfg(unix)]
-fn errno_is_eintr() -> bool {
-    unsafe { *libc::__errno_location() == libc::EINTR }
-}
-
+/// Writes every byte of `data` to a raw file descriptor, retrying on `EINTR`.
 #[cfg(unix)]
 pub fn write_all_fd(fd: i32, mut data: &[u8]) {
     while !data.is_empty() {
@@ -471,396 +249,314 @@ pub fn write_all_fd(fd: i32, mut data: &[u8]) {
     }
 }
 
+#[cfg(unix)]
+fn errno_is_eintr() -> bool {
+    unsafe { *libc::__errno_location() == libc::EINTR }
+}
+
 // ---------------------------------------------------------------------------
-// Windows implementation (Standard handle redirection via Win32 pipes)
+// Unix file-descriptor tee
 // ---------------------------------------------------------------------------
 
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SendHandle(HANDLE);
-#[cfg(windows)]
-unsafe impl Send for SendHandle {}
-#[cfg(windows)]
-unsafe impl Sync for SendHandle {}
+#[cfg(unix)]
+mod fd_tee {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
 
-#[cfg(windows)]
-impl SendHandle {
-    #[inline]
-    fn as_raw(self) -> HANDLE {
-        self.0
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug)]
-struct ChannelSync {
-    read_handle: SendHandle,
-    busy: bool,
-    cycles: u64,
-}
-
-#[cfg(windows)]
-struct SharedSync {
-    stdout: Mutex<ChannelSync>,
-    stderr: Mutex<ChannelSync>,
-    condvar: Condvar,
-}
-
-#[cfg(windows)]
-struct ExecutionLogState {
-    path: PathBuf,
-    file: Arc<Mutex<File>>,
-    saved_stdout: SendHandle,
-    saved_stderr: SendHandle,
-    write_stdout: SendHandle,
-    write_stderr: SendHandle,
-    readers: Vec<std::thread::JoinHandle<()>>,
-    sync: Arc<SharedSync>,
-}
-
-#[cfg(windows)]
-static STATE: Mutex<Option<ExecutionLogState>> = Mutex::new(None);
-
-#[cfg(windows)]
-pub fn initialize_execution_log(log_dir: &Path, args: &[String]) -> std::io::Result<()> {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.is_some() {
-        return Ok(());
+    #[derive(Debug)]
+    struct ChannelSync {
+        read_fd: i32,
+        busy: bool,
+        cycles: u64,
     }
 
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.create(log_dir)?;
-    for subdirectory in super::payload_logs::LLM_PAYLOAD_LOG_DIRECTORIES {
-        builder.create(log_dir.join(subdirectory))?;
+    struct SharedSync {
+        stdout: Mutex<ChannelSync>,
+        stderr: Mutex<ChannelSync>,
+        condvar: Condvar,
     }
 
-    let file_name = format!(
-        "astroom_{}_{}_p{}_{}.log",
-        command_identifier(args),
-        timestamp_for_file(),
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    );
-    let file_path = log_dir.join(file_name);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file_path)?;
-
-    let saved_stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    let saved_stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
-    if saved_stdout.is_null()
-        || saved_stdout == INVALID_HANDLE_VALUE
-        || saved_stderr.is_null()
-        || saved_stderr == INVALID_HANDLE_VALUE
-    {
-        return Err(std::io::Error::other("Invalid standard handle"));
+    struct TeeState {
+        saved_stdout: i32,
+        saved_stderr: i32,
+        readers: Vec<std::thread::JoinHandle<()>>,
+        sync: Arc<SharedSync>,
     }
 
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
-    };
+    static TEE: Mutex<Option<TeeState>> = Mutex::new(None);
 
-    let mut stdout_read: HANDLE = std::ptr::null_mut();
-    let mut stdout_write: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut stdout_read, &mut stdout_write, &sa, 0) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+    pub(super) fn saved_stdout() -> Option<i32> {
+        TEE.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.saved_stdout)
     }
 
-    let mut stderr_read: HANDLE = std::ptr::null_mut();
-    let mut stderr_write: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut stderr_read, &mut stderr_write, &sa, 0) } == 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe {
-            CloseHandle(stdout_read);
-            CloseHandle(stdout_write);
+    pub(super) fn install(log_file: Arc<Mutex<File>>) -> std::io::Result<()> {
+        let mut slot = TEE.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(());
         }
-        return Err(err);
-    }
-    unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
-    }
 
-    let ok_out = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stdout_write) };
-    let ok_err = unsafe { SetStdHandle(STD_ERROR_HANDLE, stderr_write) };
-    if ok_out == 0 || ok_err == 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe {
-            SetStdHandle(STD_OUTPUT_HANDLE, saved_stdout);
-            SetStdHandle(STD_ERROR_HANDLE, saved_stderr);
-            CloseHandle(stdout_read);
-            CloseHandle(stdout_write);
-            CloseHandle(stderr_read);
-            CloseHandle(stderr_write);
+        let saved_stdout = unsafe { libc::dup(1) };
+        if saved_stdout < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        return Err(err);
-    }
+        let saved_stderr = unsafe { libc::dup(2) };
+        if saved_stderr < 0 {
+            unsafe { libc::close(saved_stdout) };
+            return Err(std::io::Error::last_os_error());
+        }
 
-    let shared_file = Arc::new(Mutex::new(file));
-    let sync = Arc::new(SharedSync {
-        stdout: Mutex::new(ChannelSync {
-            read_handle: SendHandle(stdout_read),
-            busy: false,
-            cycles: 0,
-        }),
-        stderr: Mutex::new(ChannelSync {
-            read_handle: SendHandle(stderr_read),
-            busy: false,
-            cycles: 0,
-        }),
-        condvar: Condvar::new(),
-    });
-
-    let readers = vec![
-        spawn_reader(
-            "stdout",
-            SendHandle(stdout_read),
-            SendHandle(saved_stdout),
-            Arc::clone(&shared_file),
-            Arc::clone(&sync),
-        ),
-        spawn_reader(
-            "stderr",
-            SendHandle(stderr_read),
-            SendHandle(saved_stderr),
-            Arc::clone(&shared_file),
-            Arc::clone(&sync),
-        ),
-    ];
-
-    *state = Some(ExecutionLogState {
-        path: file_path,
-        file: shared_file,
-        saved_stdout: SendHandle(saved_stdout),
-        saved_stderr: SendHandle(saved_stderr),
-        write_stdout: SendHandle(stdout_write),
-        write_stderr: SendHandle(stderr_write),
-        readers,
-        sync,
-    });
-    Ok(())
-}
-
-#[cfg(windows)]
-pub fn is_stdout_terminal() -> bool {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(state) = state.as_ref() {
-        let mut mode = 0u32;
-        unsafe { GetConsoleMode(state.saved_stdout.as_raw(), &mut mode) != 0 }
-    } else {
-        std::io::IsTerminal::is_terminal(&std::io::stdout())
-    }
-}
-
-#[cfg(windows)]
-pub fn is_tee_active() -> bool {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    state.is_some()
-}
-
-#[cfg(windows)]
-pub fn get_saved_stdout() -> Option<HANDLE> {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    state.as_ref().map(|s| s.saved_stdout.as_raw())
-}
-
-#[cfg(windows)]
-pub fn execution_log_path() -> Option<PathBuf> {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|state| state.path.clone())
-}
-
-#[cfg(windows)]
-pub fn close_execution_log() {
-    let mut state_guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = match state_guard.take() {
-        Some(state) => state,
-        None => return,
-    };
-
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
-    unsafe {
-        SetStdHandle(STD_OUTPUT_HANDLE, state.saved_stdout.as_raw());
-        SetStdHandle(STD_ERROR_HANDLE, state.saved_stderr.as_raw());
-        CloseHandle(state.write_stdout.as_raw());
-        CloseHandle(state.write_stderr.as_raw());
-    }
-
-    for reader in state.readers.drain(..) {
-        let _ = reader.join();
-    }
-
-    let final_result = state.file.lock().map(|mut file| {
-        if let Ok(contents) = std::fs::read_to_string(&state.path) {
-            let plain_text = crate::logging::strip_ansi(&contents);
-            if plain_text != contents {
-                let _ = file.set_len(0);
-                let _ = file.seek(std::io::SeekFrom::Start(0));
-                let _ = file.write_all(plain_text.as_bytes());
+        let mut stdout_pipe = [0i32; 2];
+        if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } != 0 {
+            unsafe {
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
             }
+            return Err(std::io::Error::last_os_error());
         }
-        file.sync_all()
-    });
-    let _ = final_result;
-}
-
-#[cfg(windows)]
-pub fn flush_execution_log() {
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
-    let sync = {
-        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match state.as_ref() {
-            Some(s) => Arc::clone(&s.sync),
-            None => return,
+        let mut stderr_pipe = [0i32; 2];
+        if unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) } != 0 {
+            unsafe {
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+            }
+            return Err(std::io::Error::last_os_error());
         }
-    };
 
-    let drain_channel = |channel_name: &str| loop {
-        let (read_handle, is_busy) = {
+        let redirected = unsafe {
+            let stdout_result = libc::dup2(stdout_pipe[1], 1);
+            libc::close(stdout_pipe[1]);
+            let stderr_result = libc::dup2(stderr_pipe[1], 2);
+            libc::close(stderr_pipe[1]);
+            stdout_result >= 0 && stderr_result >= 0
+        };
+        if !redirected {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::dup2(saved_stdout, 1);
+                libc::dup2(saved_stderr, 2);
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
+                libc::close(stdout_pipe[0]);
+                libc::close(stderr_pipe[0]);
+            }
+            return Err(error);
+        }
+
+        let sync = Arc::new(SharedSync {
+            stdout: Mutex::new(ChannelSync {
+                read_fd: stdout_pipe[0],
+                busy: false,
+                cycles: 0,
+            }),
+            stderr: Mutex::new(ChannelSync {
+                read_fd: stderr_pipe[0],
+                busy: false,
+                cycles: 0,
+            }),
+            condvar: Condvar::new(),
+        });
+        let readers = vec![
+            spawn_reader(
+                "stdout",
+                stdout_pipe[0],
+                saved_stdout,
+                Arc::clone(&log_file),
+                Arc::clone(&sync),
+            ),
+            spawn_reader(
+                "stderr",
+                stderr_pipe[0],
+                saved_stderr,
+                Arc::clone(&log_file),
+                Arc::clone(&sync),
+            ),
+        ];
+
+        *slot = Some(TeeState {
+            saved_stdout,
+            saved_stderr,
+            readers,
+            sync,
+        });
+        Ok(())
+    }
+
+    /// Restores fds 1/2 and joins the reader threads so no chunk is lost.
+    pub(super) fn uninstall() {
+        let taken = {
+            let mut guard = TEE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        let Some(state) = taken else {
+            return;
+        };
+
+        unsafe {
+            libc::dup2(state.saved_stdout, 1);
+            libc::dup2(state.saved_stderr, 2);
+        }
+
+        // FDs 1 and 2 no longer keep the pipe write ends alive, so readers see
+        // EOF and drain. Keep the duplicated destination descriptors open until
+        // after that drain: each reader still writes its final chunk through one.
+        for reader in state.readers {
+            let _ = reader.join();
+        }
+        unsafe {
+            libc::close(state.saved_stdout);
+            libc::close(state.saved_stderr);
+        }
+    }
+
+    /// Blocks until both pipes have been fully consumed by the reader threads.
+    pub(super) fn drain() {
+        let Some(sync) = TEE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| Arc::clone(&s.sync))
+        else {
+            return;
+        };
+
+        let drain_channel = |channel_name: &str| loop {
+            let (read_fd, is_busy) = {
+                let chan = if channel_name == "stdout" {
+                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
+                } else {
+                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+                };
+                (chan.read_fd, chan.busy)
+            };
+
+            let mut available: libc::c_int = 0;
+            let ioctl_res = unsafe { libc::ioctl(read_fd, libc::FIONREAD, &mut available) };
+            let has_pending_bytes = ioctl_res == 0 && available > 0;
+
+            if !has_pending_bytes && !is_busy {
+                break;
+            }
+
             let chan = if channel_name == "stdout" {
                 sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
             } else {
                 sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
             };
-            (chan.read_handle.as_raw(), chan.busy)
+            let _ = sync
+                .condvar
+                .wait_timeout(chan, std::time::Duration::from_millis(50));
         };
 
-        let mut total_bytes_avail = 0u32;
-        let peek_res = unsafe {
-            PeekNamedPipe(
-                read_handle,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut total_bytes_avail,
-                std::ptr::null_mut(),
-            )
-        };
-        let has_pending_bytes = peek_res != 0 && total_bytes_avail > 0;
-
-        if !has_pending_bytes && !is_busy {
-            break;
-        }
-
-        let chan = if channel_name == "stdout" {
-            sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-        } else {
-            sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-        };
-        let _ = sync
-            .condvar
-            .wait_timeout(chan, std::time::Duration::from_millis(50));
-    };
-
-    drain_channel("stderr");
-    drain_channel("stdout");
-
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = state.as_ref() {
-        if let Ok(file) = s.file.lock() {
-            let _ = file.sync_data();
-        }
+        drain_channel("stderr");
+        drain_channel("stdout");
     }
-}
 
-#[cfg(windows)]
-fn spawn_reader(
-    channel_name: &'static str,
-    read_handle: SendHandle,
-    mirror_handle: SendHandle,
-    file: Arc<Mutex<File>>,
-    sync: Arc<SharedSync>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let _ = &read_handle;
-        let _ = &mirror_handle;
-        let mut buffer = [0u8; 8192];
-        let mut pending: Vec<u8> = Vec::with_capacity(16384);
-        loop {
-            // Signal idle
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+    fn spawn_reader(
+        channel_name: &'static str,
+        read_fd: i32,
+        mirror_fd: i32,
+        file: Arc<Mutex<File>>,
+        sync: Arc<SharedSync>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            let mut pending: Vec<u8> = Vec::with_capacity(16384);
+            loop {
+                // Signal that we are currently idle and about to block in read()
+                {
+                    let mut chan = if channel_name == "stdout" {
+                        sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
+                    } else {
+                        sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+                    };
+                    chan.busy = false;
+                    sync.condvar.notify_all();
+                }
+
+                let read = unsafe {
+                    libc::read(
+                        read_fd,
+                        buffer.as_mut_ptr() as *mut libc::c_void,
+                        buffer.len(),
+                    )
                 };
-                chan.busy = false;
-                sync.condvar.notify_all();
-            }
+                if read < 0 {
+                    if errno_is_eintr() {
+                        continue;
+                    }
+                    break;
+                }
+                if read == 0 {
+                    break;
+                }
 
-            let mut bytes_read = 0u32;
-            let success = unsafe {
-                ReadFile(
-                    read_handle.as_raw(),
-                    buffer.as_mut_ptr() as *mut _,
-                    buffer.len() as u32,
-                    &mut bytes_read,
-                    std::ptr::null_mut(),
-                )
-            };
+                // Signal that we are busy processing new bytes
+                {
+                    let mut chan = if channel_name == "stdout" {
+                        sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
+                    } else {
+                        sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+                    };
+                    chan.busy = true;
+                }
 
-            if success == 0 || bytes_read == 0 {
-                break;
-            }
+                pending.extend_from_slice(&buffer[..read as usize]);
 
-            // Signal busy
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                chan.busy = true;
-            }
+                // Check if more data is waiting in the pipe
+                let mut available: libc::c_int = 0;
+                let ioctl_res = unsafe { libc::ioctl(read_fd, libc::FIONREAD, &mut available) };
+                let has_more = ioctl_res == 0 && available > 0;
 
-            pending.extend_from_slice(&buffer[..bytes_read as usize]);
-
-            // Check if more data is waiting in the pipe
-            let mut total_bytes_avail = 0u32;
-            let peek_res = unsafe {
-                PeekNamedPipe(
-                    read_handle.as_raw(),
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut total_bytes_avail,
-                    std::ptr::null_mut(),
-                )
-            };
-            let has_more = peek_res != 0 && total_bytes_avail > 0;
-
-            let emit_chunk = if has_more && pending.len() < 65536 {
-                if let Some(last_nl) = pending.iter().rposition(|&b| b == b'\n') {
-                    let to_emit = pending.drain(..=last_nl).collect::<Vec<u8>>();
-                    Some(to_emit)
+                let emit_chunk = if has_more && pending.len() < 65536 {
+                    if let Some(last_nl) = pending.iter().rposition(|&b| b == b'\n') {
+                        let to_emit = pending.drain(..=last_nl).collect::<Vec<u8>>();
+                        Some(to_emit)
+                    } else {
+                        None
+                    }
+                } else if !pending.is_empty() {
+                    Some(std::mem::take(&mut pending))
                 } else {
                     None
-                }
-            } else if !pending.is_empty() {
-                Some(std::mem::take(&mut pending))
-            } else {
-                None
-            };
+                };
 
-            if let Some(chunk) = emit_chunk {
-                {
-                    let _guard = crate::logging::console_output::lock_console();
-                    write_all_handle(mirror_handle.as_raw(), &chunk);
+                if let Some(chunk) = emit_chunk {
+                    {
+                        let _guard = super::super::console_output::lock_console();
+                        write_all_fd(mirror_fd, &chunk);
+                    }
+                    let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&chunk));
+                    if !plain_text.is_empty() {
+                        if let Ok(mut log) = file.lock() {
+                            let _ = log.write_all(plain_text.as_bytes());
+                        }
+                    }
                 }
-                let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&chunk));
+
+                // Processing cycle completed
+                {
+                    let mut chan = if channel_name == "stdout" {
+                        sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
+                    } else {
+                        sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+                    };
+                    chan.cycles += 1;
+                    chan.busy = !pending.is_empty();
+                    sync.condvar.notify_all();
+                }
+            }
+
+            if !pending.is_empty() {
+                {
+                    let _guard = super::super::console_output::lock_console();
+                    write_all_fd(mirror_fd, &pending);
+                }
+                let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&pending));
                 if !plain_text.is_empty() {
                     if let Ok(mut log) = file.lock() {
                         let _ = log.write_all(plain_text.as_bytes());
@@ -868,61 +564,59 @@ fn spawn_reader(
                 }
             }
 
-            // Processing cycle completed
-            {
-                let mut chan = if channel_name == "stdout" {
-                    sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-                } else {
-                    sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                chan.cycles += 1;
-                chan.busy = !pending.is_empty();
-                sync.condvar.notify_all();
-            }
-        }
+            unsafe { libc::close(read_fd) };
 
-        if !pending.is_empty() {
-            {
-                let _guard = crate::logging::console_output::lock_console();
-                write_all_handle(mirror_handle.as_raw(), &pending);
-            }
-            let plain_text = crate::logging::strip_ansi(&String::from_utf8_lossy(&pending));
-            if !plain_text.is_empty() {
-                if let Ok(mut log) = file.lock() {
-                    let _ = log.write_all(plain_text.as_bytes());
-                }
-            }
-        }
-
-        unsafe { CloseHandle(read_handle.as_raw()) };
-
-        let mut chan = if channel_name == "stdout" {
-            sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
-        } else {
-            sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
-        };
-        chan.busy = false;
-        sync.condvar.notify_all();
-    })
+            let mut chan = if channel_name == "stdout" {
+                sync.stdout.lock().unwrap_or_else(|e| e.into_inner())
+            } else {
+                sync.stderr.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            chan.busy = false;
+            sync.condvar.notify_all();
+        })
+    }
 }
 
-#[cfg(windows)]
-fn write_all_handle(handle: HANDLE, mut data: &[u8]) {
-    while !data.is_empty() {
-        let chunk_len = data.len().min(u32::MAX as usize) as u32;
-        let mut written = 0u32;
-        let res = unsafe {
-            WriteFile(
-                handle,
-                data.as_ptr() as *const _,
-                chunk_len,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-        if res == 0 || written == 0 {
-            break;
-        }
-        data = &data[written as usize..];
+/// Windows has no descriptor tee; the log file alone is the destination.
+#[cfg(not(unix))]
+mod fd_tee {
+    use super::*;
+
+    pub(super) fn install(_log_file: Arc<Mutex<File>>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_identifier_uses_first_positional_argument() {
+        let args: Vec<String> = ["--json", "run-pipeline", "--batch", "10"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(command_identifier(&args), "run-pipeline");
+    }
+
+    #[test]
+    fn command_identifier_falls_back_when_only_flags() {
+        let args: Vec<String> = ["--json", "--verbose"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(command_identifier(&args), "cli");
+    }
+
+    #[test]
+    fn safe_identifier_strips_separators_and_edges() {
+        assert_eq!(safe_identifier("Run Pipeline!"), "run-pipeline");
+        assert_eq!(safe_identifier("  --x--  "), "x");
+        assert_eq!(safe_identifier("!!!"), "command");
     }
 }

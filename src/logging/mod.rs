@@ -4,6 +4,11 @@
 pub mod console_output;
 pub mod execution_log;
 pub mod fader;
+// The persistent animated footer needs a scrolling region, which legacy
+// Windows conhost either ignores or leaves set after exit. Windows keeps the
+// bounded in-place banner instead — see `logging::footer` for the rationale.
+#[cfg(unix)]
+pub mod footer;
 pub mod formatter;
 pub mod llm_formatter;
 pub mod payload_logs;
@@ -45,7 +50,9 @@ static ONCE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// Configure the global logger. Called once from main() after CLI parsing.
 pub fn configure_logging(format: LogFormat, min_level: LogLevel, use_color: bool) {
     {
-        let mut s = state().lock().unwrap();
+        let mut s = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         s.min_level = min_level;
         s.format = format;
         s.use_color = use_color;
@@ -55,23 +62,36 @@ pub fn configure_logging(format: LogFormat, min_level: LogLevel, use_color: bool
 }
 
 pub fn current_format() -> LogFormat {
-    state().lock().unwrap().format
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .format
 }
 
 pub fn use_color() -> bool {
-    state().lock().unwrap().use_color
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .use_color
 }
 
 pub fn is_level_enabled(level: LogLevel) -> bool {
     if !CONFIGURED.load(Ordering::SeqCst) {
         return level.severity() >= LogLevel::Info.severity();
     }
-    level.severity() >= state().lock().unwrap().min_level.severity()
+    level.severity()
+        >= state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .min_level
+            .severity()
 }
 
 fn dispatch(record: LogRecord) {
     let (fmt, use_color) = {
-        let s = state().lock().unwrap();
+        let s = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (s.format, s.use_color)
     };
     if record.component.is_empty() || record.message.is_empty() {
@@ -100,9 +120,13 @@ pub fn log_record(record: LogRecord) {
     if !is_level_enabled(record.level) {
         return;
     }
+    // Both fields carry user data and LLM payloads: `format_llm_request`
+    // embeds the applicant's résumé and the full job description in the
+    // *message*, so redacting only the context map would leave it intact.
     let sanitized_context = record.context.as_ref().map(sanitize_context);
     let mut record = record;
     record.context = sanitized_context;
+    record.message = sanitize_string(&record.message);
     dispatch(record);
 }
 
@@ -130,7 +154,9 @@ pub fn log_once(component: &str, key: &str, message: &str, level: LogLevel) {
     let cache = ONCE_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let dedup_key = format!("{component}:{key}");
     {
-        let mut c = cache.lock().unwrap();
+        let mut c = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !c.insert(dedup_key) {
             return;
         }
@@ -140,7 +166,10 @@ pub fn log_once(component: &str, key: &str, message: &str, level: LogLevel) {
 
 pub fn clear_once_keys() {
     let cache = ONCE_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-    cache.lock().unwrap().clear();
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 /// Log an AppError at the given level with error context attached.

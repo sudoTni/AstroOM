@@ -3,10 +3,22 @@
 //! Provides fault tolerance for external API calls with intelligent failure
 //! detection and recovery mechanisms.
 //!
-//! This is a synchronous port of the state machine: the caller (LLM service)
-//! is responsible for applying per-operation timeouts and for calling
+//! This is a synchronous port of the state machine: the caller is responsible
+//! for applying per-operation timeouts and for calling
 //! [`CircuitBreaker::allow_request`], [`CircuitBreaker::record_success`] and
 //! [`CircuitBreaker::record_failure`] around each operation.
+//!
+//! # Current status: not on the live LLM request path
+//!
+//! The only production holder of this type is `LlmService::circuit_breakers`,
+//! whose `record_*` calls are reached only from `LlmService::call_with_retries`
+//! → `LlmService::batch`, and `batch` has no callers. Every stage calls
+//! `LlmService::call` directly, so no state is ever recorded and the breaker
+//! can never open.
+//!
+//! Stage-level resilience is real but separate: `stages::job_cloth` has its own
+//! `JcCircuitBreaker` driven from the actual call sites. Wiring this module
+//! into the live path is a deliberate behaviour change, not a refactor.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

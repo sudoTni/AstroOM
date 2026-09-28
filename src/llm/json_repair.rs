@@ -44,16 +44,31 @@ pub fn quick_clean_json(input: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// Cached literal-pattern regexes. These are recompiled for every LLM
+/// response otherwise, and `robust_json_parse` retries the whole repair
+/// pipeline several times per response.
+fn cached_regex(pattern: &str) -> &'static Regex {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static Regex>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = guard.get(pattern) {
+        return existing;
+    }
+    let compiled: &'static Regex = Box::leak(Box::new(Regex::new(pattern).expect("valid regex")));
+    guard.insert(pattern.to_string(), compiled);
+    compiled
+}
+
 /// JavaScript `String.replace` with a non-global regex: replaces the first
 /// match (anchored at the start here) with "".
 fn strip_prefix_re(input: &str, pattern: &str) -> String {
-    let re = Regex::new(pattern).expect("valid regex");
-    re.replace(input, "").into_owned()
+    cached_regex(pattern).replace(input, "").into_owned()
 }
 
 fn strip_suffix_re(input: &str, pattern: &str) -> String {
-    let re = Regex::new(pattern).expect("valid regex");
-    re.replace(input, "").into_owned()
+    cached_regex(pattern).replace(input, "").into_owned()
 }
 
 /// Repair JSON by removing trailing commas before `}` or `]`.

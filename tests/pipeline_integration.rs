@@ -24,7 +24,8 @@ fn context(
 ) -> RunContext {
     RunContext {
         paths: Paths {
-            project_root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            app_root: data.to_path_buf(),
+            resource_root: None,
             data_dir: data.to_path_buf(),
             log_dir: logs.to_path_buf(),
             materials_dir: materials.to_path_buf(),
@@ -94,6 +95,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
     ]);
     let acquired = data.join("acquired_jobs_indeed.json");
     std::fs::write(&acquired, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+    // Ensure the fixture is treated exactly like an acquisition artifact.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -130,7 +132,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
     assert_eq!(process_result.duplicates_removed, 1);
     assert_eq!(process_result.filtered_entries, 2);
     assert_eq!(process_result.output_record_count, 2);
-    assert_eq!(mode_of(&processed), 0o600, "processed artifact mode");
+    assert_private_mode(&processed);
     let verified = verify_artifact_manifest(&processed).expect("manifest check");
     assert_eq!(verified["ok"], true, "processed manifest valid");
 
@@ -155,7 +157,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
         cloth_jobs[0].title.as_deref(),
         Some("Cloud Security Engineer")
     );
-    assert_eq!(mode_of(&clothed), 0o600, "clothed artifact mode");
+    assert_private_mode(&clothed);
     assert_eq!(
         verify_artifact_manifest(&clothed).expect("manifest check")["ok"],
         true
@@ -365,7 +367,7 @@ fn run_pipeline_end_to_end_offline_via_cli() {
             "{directory} should contain an LLM payload log"
         );
         for payload_file in payload_files {
-            assert_eq!(mode_of(&payload_file), 0o600, "payload log mode");
+            assert_private_mode(&payload_file);
             let payload = std::fs::read_to_string(&payload_file).expect("read payload log");
             assert!(
                 !payload.contains("mock-api-key"),

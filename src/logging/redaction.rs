@@ -61,8 +61,15 @@ pub fn sanitize_string(value: &str) -> String {
         (r"\bxox[baprs]-[0-9a-zA-Z]{10,48}\b", "xox-[redacted]"),
     ];
     for (pattern, replacement) in REPLACEMENTS {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            result = re.replace_all(&result, replacement.to_string()).to_string();
+        match regex::Regex::new(pattern) {
+            Ok(re) => result = re.replace_all(&result, replacement.to_string()).to_string(),
+            // A broken pattern would silently disable that scrubbing rule, so
+            // make the failure visible instead of quietly leaking the secret.
+            Err(error) => {
+                crate::logging::console_output::write_internal_console_failure(&format!(
+                    "[AstroOM] secret redaction pattern {pattern:?} failed to compile and was skipped: {error}"
+                ));
+            }
         }
     }
     if result.chars().count() > MAX_STRING_LENGTH {

@@ -49,8 +49,7 @@ impl Sandbox {
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.path())
-            .env("USERPROFILE", self.path())
-            .env("TMPDIR", std::env::temp_dir());
+            .env("TMPDIR", "/tmp");
         command.output().expect("run astroom")
     }
 }
@@ -61,6 +60,9 @@ impl Default for Sandbox {
     }
 }
 
+/// Marks `path` executable. A no-op on Windows, where executability is not a
+/// file-mode bit and the shims these helpers prepare are `.bat`/`.cmd` or
+/// otherwise Windows-specific anyway.
 #[cfg(unix)]
 pub fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -70,10 +72,11 @@ pub fn set_executable(path: &Path) {
 }
 
 #[cfg(not(unix))]
-pub fn set_executable(_path: &Path) {
-    // No-op on Windows
-}
+pub fn set_executable(_path: &Path) {}
 
+/// Unix permission bits of `path`. Returns `None` on platforms that have no
+/// mode bits, so `assert_eq!(mode_of(p), 0o600)` becomes a Windows no-op via
+/// the helper below rather than a compile error.
 #[cfg(unix)]
 pub fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -86,8 +89,39 @@ pub fn mode_of(path: &Path) -> u32 {
 
 #[cfg(not(unix))]
 pub fn mode_of(_path: &Path) -> u32 {
-    0o600
+    0
 }
+
+/// Asserts owner-only permissions, where the platform has permission bits.
+#[cfg(unix)]
+pub fn assert_private_mode(path: &Path) {
+    assert_eq!(
+        mode_of(path),
+        astroom::platform::private_file::PRIVATE_FILE_MODE,
+        "{} must be owner-only",
+        path.display()
+    );
+}
+
+/// No-op on platforms without permission bits; the parent directory's ACL
+/// provides the equivalent guarantee there.
+#[cfg(not(unix))]
+pub fn assert_private_mode(_path: &Path) {}
+
+/// Asserts owner-only *directory* permissions, where the platform has them.
+#[cfg(unix)]
+pub fn assert_private_dir_mode(path: &Path) {
+    assert_eq!(
+        mode_of(path),
+        astroom::platform::private_file::PRIVATE_DIR_MODE,
+        "{} must be owner-only",
+        path.display()
+    );
+}
+
+/// No-op on platforms without permission bits.
+#[cfg(not(unix))]
+pub fn assert_private_dir_mode(_path: &Path) {}
 
 pub fn find_file_starting_with(dir: &Path, prefix: &str) -> Option<PathBuf> {
     std::fs::read_dir(dir)
@@ -252,8 +286,8 @@ fn mock_content_for(body: &str) -> String {
         ])
         .to_string()
     } else if body.contains("ROP v2.1") || body.contains("Resume Writer") {
-        "# Resume Filename\nSample_Candidate_Materials_Cloud_Security_Engineer.txt\n\n\
-         # Cover Letter Filename\nSample_Candidate_Cover_Letter_Acme_Security.txt\n\n\
+        "# Resume Filename\nCandidate_Materials_Cloud_Security_Engineer.txt\n\n\
+         # Cover Letter Filename\nCandidate_Cover_Letter_Acme_Security.txt\n\n\
          # Optimized & Tailored Professional Title\nLead Cloud Security Engineer\n\n\
          # Optimized & Tailored Professional Summary\nHigh-impact Security Engineer specialized in cloud infrastructure and DevSecOps.\n\n\
          # Optimized & Tailored Key Skills\n- Cloud Security Architecture\n- DevSecOps & CI/CD Security\n- IAM & Zero Trust\n\n\

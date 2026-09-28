@@ -1,7 +1,7 @@
 //! HSV terminal color fader. Faithful port of AstroEX-node src/logging/fader.ts
 //! (truecolor 24-bit ANSI, gradient profiles, streaming fader, banner rainbow).
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 pub const ANSI_RESET: &str = "\x1b[0m";
 pub const ANSI_BOLD: &str = "\x1b[1m";
@@ -306,46 +306,24 @@ pub fn gradient_profile(key: GradientKey) -> GradientProfile {
     }
 }
 
-/// Global color decision, set once from CLI flags at startup.
-/// None = not yet configured (falls back to TTY detection).
-static COLOR_DECISION: OnceLock<bool> = OnceLock::new();
-
-#[cfg(windows)]
-pub fn enable_windows_ansi() {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-    };
-    for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(handle_id) };
-        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            let mut mode = 0u32;
-            if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
-                let _ =
-                    unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
-            }
-        }
-    }
-}
+/// Global colour decision, set from CLI flags at startup.
+/// `None` = not yet configured (falls back to TTY detection).
+///
+/// An `RwLock` rather than a `OnceLock` so a later `set_color_decision` — a
+/// test, or a re-entrant `configure_logging` — actually takes effect instead of
+/// being silently dropped, which would let the colour decision drift away from
+/// the log format.
+static COLOR_DECISION: RwLock<Option<bool>> = RwLock::new(None);
 
 pub fn set_color_decision(enabled: bool) {
-    #[cfg(windows)]
-    if enabled {
-        enable_windows_ansi();
+    if let Ok(mut slot) = COLOR_DECISION.write() {
+        *slot = Some(enabled);
     }
-    let _ = COLOR_DECISION.set(enabled);
 }
 
 pub fn is_color_supported() -> bool {
-    let supported = COLOR_DECISION
-        .get()
-        .copied()
-        .unwrap_or_else(super::execution_log::is_stdout_terminal);
-    #[cfg(windows)]
-    if supported {
-        enable_windows_ansi();
-    }
-    supported
+    let configured = COLOR_DECISION.read().ok().and_then(|slot| *slot);
+    configured.unwrap_or_else(super::execution_log::is_stdout_terminal)
 }
 
 fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {

@@ -16,6 +16,7 @@ pub mod llm;
 pub mod logging;
 pub mod models;
 pub mod pipeline;
+pub mod platform;
 pub mod presets;
 pub mod runtime_paths;
 pub mod stages;

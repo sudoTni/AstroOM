@@ -27,6 +27,14 @@ impl Default for RetryConfig {
 /// Random jitter delay between min and max seconds, returned in ms.
 /// Validates positivity (Node throws on invalid input).
 pub fn get_random_jitter_delay_ms(min_seconds: f64, max_seconds: f64) -> crate::error::Result<u64> {
+    // `NaN` satisfies every comparison below, and `gen_range(NaN..NaN)` panics
+    // inside `rand::Uniform`, so finiteness must be checked explicitly. This
+    // mirrors `cli::seconds_to_millis`.
+    if !min_seconds.is_finite() || !max_seconds.is_finite() {
+        return Err(crate::error::AppError::message(
+            "Delay values must be finite",
+        ));
+    }
     if min_seconds < 0.0 || max_seconds < 0.0 {
         return Err(crate::error::AppError::message(
             "Delay values must be positive",
@@ -69,12 +77,22 @@ where
                     return Err(err);
                 }
                 attempt += 1;
-                let mut delay =
-                    config.base_delay_ms * (config.backoff_factor as u64).pow(attempt - 1);
-                delay = delay.min(config.max_delay_ms);
+                // Clamp the factor before multiplying: a large base delay and
+                // attempt count would otherwise overflow u64 (panicking in
+                // debug, wrapping to a tiny delay in release).
+                let exponent = config
+                    .max_delay_ms
+                    .checked_div(config.base_delay_ms.max(1))
+                    .unwrap_or(u64::MAX)
+                    .min(u32::MAX as u64) as u32;
+                let factor = (config.backoff_factor as u64).pow(exponent.min(attempt - 1));
+                let mut delay = config
+                    .base_delay_ms
+                    .saturating_mul(factor)
+                    .min(config.max_delay_ms);
                 if config.jitter {
                     let jitter: f64 = rand::thread_rng().gen_range(0.0..0.1);
-                    delay += (delay as f64 * jitter) as u64;
+                    delay = delay.saturating_add((delay as f64 * jitter) as u64);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }

@@ -129,21 +129,50 @@ struct WatchdogInner {
     stopped: AtomicBool,
 }
 
+/// Argv for a single `ping` packet.
+///
+/// `ping(8)` spells the count `-c`; `PING.EXE` spells it `-n`. Passing the
+/// wrong flag makes every probe exit non-zero, which after
+/// `WATCHDOG_FAILURE_THRESHOLD` probes aborts the whole pipeline with
+/// `INTERNET_WATCHDOG_CONNECTIVITY_LOST` — the watchdog must be usable wherever
+/// AstroOM runs.
+#[cfg(unix)]
+fn ping_argv(target: &str, ipv6: bool) -> Vec<&str> {
+    let mut argv = Vec::with_capacity(4);
+    if ipv6 {
+        argv.push("-6");
+    }
+    argv.extend_from_slice(&["-c", "1", target]);
+    argv
+}
+
+/// Argv for a single `ping` packet. See the Unix variant for the flag mapping.
+#[cfg(windows)]
+fn ping_argv(target: &str, ipv6: bool) -> Vec<&str> {
+    let mut argv = Vec::with_capacity(4);
+    if ipv6 {
+        argv.push("-6");
+    }
+    argv.extend_from_slice(&["-n", "1", target]);
+    argv
+}
+
 impl WatchdogInner {
     async fn probe_once(&self) -> Result<()> {
+        let ipv6 = self.target.contains(':');
+        let argv = ping_argv(&self.target, ipv6);
         let mut command = tokio::process::Command::new("ping");
-        if self.target.contains(':') {
-            command.arg("-6");
+        for argument in &argv {
+            command.arg(argument);
         }
-        #[cfg(unix)]
-        command.arg("-c").arg("1");
-        #[cfg(windows)]
-        command.arg("-n").arg("1");
-        command.arg(&self.target);
         // Node runs ping through execFile, which captures (and discards)
         // stdout/stderr; do the same so probes do not pollute the console.
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
+        // Without this, aborting the loop mid-probe (stop(), or a pipeline
+        // panic that skips stop()) leaves an orphaned `ping` running to its own
+        // completion.
+        command.kill_on_drop(true);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err)
@@ -342,7 +371,11 @@ impl InternetWatchdog {
     where
         F: Fn(AppError) + Send + 'static,
     {
-        let mut handle_slot = self.inner.loop_handle.lock().unwrap();
+        let mut handle_slot = self
+            .inner
+            .loop_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.inner.stopped.load(Ordering::SeqCst) || handle_slot.is_some() {
             return;
         }
@@ -355,7 +388,13 @@ impl InternetWatchdog {
         if !self.inner.stopped.swap(true, Ordering::SeqCst) {
             self.inner.stop_token.cancel();
         }
-        if let Some(handle) = self.inner.loop_handle.lock().unwrap().take() {
+        let handle = self
+            .inner
+            .loop_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle {
             handle.abort();
         }
     }

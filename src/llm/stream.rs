@@ -6,8 +6,6 @@
 //! reasoning deltas into a per-attempt [`StreamRepetitionDetector`], and
 //! renders live reasoning/response output through [`StreamFader`]s.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -26,12 +24,15 @@ const REASONING_FADER_CYCLE: usize = 100;
 /// Cycle length of the response stream fader (createStreamFader("streaming")).
 const RESPONSE_FADER_CYCLE: usize = 120;
 
+/// Writes a live-stream fragment to the console.
+///
+/// Routed through `console_output` rather than writing to `stdout()` directly,
+/// for two reasons: it takes the same console lock the line writers and the
+/// execution-log reader threads take, so a stream delta cannot interleave
+/// mid-line with a log record; and on Windows, where there is no descriptor
+/// tee, it is what mirrors streaming output into the execution log.
 fn write_stdout(text: &str) {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let _ = lock.write_all(text.as_bytes());
-    let _ = lock.flush();
+    crate::logging::console_output::write_stdout_fragment(text);
 }
 
 /// Port of writeLiveStreamStart: `\n╭─ [label]` header plus an open `│ `
@@ -368,10 +369,12 @@ pub async fn stream_openai_compatible(
         "{}/chat/completions",
         provider_config.base_url.trim_end_matches('/')
     );
-    let send = shared_client()
+    let send = shared_client()?
         .post(&url)
         .bearer_auth(&provider_config.api_key)
-        .timeout(Duration::from_millis(crate::constants::LLM_HTTP_TIMEOUT_MS))
+        .timeout(crate::llm::openai_compat::resolve_http_timeout(
+            request.timeout_ms,
+        ))
         .json(body)
         .send();
     let response = tokio::select! {
@@ -382,7 +385,12 @@ pub async fn stream_openai_compatible(
     }?;
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        // A failed body read must not erase the diagnostics that explain why
+        // the provider rejected the request.
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<response body could not be read: {error}>"));
         let snippet: String = text.chars().take(500).collect();
         return Err(AppError::new(
             "LLM_CALL_FAILED",

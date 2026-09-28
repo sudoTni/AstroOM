@@ -14,10 +14,7 @@ use crate::stages::{
 };
 use crate::types::{should_execute_phase, LogLevel, Provider, ProviderRouting};
 use serde::Serialize;
-use std::sync::{
-    atomic::{AtomicU16, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 
 /// Resolve the `astro_auto_provider` sentinel into concrete OpenRouter
 /// provider slugs immediately before a stage runs (Node
@@ -113,81 +110,21 @@ pub async fn execute(ctx: &RunContext, config: &PipelineConfig) -> Result<Pipeli
     // Install SIGINT/SIGTERM handling before any stage work (including the
     // preflight rclone check), so signals during startup are also caught and
     // mapped to exit codes 130/143, matching Node's CLI handler.
-    let signal_code = Arc::new(AtomicU16::new(0));
     let signal_stop = tokio_util::sync::CancellationToken::new();
-    #[cfg(unix)]
-    let signal_task = {
-        let cancellation = ctx.cancellation.clone();
-        let stop = signal_stop.clone();
-        let code = Arc::clone(&signal_code);
-        tokio::spawn(async move {
-            let Ok(mut int) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            else {
-                return;
-            };
-            let Ok(mut term) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            else {
-                return;
-            };
-            tokio::select! {
-                _ = int.recv() => {
-                    crate::logging::log(
-                        "Pipeline",
-                        "Received SIGINT; cancelling pipeline gracefully.",
-                        LogLevel::Warn,
-                    );
-                    code.store(130, Ordering::SeqCst);
-                    cancellation.cancel();
-                }
-                _ = term.recv() => {
-                    crate::logging::log(
-                        "Pipeline",
-                        "Received SIGTERM; cancelling pipeline gracefully.",
-                        LogLevel::Warn,
-                    );
-                    code.store(143, Ordering::SeqCst);
-                    cancellation.cancel();
-                }
-                _ = stop.cancelled() => {}
-            }
-        })
-    };
-
-    #[cfg(windows)]
-    let signal_task = {
-        let cancellation = ctx.cancellation.clone();
-        let stop = signal_stop.clone();
-        let code = Arc::clone(&signal_code);
-        tokio::spawn(async move {
-            tokio::select! {
-                res = tokio::signal::ctrl_c() => {
-                    if res.is_ok() {
-                        crate::logging::log(
-                            "Pipeline",
-                            "Received Ctrl-C; cancelling pipeline gracefully.",
-                            LogLevel::Warn,
-                        );
-                        code.store(130, Ordering::SeqCst);
-                        cancellation.cancel();
-                    }
-                }
-                _ = stop.cancelled() => {}
-            }
-        })
-    };
+    let signal_task = crate::pipeline::cancellation::spawn_signal_watcher(
+        ctx.cancellation.clone(),
+        signal_stop.clone(),
+    );
     let outcome = execute_untracked(ctx, config).await;
     signal_stop.cancel();
-    signal_task.abort();
-    let result = match signal_code.load(Ordering::SeqCst) {
-        130 => Err(AppError::new("SIGINT", 130, "Pipeline cancelled by SIGINT")),
-        143 => Err(AppError::new(
-            "SIGTERM",
-            143,
-            "Pipeline cancelled by SIGTERM",
-        )),
-        _ => outcome,
+    let signal = match signal_task.await {
+        Ok(Some(outcome)) => Some(outcome),
+        // No signal, or the watcher never observed one: use the real outcome.
+        Ok(None) | Err(_) => None,
+    };
+    let result = match signal {
+        Some(signal) => Err(AppError::from(signal)),
+        None => outcome,
     };
     if let Some(tracker) = &ctx.usage_tracker {
         let summary = tracker
@@ -257,7 +194,8 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             selected_presets: vec![],
             selected_preset_categories,
         },
-    )?;
+    )
+    .await?;
     crate::logging::log("Pipeline", "Preflight checks passed", LogLevel::Success);
     crate::logging::log(
         "Pipeline",

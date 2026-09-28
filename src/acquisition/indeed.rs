@@ -18,17 +18,27 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const INDEED_API_URL: &str = "https://apis.indeed.com/graphql";
+pub const INDEED_API_URL: &str = "https://apis.indeed.com/graphql";
 
-/// Public Indeed mobile-app client key, extracted from the official Indeed iOS
-/// app and already present in any copy of that app. It is NOT a user secret.
+/// Public Indeed mobile client identifier, compiled into the binary.
 ///
-/// This value is intentionally committed and embedded in the released binary.
-/// Users who have their own Indeed API credential should pass it with
-/// `--indeed-api-key` (or `AOM_INDEED_API_KEY` via the launcher), which takes
-/// precedence at runtime; see `acquire_indeed` below.
-const DEFAULT_INDEED_CLIENT_KEY: &str =
+/// This is not a user secret: Indeed's own mobile application ships the same
+/// identifier to every device, so there is nothing to rotate and nothing to
+/// protect. It is embedded rather than required from a file or the
+/// environment so that relocating the executable, changing platform, or
+/// omitting `.env` cannot stop the scraper from working.
+///
+/// A deployment that would rather supply its own credential from an external
+/// secret source can set [`INDEED_API_KEY_ENV`]; see
+/// [`resolve_indeed_api_key`] for the full precedence order.
+pub const DEFAULT_INDEED_CLIENT_KEY: &str =
     "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8";
+
+/// Environment variable that overrides the compiled-in Indeed client key.
+///
+/// Consulted ahead of [`DEFAULT_INDEED_CLIENT_KEY`] so the credential can be
+/// kept in a secret manager or a git-ignored `.env` rather than in source.
+pub const INDEED_API_KEY_ENV: &str = "ASTROOM_INDEED_API_KEY";
 
 const INDEED_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1";
 
@@ -216,14 +226,89 @@ fn representation_for(format: DescriptionFormat) -> DescriptionRepresentation {
     }
 }
 
+/// Resolves the credential to send as `indeed-api-key`.
+///
+/// Precedence, highest first:
+///
+/// 1. an explicit non-blank `--indeed-api-key`;
+/// 2. a non-blank `$ASTROOM_INDEED_API_KEY` ([`INDEED_API_KEY_ENV`]), so the
+///    credential can be supplied from an external secret source;
+/// 3. the compiled-in public client identifier, which keeps a zero-config
+///    install scraping exactly as it always has.
+///
+/// A blank or whitespace-only value at any level is treated as absent and
+/// falls through, so an empty variable cannot silently break acquisition.
+pub fn resolve_indeed_api_key(query: &AcquisitionQuery) -> String {
+    resolve_indeed_api_key_with(
+        query.indeed_api_key.as_deref(),
+        std::env::var(INDEED_API_KEY_ENV).ok(),
+    )
+}
+
+/// [`resolve_indeed_api_key`] with the two candidate sources supplied
+/// explicitly, so the precedence order is testable without mutating the
+/// process environment (which is global, and therefore racy under a parallel
+/// test runner).
+pub fn resolve_indeed_api_key_with(flag_value: Option<&str>, env_value: Option<String>) -> String {
+    non_blank(flag_value)
+        .or_else(|| non_blank(env_value.as_deref()))
+        .unwrap_or_else(|| DEFAULT_INDEED_CLIENT_KEY.to_string())
+}
+
+/// The trimmed value, or `None` when absent, empty, or whitespace-only.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The header that carries the credential. Part of Indeed's request contract:
+/// renaming it silently breaks every request.
+pub const INDEED_API_KEY_HEADER: &str = "indeed-api-key";
+
+/// The credential as it is placed on the wire, for tests and diagnostics.
+pub fn indeed_api_key_header_value(query: &AcquisitionQuery) -> (String, String) {
+    (
+        INDEED_API_KEY_HEADER.to_string(),
+        resolve_indeed_api_key(query),
+    )
+}
+
+/// The human-readable request line used by `--show-fetch-url` logging.
+/// Deliberately carries no credential.
+pub fn describe_request_for_log(
+    query: &AcquisitionQuery,
+    page: u32,
+    fetched: usize,
+    cumulative: usize,
+) -> String {
+    let filter_mode = if let Some(hours) = query.hours_old {
+        format!("hoursOld:{hours}")
+    } else if query.remote_only {
+        "remoteOnly:DSQF7".to_string()
+    } else if query.easy_apply {
+        "easyApply".to_string()
+    } else if query.remote {
+        "remote:DSQF7".to_string()
+    } else if let Some(job_type) = &query.job_type {
+        format!("jobType:{job_type}")
+    } else {
+        "none".to_string()
+    };
+    format!(
+        "[search][indeed] page={page} fetched={fetched} cumulative={cumulative} url={INDEED_API_URL} filter={filter_mode}"
+    )
+}
+
+/// `country_code` re-exported for tests; the mapping itself is unchanged.
+pub fn country_code_for_test(country: Option<&str>) -> (&'static str, &'static str) {
+    country_code(country)
+}
+
 pub async fn acquire_indeed(query: &AcquisitionQuery) -> Result<Vec<CanonicalAcquiredJob>> {
     let session = JobSpySession::new(&query.proxies, query.user_agent.as_deref(), false, 0);
     let (domain, country) = country_code(Some(query.indeed_country.as_str()));
-    let api_key = query
-        .indeed_api_key
-        .clone()
-        .filter(|key| !key.is_empty())
-        .unwrap_or_else(|| DEFAULT_INDEED_CLIENT_KEY.to_string());
     let mut jobs: Vec<CanonicalAcquiredJob> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut cursor: Option<String> = None;
@@ -295,6 +380,7 @@ pub async fn acquire_indeed(query: &AcquisitionQuery) -> Result<Vec<CanonicalAcq
             );
         }
 
+        let api_key = resolve_indeed_api_key(query);
         let headers: Vec<(&str, &str)> = vec![
             ("Host", "apis.indeed.com"),
             ("content-type", "application/json"),
@@ -303,7 +389,7 @@ pub async fn acquire_indeed(query: &AcquisitionQuery) -> Result<Vec<CanonicalAcq
             ("accept-language", "en-US,en;q=0.9"),
             ("user-agent", INDEED_USER_AGENT),
             ("indeed-app-info", INDEED_APP_INFO),
-            ("indeed-api-key", api_key.as_str()),
+            (INDEED_API_KEY_HEADER, api_key.as_str()),
             ("indeed-co", country),
         ];
         let body = serde_json::json!({ "query": query_string }).to_string();
@@ -480,10 +566,7 @@ pub async fn acquire_indeed(query: &AcquisitionQuery) -> Result<Vec<CanonicalAcq
         } else {
             log_kv(
                 "IndeedSearch",
-                &format!(
-                    "[search][indeed] page={page_num} fetched={page_fetched} cumulative={}",
-                    jobs.len()
-                ),
+                &describe_request_for_log(query, page_num, page_fetched, jobs.len()),
                 LogLevel::Info,
                 &[
                     ("page", serde_json::json!(page_num)),

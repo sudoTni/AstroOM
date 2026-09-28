@@ -1,57 +1,102 @@
 #!/usr/bin/env bash
+# AstroOM launcher (Linux / macOS / WSL).
 #
-# AstroOM launcher.
+# Applies the tuned policy argv and execs the astroom binary. Any arguments
+# you pass are appended *last* so they override the defaults, which is what the
+# binary's `args_override_self` expects.
 #
-# Sources a private .env for credentials and optional directory redirection,
-# wipes the previous run's logs, then executes the release binary with a
-# fixed policy argv. Any arguments passed to this script are appended LAST, so
-# they override the policy defaults (same last-wins semantics as the Node
-# predecessor's yargs parsing).
-#
-# Usage:
-#   ./astro_launcher.bash                       # use the policy defaults
-#   ./astro_launcher.bash --batch 50 --clean    # override selected flags
-#
-# The `astroom` binary itself reads NO environment variables; every setting
-# reaches it through explicit flags. If you would rather not use this wrapper,
-# invoke the binary directly with --api-key / --api-key-file.
+# The launcher does NOT change directory. Path resolution belongs to the
+# executable, which locates its own resources relative to itself; changing the
+# working directory here would mask that and break any relative path you pass.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# Bash 3.2 (macOS) lacks BASH_SOURCE[0] safety nets and `readarray`.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-echo ":: astroom launcher"
-echo
+die() {
+  printf 'astro_launcher: %s\n' "$*" >&2
+  exit 1
+}
 
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  echo ":: Sourcing $SCRIPT_DIR/.env..."
-  set -a
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/.env"
-  set +a
-  echo ":: ...sourced $SCRIPT_DIR/.env"
-else
-  echo ":: No .env found; using defaults and CLI flags only."
-  echo "::   cp .env.example .env   # then set AOM_OR_API_KEY"
+# --- locate the binary ------------------------------------------------------
+# Order matters: an explicit override, then a co-located install (the
+# distribution layout), then the in-tree cargo build output, then PATH.
+find_binary() {
+  local candidate
+  if [[ -n "${ASTROOM_BIN:-}" ]]; then
+    if [[ -x "${ASTROOM_BIN}" ]]; then
+      printf '%s\n' "${ASTROOM_BIN}"
+      return 0
+    fi
+    die "ASTROOM_BIN is set to '${ASTROOM_BIN}', which is not an executable file."
+  fi
+  for candidate in \
+    "${SCRIPT_DIR}/astroom" \
+    "${SCRIPT_DIR}/bin/astroom" \
+    "${SCRIPT_DIR}/../bin/astroom" \
+    "${SCRIPT_DIR}/target/release/astroom" \
+    "${SCRIPT_DIR}/target/debug/astroom"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  if command -v astroom >/dev/null 2>&1; then
+    command -v astroom
+    return 0
+  fi
+  cat >&2 <<EOF
+astro_launcher: could not find the astroom binary.
+
+Searched, in order:
+  \$ASTROOM_BIN
+  ${SCRIPT_DIR}/astroom
+  ${SCRIPT_DIR}/bin/astroom
+  ${SCRIPT_DIR}/../bin/astroom
+  ${SCRIPT_DIR}/target/release/astroom
+  ${SCRIPT_DIR}/target/debug/astroom
+  astroom on PATH
+
+Build one with:  cargo build --release
+or set \$ASTROOM_BIN to its full path.
+EOF
+  return 1
+}
+
+# --- configuration ----------------------------------------------------------
+load_env_file() {
+  local env_file="${SCRIPT_DIR}/.env"
+  [[ -f "${env_file}" ]] || return 0
+  printf ':: sourcing %s\n' "${env_file}"
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  printf ':: ...sourced %s\n' "${env_file}"
+}
+
+# Resolved before anything destructive happens, so a missing binary never costs
+# you the previous run's logs.
+ASTROOM="$(find_binary)" || exit 1
+
+load_env_file
+
+: "${AOM_OR_API_KEY:?Set AOM_OR_API_KEY in ${SCRIPT_DIR}/.env before running LLM stages.}"
+
+if [[ "${AOM_CLEAN_LOGS:-1}" == "1" ]]; then
+  printf ':: cleaning %s/logs/\n' "${SCRIPT_DIR}"
+  mkdir -p "${SCRIPT_DIR}/logs"
+  rm -rf "${SCRIPT_DIR}"/logs/*
+  printf ':: ...cleaned %s/logs/\n' "${SCRIPT_DIR}"
 fi
-echo
 
-echo ":: Cleaning $SCRIPT_DIR/logs/..."
-mkdir -p "$SCRIPT_DIR/logs"
-rm -rfv "$SCRIPT_DIR"/logs/*
-echo ":: ...cleaned $SCRIPT_DIR/logs/"
-echo
-
-: "${AOM_OR_API_KEY:?Set AOM_OR_API_KEY in .env (see .env.example), or pass --api-key directly to astroom.}"
-
-# Candidate profile directory. Copy the shipped template once with:
-#   cp -r profile.example profile
-PROFILE_DIR="${AOM_PROFILE_DIR:-$SCRIPT_DIR/profile}"
+# --- policy argv ------------------------------------------------------------
+# Mirrors the tuned defaults; every one of these is overridable by a trailing
+# caller argument.
+PROFILE_DIR="${AOM_PROFILE_DIR:-${SCRIPT_DIR}/candidate_profile}"
 
 ARGS=(
   run-pipeline
   --job-provider indeed,linkedin
-  --search-terms-file "$PROFILE_DIR/search_terms.txt"
+  --search-terms-file "${PROFILE_DIR}/search_terms.txt"
   --api-key "$AOM_OR_API_KEY"
   --jobcloth-preset "jc_glm-5.3-flash"
   --remoteeval-preset "re_glm-5.3-flash"
@@ -66,16 +111,27 @@ ARGS=(
   --remote-only true --track-or-costs --internet-watchdog --log-cool-offs
 )
 
+# Optional explicit directory redirection. Passed as absolute paths so they are
+# unambiguous regardless of the caller's working directory.
 [[ -n "${AOM_DATA_DIR:-}" ]] && ARGS+=(--data-dir "$AOM_DATA_DIR")
 [[ -n "${AOM_LOG_DIR:-}" ]] && ARGS+=(--log-dir "$AOM_LOG_DIR")
 [[ -n "${AOM_MATERIALS_DIR:-}" ]] && ARGS+=(--materials-dir "$AOM_MATERIALS_DIR")
-[[ -n "${AOM_PROFILE_DIR:-}" ]] && ARGS+=(--profile-dir "$AOM_PROFILE_DIR")
-[[ -n "${AOM_INDEED_API_KEY:-}" ]] && ARGS+=(--indeed-api-key "$AOM_INDEED_API_KEY")
+if [[ -n "${AOM_PROFILE_DIR:-}" ]]; then
+  ARGS+=(--profile-dir "$AOM_PROFILE_DIR")
+  # Replaces the default entry appended above rather than duplicating it.
+  for i in "${!ARGS[@]}"; do
+    if [[ "${ARGS[$i]}" == "--search-terms-file" ]]; then
+      ARGS[$((i + 1))]="${AOM_PROFILE_DIR}/search_terms.txt"
+      break
+    fi
+  done
+fi
 
 [[ "${AOM_CLEAN:-0}" == "1" ]] && ARGS+=(--clean)
 if [[ "${AOM_DEPLOY:-0}" == "1" ]]; then
-  : "${AOM_DEPLOY_DESTINATION:?Set AOM_DEPLOY_DESTINATION, e.g. GoogleDrive:/my-astroom-output}"
+  : "${AOM_DEPLOY_DESTINATION:?Set AOM_DEPLOY_DESTINATION, e.g. GoogleDrive:/autoJobGen-src}"
   ARGS+=(--deploy --deploy-destination "$AOM_DEPLOY_DESTINATION")
 fi
 
-exec ./target/release/astroom "${ARGS[@]}" "$@"
+printf ':: exec %s %s ...\n' "${ASTROOM}" "${ARGS[0]}" >&2
+exec "${ASTROOM}" "${ARGS[@]}" "$@"

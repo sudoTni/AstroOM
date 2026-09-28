@@ -1,7 +1,7 @@
 //! Stage 8 deployment contract with a fake `rclone` shim on PATH.
 
+// Requires a POSIX shell `rclone` shim on PATH and POSIX signal delivery.
 #![cfg(unix)]
-
 mod common;
 
 use common::*;

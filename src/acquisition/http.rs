@@ -69,9 +69,20 @@ impl JobSpySession {
             .filter_map(|p| normalize_proxy(p))
             .collect::<Vec<_>>();
         let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECONDS);
+        // `unwrap_or_default()` here would silently yield a client with no
+        // proxy, a 30s timeout and a different UA, turning a broken proxy pool
+        // into direct connections rather than a reported failure.
         let client = client_builder(timeout, &user_agent)
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                crate::logging::log_kv(
+                    "JobSpy",
+                    &format!("Failed to build the default HTTP client: {error}"),
+                    crate::types::LogLevel::Warn,
+                    &[] as &[(&str, serde_json::Value)],
+                );
+                reqwest::Client::new()
+            });
         Self {
             client,
             proxies,

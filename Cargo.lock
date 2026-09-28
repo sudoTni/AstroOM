@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "astroom"
-version = "0.1326.0"
+version = "0.1338.0"
 dependencies = [
  "ab_glyph",
  "chrono",

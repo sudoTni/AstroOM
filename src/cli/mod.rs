@@ -502,13 +502,21 @@ pub fn run_cli() -> i32 {
         }
     };
     if cli.global.record_logo_gif {
+        // Routed through `console_output` like every other write, even though
+        // no execution log exists yet at this point: it keeps the invariant
+        // that all console output takes the shared console lock.
         return match crate::utils::gif_export::record_logo_gif() {
             Ok(path) => {
-                println!("Recorded animated logo to {}", path.display());
+                crate::logging::console_output::write_stdout_line(&format!(
+                    "Recorded animated logo to {}",
+                    path.display()
+                ));
                 0
             }
             Err(error) => {
-                eprintln!("Error: failed to generate logo GIF: {error}");
+                crate::logging::console_output::write_internal_console_failure(&format!(
+                    "Error: failed to generate logo GIF: {error}"
+                ));
                 1
             }
         };
@@ -545,10 +553,31 @@ pub fn run_cli() -> i32 {
             )));
         }
     }
+    // Enabling virtual-terminal processing must happen before any escape
+    // sequence is emitted, otherwise a Windows console prints the sequences
+    // literally.
+    let vt_available = crate::platform::try_enable_virtual_terminal();
+    let mut context = context;
+    if !vt_available {
+        // Only automatic detection is downgraded. An explicit `--color` is a
+        // deliberate request and is honoured even off a TTY, exactly as before.
+        if context.display.color.is_none() {
+            context.display.color = Some(false);
+        }
+    }
+
     if let Err(error) = initialize_runtime(&context, &raw_args, suppress_banner) {
         crate::logging::console_output::write_internal_console_failure(&format!("Error: {error}"));
         return 1;
     }
+    // The guard is bound for its whole lifetime so its `Drop` — which restores
+    // the terminal's scroll region and cursor — also runs on the error return
+    // below and on an unwinding panic.
+    #[cfg(unix)]
+    let banner_guard = initialize_banner(&context, suppress_banner);
+    #[cfg(not(unix))]
+    initialize_banner(&context, suppress_banner);
+
     let result = dispatch(command, &context);
     let code = match result {
         Ok(code) => code,
@@ -562,6 +591,10 @@ pub fn run_cli() -> i32 {
         }
     };
     crate::logging::execution_log::close_execution_log();
+    // Drop the banner guard after the execution log is closed and immediately
+    // before returning, so the console is restored last.
+    #[cfg(unix)]
+    drop(banner_guard);
     code
 }
 
@@ -570,20 +603,52 @@ fn initialize_runtime(
     raw_args: &[String],
     suppress_banner: bool,
 ) -> Result<()> {
+    let _ = suppress_banner;
     std::fs::create_dir_all(&context.paths.data_dir)?;
     crate::logging::configure_logging(
         context.display.log_format,
         context.display.initial_log_level(),
         context.display.use_color(),
     );
-    if !suppress_banner {
-        crate::utils::display_banner(context.display.use_color(), context.display.banner_loops);
-    }
     crate::logging::execution_log::initialize_execution_log(&context.paths.log_dir, raw_args)
         .map_err(|error| {
             AppError::message(format!("Failed to initialize execution log: {error}"))
         })?;
     Ok(())
+}
+
+/// Starts the banner and returns the guard that restores the terminal.
+///
+/// On a Unix terminal that supports a scrolling region this is a persistent
+/// animated footer that leaves the full application history in the terminal's
+/// native scrollback. Everywhere else — redirected output, a small or
+/// `TERM=dumb` terminal, `--no-banner`, `--json`, and all of Windows — it falls
+/// back to the existing bounded in-place animation, unchanged.
+#[cfg(unix)]
+fn initialize_banner(
+    context: &RunContext,
+    suppress_banner: bool,
+) -> crate::logging::footer::FooterGuard {
+    if suppress_banner {
+        return crate::logging::footer::FooterGuard::disabled();
+    }
+    let use_color = context.display.use_color();
+    if crate::logging::footer::is_supported(use_color) {
+        return crate::logging::footer::install(use_color);
+    }
+    // Fallback: the historical bounded animation, byte-for-byte.
+    crate::utils::display_banner(use_color, context.display.banner_loops);
+    crate::logging::footer::FooterGuard::disabled()
+}
+
+/// Windows has no reliable scrolling-region support, so the persistent footer
+/// is not offered there: the historical bounded in-place animation is the
+/// Windows behaviour, unchanged.
+#[cfg(not(unix))]
+fn initialize_banner(context: &RunContext, suppress_banner: bool) {
+    if !suppress_banner {
+        crate::utils::display_banner(context.display.use_color(), context.display.banner_loops);
+    }
 }
 
 fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
@@ -883,7 +948,11 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                 selected_presets,
                 selected_preset_categories: vec![],
             };
-            let result = app_commands::preflight::run_preflight(context, &options)?;
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                AppError::message(format!("Unable to start async runtime: {error}"))
+            })?;
+            let result =
+                runtime.block_on(app_commands::preflight::run_preflight(context, &options))?;
             crate::logging::console_output::write_machine_json(&serde_json::to_value(&result)?);
             Ok(if result.valid { 0 } else { 1 })
         }
@@ -911,7 +980,7 @@ mod tests {
             "--job-provider",
             "indeed,linkedin",
             "--search-terms-file",
-            "/p/profile/search_terms.txt",
+            "/p/candidate_profile/search_terms.txt",
             "--api-key",
             "test-key",
             "--jobcloth-preset",

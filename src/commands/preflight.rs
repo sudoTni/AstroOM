@@ -8,9 +8,12 @@ use crate::jobrepo::{JobRepository, JobRepositoryConfig, JobRepositoryHealth};
 use crate::presets::load_presets;
 use serde::Serialize;
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
+
+/// Upper bound on the `rclone version` capability probe. A hung rclone must
+/// not stall pipeline startup indefinitely.
+const RCLONE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Default)]
 pub struct PreflightOptions {
@@ -50,7 +53,10 @@ pub struct PreflightResult {
     pub errors: Vec<String>,
 }
 
-pub fn run_preflight(ctx: &RunContext, options: &PreflightOptions) -> Result<PreflightResult> {
+pub async fn run_preflight(
+    ctx: &RunContext,
+    options: &PreflightOptions,
+) -> Result<PreflightResult> {
     let mut errors = Vec::new();
     let required_files = ["search_terms.txt", "my_resume.txt"];
     let missing_profile_files: Vec<String> = required_files
@@ -147,13 +153,12 @@ pub fn run_preflight(ctx: &RunContext, options: &PreflightOptions) -> Result<Pre
         .is_some_and(|destination| !destination.trim().is_empty());
     // Node's execFileSync("rclone", ["version"]) throws on a non-zero exit
     // status, so a present-but-broken rclone is not "available".
-    let rclone_available = options.check_deployment
-        && std::process::Command::new("rclone")
-            .arg("version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+    //
+    // `.status()` blocks the calling thread with no timeout and no
+    // cancellation path, so a wedged or interactive rclone (it inherits
+    // RCLONE_* configuration) would hang `preflight` — and therefore pipeline
+    // startup — forever. Probe asynchronously with a bounded budget instead.
+    let rclone_available = options.check_deployment && rclone_is_available().await;
     if options.check_deployment && !destination_set {
         errors.push("Deployment is enabled but --deploy-destination is not set.".into());
     }
@@ -202,8 +207,11 @@ pub fn run_preflight(ctx: &RunContext, options: &PreflightOptions) -> Result<Pre
     })
 }
 
-pub fn assert_preflight(ctx: &RunContext, options: &PreflightOptions) -> Result<PreflightResult> {
-    let result = run_preflight(ctx, options)?;
+pub async fn assert_preflight(
+    ctx: &RunContext,
+    options: &PreflightOptions,
+) -> Result<PreflightResult> {
+    let result = run_preflight(ctx, options).await?;
     if result.valid {
         Ok(result)
     } else {
@@ -219,6 +227,31 @@ pub fn assert_preflight(ctx: &RunContext, options: &PreflightOptions) -> Result<
     }
 }
 
+/// Probes `rclone version` with a bounded time budget.
+///
+/// The probe runs on a temporary runtime when the caller is not already inside
+/// one (`astroom preflight` is synchronous), and on the ambient runtime when it
+/// is (pipeline startup). Either way a wedged or interactive rclone resolves to
+/// `false` after [`RCLONE_PROBE_TIMEOUT`] instead of hanging forever.
+async fn rclone_is_available() -> bool {
+    match tokio::time::timeout(
+        RCLONE_PROBE_TIMEOUT,
+        tokio::process::Command::new("rclone")
+            .arg("version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status.success(),
+        // Timed out, or the binary could not be spawned at all.
+        _ => false,
+    }
+}
+
 fn verify_directory_writable(directory: &Path) -> bool {
     if std::fs::create_dir_all(directory).is_err() {
         return false;
@@ -228,12 +261,10 @@ fn verify_directory_writable(directory: &Path) -> bool {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let result = options
-        .open(&probe)
-        .and_then(|_| std::fs::remove_file(&probe));
+    let result = crate::platform::private_file::apply_private_file_mode(
+        std::fs::OpenOptions::new().write(true).create_new(true),
+    )
+    .open(&probe)
+    .and_then(|_| std::fs::remove_file(&probe));
     result.is_ok()
 }

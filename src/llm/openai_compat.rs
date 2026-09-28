@@ -30,23 +30,57 @@ const REPETITION_RETRY_DELAY_MS: u64 = 1000;
 /// on each call). Every request made through this client automatically
 /// includes the `HTTP-Referer` and `X-Title` identification headers
 /// required by OpenRouter and compatible LLM APIs.
-pub(crate) fn shared_client() -> &'static reqwest::Client {
+pub(crate) fn shared_client() -> crate::error::Result<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "HTTP-Referer",
-            reqwest::header::HeaderValue::from_static("https://github.com/sudoTni/AstroOM"),
-        );
-        headers.insert(
-            "X-Title",
-            reqwest::header::HeaderValue::from_static("AstroOM"),
-        );
-        reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("Failed to build shared LLM HTTP client")
-    })
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "HTTP-Referer",
+        reqwest::header::HeaderValue::from_static("https://github.com/sudoTni/AstroOM"),
+    );
+    headers.insert(
+        "X-Title",
+        reqwest::header::HeaderValue::from_static("AstroOM"),
+    );
+    // A TLS backend that cannot initialise (missing or incompatible OpenSSL on
+    // a musl host, a FIPS-restricted host) is a runtime configuration problem,
+    // not a programming error, so it is reported rather than panicked. The
+    // `OnceLock` caches the client only on success, so a transient failure can
+    // be retried instead of panicking on every call.
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(|error| {
+            crate::error::AppError::new(
+                "LLM_CLIENT_INIT_FAILED",
+                500,
+                format!(
+                    "Failed to build the LLM HTTP client. This usually means the system TLS \
+                     backend is unavailable or too old for the linked OpenSSL. ({error})"
+                ),
+            )
+        })?;
+    let _ = CLIENT.set(client);
+    CLIENT
+        .get()
+        .ok_or_else(|| crate::error::AppError::message("LLM HTTP client unavailable"))
+}
+
+/// Resolves the effective HTTP timeout for one request.
+///
+/// `LlmRequest::timeout_ms` is the caller-declared budget (`--openai-timeout`
+/// for `jobCloth`, 30s for the other stages). It was previously only written
+/// into the log context and never applied, so every request ran for the full
+/// [`crate::constants::LLM_HTTP_TIMEOUT_MS`] regardless of configuration. A
+/// zero or absent value falls back to that default.
+pub(crate) fn resolve_http_timeout(timeout_ms: u64) -> Duration {
+    if timeout_ms == 0 {
+        Duration::from_millis(crate::constants::LLM_HTTP_TIMEOUT_MS)
+    } else {
+        Duration::from_millis(timeout_ms)
+    }
 }
 
 /// Build the JSON body for an OpenAI-compatible chat-completion request.
@@ -114,15 +148,16 @@ async fn send_chat_completion(
     ctx: &RunContext,
     provider_config: &ProviderConfig,
     body: &Value,
+    timeout_ms: u64,
 ) -> Result<Value> {
     let url = format!(
         "{}/chat/completions",
         provider_config.base_url.trim_end_matches('/')
     );
-    let send = shared_client()
+    let send = shared_client()?
         .post(&url)
         .bearer_auth(&provider_config.api_key)
-        .timeout(Duration::from_millis(crate::constants::LLM_HTTP_TIMEOUT_MS))
+        .timeout(resolve_http_timeout(timeout_ms))
         .json(body)
         .send();
     let response = tokio::select! {
@@ -133,7 +168,12 @@ async fn send_chat_completion(
     }?;
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
+        // A failed body read must not erase the diagnostics that explain why
+        // the provider rejected the request.
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<response body could not be read: {error}>"));
         let snippet: String = text.chars().take(500).collect();
         return Err(AppError::new(
             "LLM_CALL_FAILED",
@@ -432,7 +472,8 @@ pub async fn call_openai_compatible(
     }
 
     let body = build_request_body(request.provider, request, false, false);
-    let response_body = send_chat_completion(ctx, provider_config, &body).await?;
+    let response_body =
+        send_chat_completion(ctx, provider_config, &body, request.timeout_ms).await?;
     let outcome = parse_non_streaming_response(
         request,
         &response_body,

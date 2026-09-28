@@ -8,8 +8,6 @@ use crate::types::LogLevel;
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -76,11 +74,7 @@ pub fn write_llm_payload_log(log_directory: &Path, stage: &str, payload: &Value)
         }
     };
     let directory = log_directory.join(directory_name);
-    let mut dir_builder = std::fs::DirBuilder::new();
-    dir_builder.recursive(true);
-    #[cfg(unix)]
-    dir_builder.mode(0o700);
-    if let Err(error) = dir_builder.create(&directory) {
+    if let Err(error) = crate::platform::create_private_dir_all(&directory) {
         warn_payload_failure(
             format!(
                 "Unable to create LLM payload log directory at {}",
@@ -112,13 +106,11 @@ pub fn write_llm_payload_log(log_directory: &Path, stage: &str, payload: &Value)
         uuid::Uuid::new_v4()
     );
     let file_path = directory.join(file_name);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let write_result = options
-        .open(&file_path)
-        .and_then(|mut file| file.write_all(serialized_payload.as_bytes()));
+    let write_result = crate::platform::private_file::apply_private_file_mode(
+        OpenOptions::new().write(true).create_new(true),
+    )
+    .open(&file_path)
+    .and_then(|mut file| file.write_all(serialized_payload.as_bytes()));
     match write_result {
         Ok(()) => Some(file_path.to_string_lossy().to_string()),
         Err(error) => {
@@ -182,15 +174,20 @@ fn update_llm_payload_log_inner(file_path: &str, llm_output: &Value) -> std::io:
         random_suffix
     );
     {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut temp_file = options.open(&temp_path)?;
+        let mut temp_file = crate::platform::private_file::apply_private_file_mode(
+            OpenOptions::new().write(true).create(true).truncate(true),
+        )
+        .open(&temp_path)?;
         temp_file
             .write_all(serde_json::to_string_pretty(&Value::Object(updated_data))?.as_bytes())?;
     }
-    std::fs::rename(&temp_path, file_path)?;
+    // A failed rename must not leave the temp file behind: it holds the full
+    // request payload plus the model's response. Windows in particular fails
+    // here whenever an indexer or scanner holds the destination open.
+    if let Err(error) = std::fs::rename(&temp_path, file_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
     Ok(())
 }
 

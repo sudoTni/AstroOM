@@ -117,50 +117,7 @@ fn iso(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn parse_proc_kb(rest: &str) -> Option<u64> {
-    rest.trim()
-        .strip_suffix("kB")
-        .and_then(|n| n.trim().parse::<u64>().ok())
-        .map(|kb| kb * 1024)
-}
-
-fn read_proc_status() -> Option<(u64, u64)> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let mut peak = None;
-    let mut size = None;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmPeak:") {
-            peak = parse_proc_kb(rest);
-        } else if let Some(rest) = line.strip_prefix("VmSize:") {
-            size = parse_proc_kb(rest);
-        }
-    }
-    Some((peak?, size?))
-}
-
-fn read_cpu_ticks() -> Option<(u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let after_comm = stat.rsplit(')').next()?;
-    let mut fields = after_comm.split_whitespace();
-    let utime: u64 = fields.nth(11)?.parse().ok()?;
-    let stime: u64 = fields.next()?.parse().ok()?;
-    Some((utime, stime))
-}
-
-#[cfg(unix)]
-fn clock_ticks_per_sec() -> f64 {
-    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if tck > 0 {
-        tck as f64
-    } else {
-        100.0
-    }
-}
-
-#[cfg(not(unix))]
-fn clock_ticks_per_sec() -> f64 {
-    100.0
-}
+use crate::platform::proc_metrics::{clock_ticks_per_sec, read_cpu_ticks, read_peak_memory_kb};
 
 impl StatisticsCollector {
     pub fn new(command: &str) -> Self {
@@ -464,7 +421,7 @@ impl StatisticsCollector {
     }
 
     fn update_memory_usage(&mut self) {
-        if let Some((vm_peak, vm_size)) = read_proc_status() {
+        if let Some((vm_peak, vm_size)) = read_peak_memory_kb() {
             self.memory_samples.push(vm_size);
             if self.memory_start == 0 {
                 self.memory_start = vm_size;
@@ -956,7 +913,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(
+                mode & 0o777,
+                crate::platform::private_file::PRIVATE_FILE_MODE
+            );
         }
     }
 }

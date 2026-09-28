@@ -3,8 +3,8 @@
 //! Kept in its own integration binary (and a single test) because it
 //! manipulates the process `PATH` environment variable.
 
+// Requires a POSIX shell `ping` shim on PATH.
 #![cfg(unix)]
-
 mod common;
 
 use astroom::internet_watchdog::InternetWatchdog;

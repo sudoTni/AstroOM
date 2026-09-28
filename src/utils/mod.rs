@@ -11,6 +11,8 @@ use crate::logging;
 use crate::types::LogLevel;
 use std::time::{Duration, Instant};
 
+use crate::platform::terminal::{MIN_BANNER_COLS, MIN_BANNER_ROWS};
+
 /// The AstroOM startup banner ("ASTROOM" in the ANSI Shadow figlet face),
 /// rendered with the block/fade rainbow effect.
 pub const BANNER: &str = r#" █████╗ ███████╗████████╗██████╗  ██████╗  ██████╗ ███╗   ███╗
@@ -216,71 +218,43 @@ pub fn render_strike_frame_custom(
 /// (crest of slate temper blue wave #528ebf and deep quench cobalt #42608a).
 pub const BANNER_MAX_BLUE_TIME_SEC: f64 = 1.58;
 
-#[cfg(unix)]
 pub fn get_terminal_size() -> Option<(u16, u16)> {
-    let fd = libc::STDOUT_FILENO;
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let success = (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0
-        || unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0)
-        && ws.ws_row > 0
-        && ws.ws_col > 0;
-    if success {
-        Some((ws.ws_row, ws.ws_col))
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
-pub fn get_terminal_size() -> Option<(u16, u16)> {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE,
-        STD_OUTPUT_HANDLE,
-    };
-    for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(handle_id) };
-        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-            if unsafe { GetConsoleScreenBufferInfo(handle, &mut csbi) } != 0 {
-                let rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
-                let cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
-                if rows > 0 && cols > 0 {
-                    return Some((rows as u16, cols as u16));
-                }
-            }
-        }
-    }
-    None
+    crate::platform::terminal_size(crate::logging::execution_log::console_stdout_fd())
 }
 
 struct CursorGuard;
 
 impl Drop for CursorGuard {
     fn drop(&mut self) {
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(b"\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        crate::logging::console_output::write_console_fragment("\x1b[?25h");
     }
+}
+
+/// Writes banner output through the shared console path.
+///
+/// Going through `console_output` rather than `stdout()` keeps the banner
+/// mutually exclusive with the log writers. It uses the chrome writer, not the
+/// log writer: the banner is decoration, and at 30 frames per second recording
+/// it would swamp the execution log with megabytes of cursor sequences.
+fn write_banner(text: &str) {
+    crate::logging::console_output::write_console_fragment(text);
 }
 
 /// Plays a bounded in-place banner animation for a specified number of loops,
 /// concluding on the maximum-blue frame without setting terminal margins or
 /// interfering with native terminal scrollback.
 pub fn display_banner(use_color: bool, banner_loops: u32) {
-    use std::io::Write;
     let is_terminal = crate::logging::execution_log::is_stdout_terminal();
     if !use_color || !is_terminal || banner_loops == 0 {
         let frame = render_strike_frame(!use_color, BANNER_MAX_BLUE_TIME_SEC);
-        let _ = std::io::stdout().write_all(frame.as_bytes());
-        let _ = std::io::stdout().flush();
+        write_banner(&frame);
         return;
     }
 
     let (term_rows, term_cols) = get_terminal_size().unwrap_or((0, 0));
-    if term_rows < 10 || term_cols < 64 {
+    if term_rows < MIN_BANNER_ROWS || term_cols < MIN_BANNER_COLS {
         let frame = render_strike_frame(false, BANNER_MAX_BLUE_TIME_SEC);
-        let _ = std::io::stdout().write_all(frame.as_bytes());
-        let _ = std::io::stdout().flush();
+        write_banner(&frame);
         return;
     }
 
@@ -295,8 +269,7 @@ pub fn display_banner(use_color: bool, banner_loops: u32) {
         BANNER_MAX_BLUE_TIME_SEC + (banner_loops.saturating_sub(1) as f64) * wave_period;
 
     let _cursor_guard = CursorGuard;
-    let _ = std::io::stdout().write_all(b"\x1b[?25l");
-    let _ = std::io::stdout().flush();
+    write_banner("\x1b[?25l");
 
     let start_time = Instant::now();
     let mut first_frame = true;
@@ -331,25 +304,21 @@ pub fn display_banner(use_color: bool, banner_loops: u32) {
         let frame = render_strike_frame_custom(false, elapsed, pulse, intensity_boost, cool_factor);
 
         if first_frame {
-            let _ = std::io::stdout().write_all(frame.as_bytes());
+            write_banner(&frame);
             first_frame = false;
         } else {
-            let rewind = format!("\x1b[{}A\r{frame}", logo_lines);
-            let _ = std::io::stdout().write_all(rewind.as_bytes());
+            write_banner(&format!("\x1b[{logo_lines}A\r{frame}"));
         }
-        let _ = std::io::stdout().flush();
         std::thread::sleep(frame_dur);
     }
 
     // Settle cleanly into the approved maximum-blue resting frame
     let final_frame = render_strike_frame(false, BANNER_MAX_BLUE_TIME_SEC);
     if first_frame {
-        let _ = std::io::stdout().write_all(final_frame.as_bytes());
+        write_banner(&final_frame);
     } else {
-        let rewind = format!("\x1b[{}A\r{final_frame}", logo_lines);
-        let _ = std::io::stdout().write_all(rewind.as_bytes());
+        write_banner(&format!("\x1b[{logo_lines}A\r{final_frame}"));
     }
-    let _ = std::io::stdout().flush();
 }
 
 pub struct BannerAnimationHandle;

@@ -1,0 +1,3 @@
+# Comma-separated competencies. These are matched against job requirements, so
+# list the ones you can defend from my_resume.txt.
+REPLACE THIS: cloud security, incident response, IAM, vulnerability management

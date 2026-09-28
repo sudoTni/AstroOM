@@ -71,12 +71,14 @@ pub fn clear_presets_cache() {
 
 pub fn load_presets() -> Result<PresetConfig> {
     {
-        let cache = presets_cache().lock().unwrap();
+        let cache = presets_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(config) = cache.as_ref() {
             return Ok(config.clone());
         }
     }
-    let path = crate::runtime_paths::project_root()
+    let path = crate::runtime_paths::require_resource_root()?
         .join("config")
         .join("presets.json");
     let raw = std::fs::read_to_string(&path).map_err(|err| {
@@ -87,7 +89,9 @@ pub fn load_presets() -> Result<PresetConfig> {
     })?;
     let config: PresetConfig = serde_json::from_str(&raw)
         .map_err(|err| AppError::message(format!("Failed to load presets: {err}")))?;
-    let mut cache = presets_cache().lock().unwrap();
+    let mut cache = presets_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *cache = Some(config.clone());
     Ok(config)
 }
@@ -114,12 +118,14 @@ pub fn get_preset(stage: &str, name: &str, config: &PresetConfig) -> Result<Pres
 /// Loads the Veritas system prompt (sysprompts/veritas_sys_prompt.txt), trimmed.
 pub fn load_veritas_system_prompt() -> Result<String> {
     {
-        let cache = veritas_cache().lock().unwrap();
+        let cache = veritas_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(prompt) = cache.as_ref() {
             return Ok(prompt.clone());
         }
     }
-    let path = crate::runtime_paths::project_root()
+    let path = crate::runtime_paths::require_resource_root()?
         .join("sysprompts")
         .join("veritas_sys_prompt.txt");
     let raw = std::fs::read_to_string(&path).map_err(|err| {
@@ -129,16 +135,28 @@ pub fn load_veritas_system_prompt() -> Result<String> {
         ))
     })?;
     let trimmed = raw.trim().to_string();
-    let mut cache = veritas_cache().lock().unwrap();
+    let mut cache = veritas_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *cache = Some(trimmed.clone());
     Ok(trimmed)
 }
 
-/// Resolves a preset's promptTemplate path (relative to the project root).
+/// Resolves a preset's promptTemplate path.
+///
+/// `./`-prefixed values are relative to the resource root, which is where
+/// `prompts/` ships. Anything else is passed through unchanged, so a fully
+/// qualified path keeps working. Both `./` and `.\` are accepted so a
+/// hand-edited `config/presets.json` written on Windows still resolves.
 pub fn template_path(template: &str) -> PathBuf {
     let trimmed = template.trim();
-    if trimmed.starts_with("./") || trimmed.starts_with(".\\") {
-        crate::runtime_paths::project_root().join(&trimmed[2..])
+    if let Some(relative) = trimmed
+        .strip_prefix("./")
+        .or_else(|| trimmed.strip_prefix(".\\"))
+    {
+        crate::runtime_paths::resource_root()
+            .unwrap_or_default()
+            .join(relative)
     } else {
         PathBuf::from(trimmed)
     }
@@ -148,7 +166,9 @@ pub fn load_prompt_template(template: &str) -> Result<String> {
     let path = template_path(template);
     let key = path.to_string_lossy().to_string();
     {
-        let cache = template_cache().lock().unwrap();
+        let cache = template_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(t) = cache.get(&key) {
             return Ok(t.clone());
         }
@@ -159,7 +179,9 @@ pub fn load_prompt_template(template: &str) -> Result<String> {
             describe_io(&path, &err)
         ))
     })?;
-    let mut cache = template_cache().lock().unwrap();
+    let mut cache = template_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.insert(key, raw.clone());
     Ok(raw)
 }

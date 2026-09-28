@@ -334,8 +334,10 @@ pub async fn run(ctx: &RunContext, options: &RemoteEvalOptions) -> Result<Remote
     let presets = load_presets()?;
     let preset = get_preset("remoteEval", &options.preset, &presets)?;
     validate_prompt(&preset.prompt_template)?;
-    let parent = options.output_file.parent().unwrap_or(&ctx.paths.data_dir);
-    std::fs::create_dir_all(parent)?;
+    // See the note in `stages::job_judge::run`: a bare output file name must
+    // not relocate the SQLite repository into the process working directory.
+    let parent = crate::runtime_paths::parent_or_default(&options.output_file, &ctx.paths.data_dir);
+    std::fs::create_dir_all(&parent)?;
 
     let mut repository = JobRepository::new(JobRepositoryConfig {
         db_file_path: parent.join("jobDB.sqlite"),
@@ -377,8 +379,24 @@ pub async fn run(ctx: &RunContext, options: &RemoteEvalOptions) -> Result<Remote
         });
     }
 
+    // When the checkpoint claims prior work, a previous output file exists and
+    // must be readable: `unwrap_or_default()` would silently turn "the file is
+    // corrupt" into "there were no results", after which every already
+    // processed job is skipped below and the file is overwritten with `[]` —
+    // destroying an entire stage-5 result set while reporting success.
     let mut passed_jobs = if checkpoint.has_matching_work {
-        read_jobs(&options.output_file).unwrap_or_default()
+        match read_jobs(&options.output_file) {
+            Ok(jobs) => jobs,
+            Err(_) if !options.output_file.exists() => Vec::new(),
+            Err(error) => {
+                return Err(AppError::message(format!(
+                    "Cannot resume remoteEval: the existing result file {} could not be read ({error}). \
+                     Refusing to overwrite it, because the recorded checkpoint lists jobs as already \
+                     evaluated. Delete the file, or re-run with checkpoints disabled, to start over.",
+                    options.output_file.display()
+                )));
+            }
+        }
     } else {
         Vec::new()
     };

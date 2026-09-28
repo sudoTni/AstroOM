@@ -41,6 +41,36 @@ pub struct AcquisitionQuery {
     pub total_terms: Option<usize>,
 }
 
+impl AcquisitionQuery {
+    /// A query with every field at its zero value, for tests and for callers
+    /// that override only a few fields.
+    pub fn empty() -> Self {
+        Self {
+            site: Site::Indeed,
+            search_term: String::new(),
+            location: String::new(),
+            results_wanted: 0,
+            distance: 0,
+            hours_old: None,
+            remote: false,
+            remote_only: false,
+            job_type: None,
+            easy_apply: false,
+            indeed_country: "USA".to_string(),
+            description_mode: DescriptionMode::None,
+            description_format: DescriptionFormat::Markdown,
+            proxies: Vec::new(),
+            user_agent: None,
+            offset: 0,
+            indeed_api_key: None,
+            show_fetch_url: false,
+            token: CancellationToken::new(),
+            term_index: None,
+            total_terms: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptionMode {
     None,

@@ -15,7 +15,7 @@ fn manifest_round_trip_and_tamper_detection() {
 
     let manifest = artifact.with_extension("json.manifest.json");
     assert!(manifest.exists());
-    assert_eq!(mode_of(&manifest), 0o600);
+    assert_private_mode(&manifest);
 
     let verified = verify_artifact_manifest(&artifact).unwrap();
     assert_eq!(verified["ok"], true);

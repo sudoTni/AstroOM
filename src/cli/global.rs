@@ -148,7 +148,8 @@ impl GlobalArgs {
         };
         Ok(RunContext {
             paths: Paths {
-                project_root: runtime_paths::project_root(),
+                app_root: runtime_paths::app_root()?,
+                resource_root: runtime_paths::resource_root(),
                 data_dir: runtime_paths::data_dir(self.data_dir.as_deref()),
                 log_dir: runtime_paths::log_dir(self.log_dir.as_deref()),
                 materials_dir: runtime_paths::materials_dir(self.materials_dir.as_deref()),
@@ -160,6 +161,9 @@ impl GlobalArgs {
                 max_llm_output_tokens: Some(self.max_llm_output_tokens),
                 max_total_llm_output_tokens: self.max_total_llm_output_tokens,
                 llm_deadline_ms: self.llm_deadline_ms,
+                // One meter per process run, shared by every stage: the
+                // ceilings are run-level, not per-stage.
+                meter: std::sync::Arc::new(crate::context::LlmBudgetMeter::default()),
             },
             diagnostics: Diagnostics {
                 log_llm_payloads: self.log_llm_payloads,

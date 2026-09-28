@@ -1,0 +1,8 @@
+# Optional. Quotes about you, one per block, separated by a blank line.
+#
+# Used ONLY as qualitative supporting evidence. Never as the basis for a
+# technology, a number of years of experience, a certification, a degree, or a
+# clearance: those are always grounded in my_resume.txt instead.
+#
+# REPLACE THIS with real quotes, or delete this file.
+"[Placeholder testimonial. Delete this file or replace it with a real quote.]"

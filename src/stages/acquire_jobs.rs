@@ -403,8 +403,19 @@ fn write_checkpoint(path: &Path, jobs: &[CanonicalAcquiredJob]) -> Result<()> {
         std::process::id(),
         chrono::Utc::now().timestamp_millis()
     ));
-    std::fs::write(&temp, serde_json::to_string_pretty(jobs)?)?;
-    std::fs::rename(&temp, path)?;
+    let body = serde_json::to_string_pretty(jobs)?;
+    {
+        // Owner-only, like every other artifact writer: this file holds job
+        // titles, companies, locations and URLs.
+        use std::io::Write;
+        let mut file = crate::platform::private_writer(&temp)?;
+        file.write_all(body.as_bytes())?;
+    }
+    // A failed rename must not leave the temp file behind.
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -430,7 +441,8 @@ mod tests {
     fn context(temp: &TempDir) -> RunContext {
         RunContext {
             paths: Paths {
-                project_root: temp.path().to_path_buf(),
+                app_root: temp.path().to_path_buf(),
+                resource_root: None,
                 data_dir: temp.path().join("data"),
                 log_dir: temp.path().join("logs"),
                 materials_dir: temp.path().join("materials"),

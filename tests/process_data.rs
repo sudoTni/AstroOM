@@ -71,10 +71,10 @@ fn process_data_dedups_normalizes_and_writes_manifested_artifact() {
     assert_eq!(jobs[0]["id"], "indeed-1", "Indeed record is preferred");
 
     // Atomic private write.
-    assert_eq!(mode_of(&processed), 0o600);
+    assert_private_mode(&processed);
     let manifest = processed.with_extension("json.manifest.json");
     assert!(manifest.exists());
-    assert_eq!(mode_of(&manifest), 0o600);
+    assert_private_mode(&manifest);
 
     // JobDB created next to the output artifact.
     assert!(data.join("jobDB.sqlite").exists());
@@ -152,7 +152,7 @@ fn process_data_writes_cool_off_suppression_log() {
 
     let log_file = find_file_starting_with(&logs, "processData_cool_off_suppressions_")
         .expect("cool-off suppression log");
-    assert_eq!(mode_of(&log_file), 0o600);
+    assert_private_mode(&log_file);
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&log_file).unwrap()).unwrap();
     assert_eq!(report["count"], json!(1));

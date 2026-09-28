@@ -9,10 +9,16 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Resolved filesystem locations (from --data-dir/--log-dir/--materials-dir/
-/// --profile-dir or install-root defaults).
+/// --profile-dir, the ASTROOM_HOME override, or the executable directory).
 #[derive(Debug, Clone)]
 pub struct Paths {
-    pub project_root: PathBuf,
+    /// The directory holding the mutable data/log/materials/profile tree.
+    pub app_root: PathBuf,
+    /// The directory holding config/presets.json, prompts/ and sysprompts/,
+    /// or `None` when it could not be located. Commands that load no resource
+    /// run fine without it; anything that reads a preset reports the searched
+    /// locations.
+    pub resource_root: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub log_dir: PathBuf,
     pub materials_dir: PathBuf,
@@ -80,6 +86,40 @@ impl Default for DisplayConfig {
     }
 }
 
+/// Run-scoped cumulative counters backing `--max-llm-requests` and
+/// `--max-total-llm-output-tokens`.
+///
+/// These live on the `RunContext`, not on `LlmService`, because both flags are
+/// `global = true` and are documented as run-level ceilings. Holding them per
+/// service let each of the four LLM stages start from zero, so a full
+/// eight-stage pipeline could issue roughly four times the requested budget.
+#[derive(Debug, Default)]
+pub struct LlmBudgetMeter {
+    requests: std::sync::atomic::AtomicU64,
+    reserved_output_tokens: std::sync::atomic::AtomicU64,
+}
+
+impl LlmBudgetMeter {
+    pub fn requests(&self) -> u64 {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reserved_output_tokens(&self) -> u64 {
+        self.reserved_output_tokens
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reserve_request(&self) -> u64 {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reserve_output_tokens(&self, tokens: u64) {
+        self.reserved_output_tokens
+            .fetch_add(tokens, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// LLM safety budgets (from --max-llm-requests / --max-llm-output-tokens /
 /// --max-total-llm-output-tokens / --llm-deadline-ms).
 #[derive(Debug, Clone)]
@@ -88,6 +128,10 @@ pub struct LlmBudgets {
     pub max_llm_output_tokens: Option<u32>,
     pub max_total_llm_output_tokens: Option<u64>,
     pub llm_deadline_ms: Option<u64>,
+    /// Shared, run-scoped consumption counters. Cloning a `RunContext` (and
+    /// therefore its budgets) shares the same meter, so the ceiling is
+    /// enforced once per process run rather than once per stage.
+    pub meter: Arc<LlmBudgetMeter>,
 }
 
 impl Default for LlmBudgets {
@@ -97,6 +141,7 @@ impl Default for LlmBudgets {
             max_llm_output_tokens: Some(crate::constants::DEFAULT_MAX_OUTPUT_TOKENS),
             max_total_llm_output_tokens: None,
             llm_deadline_ms: None,
+            meter: Arc::new(LlmBudgetMeter::default()),
         }
     }
 }

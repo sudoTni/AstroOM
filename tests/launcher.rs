@@ -1,13 +1,35 @@
 //! `astro_launcher.bash` launcher integration: argv assembly, policy flags,
 //! logs cleanup, key gating, deploy gating and argument forwarding.
 
+// Requires a bash interpreter and POSIX shell semantics.
 #![cfg(unix)]
-
 mod common;
 
 use common::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The launcher under test. Renamed from `twoTesties.bash`; keep this in sync
+/// with the file name in the repository root.
+const LAUNCHER_NAME: &str = "astro_launcher.bash";
+
+/// Copies the repository launcher into `dest_dir` under `LAUNCHER_NAME`.
+///
+/// The error message names the source path explicitly so that a future
+/// launcher rename is diagnosable from the failure text alone, instead of
+/// surfacing as a bare "No such file or directory" from `fs::copy`.
+fn install_launcher(dest_dir: &Path) -> PathBuf {
+    let script_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LAUNCHER_NAME);
+    let dest = dest_dir.join(LAUNCHER_NAME);
+    std::fs::copy(&script_src, &dest).unwrap_or_else(|error| {
+        panic!(
+            "failed to copy launcher {} to {}: {error}",
+            script_src.display(),
+            dest.display()
+        )
+    });
+    dest
+}
 
 struct Launcher {
     sandbox: Sandbox,
@@ -17,11 +39,10 @@ struct Launcher {
 impl Launcher {
     fn new(env_contents: &str) -> Self {
         let sandbox = Sandbox::new();
-        let script_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("astro_launcher.bash");
-        std::fs::copy(&script_src, sandbox.path().join("astro_launcher.bash")).unwrap();
+        install_launcher(sandbox.path());
         std::fs::write(sandbox.path().join(".env"), env_contents).unwrap();
 
-        let profile = sandbox.sub("profile");
+        let profile = sandbox.sub("candidate_profile");
         std::fs::write(profile.join("search_terms.txt"), "engineer\n").unwrap();
 
         // A pre-existing log file must be wiped by the launcher.
@@ -56,7 +77,7 @@ impl Launcher {
 
     fn run(&self) -> std::process::Output {
         Command::new("bash")
-            .arg(self.sandbox.path().join("astro_launcher.bash"))
+            .arg(self.sandbox.path().join(LAUNCHER_NAME))
             .current_dir(self.sandbox.path())
             .output()
             .expect("run launcher")
@@ -96,7 +117,7 @@ fn launcher_assembles_policy_argv_and_wipes_logs() {
 fn launcher_forwards_extra_arguments_last() {
     let launcher = Launcher::new("AOM_OR_API_KEY=test-key\n");
     let output = Command::new("bash")
-        .arg(launcher.sandbox.path().join("astro_launcher.bash"))
+        .arg(launcher.sandbox.path().join(LAUNCHER_NAME))
         .arg("--batch")
         .arg("99")
         .current_dir(launcher.sandbox.path())
@@ -145,8 +166,7 @@ fn launcher_requires_destination_when_deploying() {
 #[test]
 fn launcher_propagates_absolute_dir_flags() {
     let sandbox = Sandbox::new();
-    let script_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("astro_launcher.bash");
-    std::fs::copy(&script_src, sandbox.path().join("astro_launcher.bash")).unwrap();
+    install_launcher(sandbox.path());
     let data = sandbox.sub("custom-data");
     let logs = sandbox.sub("logs");
     std::fs::write(
@@ -180,7 +200,7 @@ fn launcher_propagates_absolute_dir_flags() {
     set_executable(&shim);
 
     let output = Command::new("bash")
-        .arg(sandbox.path().join("astro_launcher.bash"))
+        .arg(sandbox.path().join(LAUNCHER_NAME))
         .current_dir(sandbox.path())
         .output()
         .unwrap();
