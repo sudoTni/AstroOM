@@ -1,0 +1,37 @@
+# Job Metadata
+
+**Job Title:** Security Engineer
+**Company:** Patreon
+**Job URL:** https://www.linkedin.com/jobs/view/4471527814
+**Job ID:** linkedin:4471527814
+**Posted Date:** 2026-09-28T00:00:00.000Z
+
+---
+
+# Materials Filename
+
+Candidate_Resume_Security_Engineer
+
+# Cover Letter Filename
+
+Candidate_Cover_Security_Engineer
+
+# Optimized & Tailored Professional Title
+
+Security Engineer | SecOps | EDR/XDR
+
+# Optimized & Tailored Professional Summary
+
+Security Engineer with multiple years of hands-on security operations experience and more than a decade in enterprise IT, including healthcare cybersecurity in HIPAA-regulated environments. Co-led migration of tens of thousands of endpoints from legacy antivirus to Carbon Black EDR/XDR, supporting deployment, tuning, adoption, and enterprise security modernization. Uses Splunk, Splunk SPL, Python, and PowerShell to investigate security events, analyze endpoint behavior, support threat hunting, and drive incident remediation, with additional experience in vulnerability management, endpoint hardening, and security tool deployment. Brings experience translating technical findings into prioritized actions while coordinating with cross-functional teams to reduce risk and maintain operational continuity.
+
+# Optimized & Tailored Key Skills
+
+Python, Git / GitHub, AI-Assisted Development, Splunk, Splunk SPL, Carbon Black EDR/XDR, Security Event Triage, Threat Hunting, IOC Investigation, Endpoint Telemetry Analysis, Incident Response, Detection Tuning, Log Analysis, Vulnerability Management, Qualys, Nexpose, CVE / CVSS Analysis, Vulnerability Prioritization, Vulnerability Remediation, Patch Management, Endpoint Hardening, Security Tool Deployment & Migration
+
+# Optimized & Tailored Cover Letter
+
+The Security Engineer role at Patreon aligns with my background in endpoint and enterprise security, including multiple years of hands-on security operations supported by more than a decade in enterprise IT. At [Healthcare Employer], I co-led migration of tens of thousands of HIPAA-regulated endpoints from Trend Micro antivirus to Carbon Black EDR/XDR, supporting deployment, tuning, adoption, and security modernization. I used Splunk, Splunk SPL, Python, and PowerShell to investigate events, analyze endpoint behavior, support threat hunting, and assist remediation, turning high-volume signals into actionable findings for cross-functional teams.
+
+My security operations experience includes incident response, security event triage, detection tuning, endpoint telemetry analysis, vulnerability prioritization and remediation, patch management, and endpoint hardening. I have used Qualys, Nexpose, and CVE/CVSS analysis, and applied Carbon Black administration and policy tuning to support risk reduction, documenting remediation in a structured, SLA-driven way. Earlier, I deployed HIPAA-compliant telehealth infrastructure for hundreds of clinicians, maintained high availability, and substantially reduced technical response times through asset-management improvements and ticketing workflow automation. That work reinforced my ability to balance security controls with operational continuity and user needs.
+
+I also bring hands-on Python, Git/GitHub, and AI-assisted development experience, and I’m eager to apply those practices to security projects, detection improvements, and investigative tooling. In enterprise support roles, I worked with Windows, Active Directory, SCCM, Windows Server, VMware, and identity operations, giving me a practical understanding of how security decisions affect endpoints, access, and business workflows. Colleagues have described me as responsive, patient, clear, and proactive, and I follow through until issues are resolved. I would welcome the chance to discuss how my security operations, vulnerability management, and pragmatic risk-reduction experience could contribute to Patreon’s work protecting creators and fans.

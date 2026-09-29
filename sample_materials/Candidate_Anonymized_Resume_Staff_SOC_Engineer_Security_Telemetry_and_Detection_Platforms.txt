@@ -1,0 +1,39 @@
+# Job Metadata
+
+**Job Title:** Staff SOC Engineer - Security Telemetry & Detection Platforms
+**Company:** Ladders
+**Job URL:** https://www.linkedin.com/jobs/view/4470858425
+**Job ID:** linkedin:4470858425
+**Posted Date:** 2026-09-28T00:00:00.000Z
+
+---
+
+# Materials Filename
+
+Candidate_Resume_Staff_SOC_Engineer_Security_Telemetry_and_Detection_Platforms
+
+# Cover Letter Filename
+
+Candidate_Cover_Staff_SOC_Engineer_Security_Telemetry_and_Detection_Platforms
+
+# Optimized & Tailored Professional Title
+
+SOC Engineer - SIEM - EDR - Detection Tuning
+
+# Optimized & Tailored Professional Summary
+
+SOC and Security Operations Engineer with multiple years of dedicated hands-on security experience supported by more than a decade across enterprise IT and infrastructure engineering. Co-led the migration of tens of thousands of HIPAA-regulated endpoints from legacy antivirus to Carbon Black EDR/XDR, and used Splunk and Splunk SPL to investigate security events, analyze endpoint telemetry, support threat hunting, and drive remediation of critical vulnerabilities. Brings a deep operations foundation in Windows Server, Active Directory, SCCM, and VMware from several years of enterprise infrastructure support, paired with Python- and PowerShell-based automation and clear technical documentation. Focused on improving detection signal quality, reducing endpoint risk, and maintaining operational continuity in regulated environments.
+
+# Optimized & Tailored Key Skills
+
+Splunk, Splunk SPL, Carbon Black EDR/XDR, EDR Administration & Policy Tuning, Detection Tuning, Endpoint Telemetry Analysis, Security Event Triage, Threat Hunting, IOC Investigation, Incident Response, Log Analysis, Vulnerability Management, Vulnerability Remediation, CVE / CVSS Analysis, Qualys, Security Tool Deployment & Migration, Patch Management, Python, PowerShell, Technical Documentation, Active Directory, SCCM
+
+# Optimized & Tailored Cover Letter
+
+I am excited to apply for the Staff SOC Engineer - Security Telemetry & Detection Platforms position. Improving signal quality, reducing noise, and keeping SIEM and EDR platforms performing at enterprise scale is precisely the intersection where I have done my best work, and I would welcome the chance to bring that focus to your client's security operations team.
+
+At [Healthcare Employer], I co-led the migration of tens of thousands of HIPAA-regulated endpoints from legacy antivirus to Carbon Black EDR/XDR, owning deployment, tuning, and adoption across the enterprise. Working daily in Splunk, I used Splunk SPL to investigate security events, analyze endpoint telemetry, support threat hunting, and develop targeted searches that converted high-volume signals into actionable findings for incident response. I also supported SLA-driven remediation of critical vulnerabilities through structured prioritization, tracking, documentation, and cross-functional coordination, while strengthening endpoint defenses through EDR policy tuning and security tool deployment.
+
+That dedicated security work stands on a deep operational foundation: several years of enterprise infrastructure support spanning Windows Server, Active Directory, SCCM administration, VMware, and automated patch deployment, along with Python and PowerShell scripting for investigation and workflow automation. I am equally comfortable on the documentation side of the house, and colleagues have consistently recognized my responsive, proactive communication and thorough follow-through under pressure.
+
+I would welcome a conversation about how my hands-on SIEM and EDR experience, detection-tuning focus, and enterprise operations background can help strengthen your security telemetry and detection platforms.
