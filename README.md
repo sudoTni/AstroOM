@@ -1,3 +1,4 @@
+
 # AstroOM
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
@@ -13,7 +14,7 @@
 
 <p align = "center"><img width = "640" alt="AstroOM animated logo" src="screenshots/AstroOM-logo.gif" /></p>
 
-Terminal captures are in [`screenshots/`](screenshots).
+Terminal captures are in [`screenshots/`](screenshots). Demo video is [here](https://github.com/user-attachments/assets/47c75496-f583-4e5e-8d2d-7b1136826c61).
 
 ---
 
