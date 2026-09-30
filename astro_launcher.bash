@@ -20,7 +20,9 @@ die() {
 
 # --- locate the binary ------------------------------------------------------
 # Order matters: an explicit override, then a co-located install (the
-# distribution layout), then the in-tree cargo build output, then PATH.
+# distribution layout), then a staged build under ./bin, then the in-tree
+# cargo build output, then PATH. ./bin/astroom is checked before target/ so a
+# deliberately staged release build is not shadowed by a stale target/ binary.
 find_binary() {
   local candidate
   if [[ -n "${ASTROOM_BIN:-}" ]]; then
@@ -32,8 +34,8 @@ find_binary() {
   fi
   for candidate in \
     "${SCRIPT_DIR}/astroom" \
-    "${SCRIPT_DIR}/bin/astroom" \
-    "${SCRIPT_DIR}/../bin/astroom"; do
+    "${SCRIPT_DIR}/../bin/astroom" \
+    "${SCRIPT_DIR}/bin/astroom"; do
     if [[ -x "${candidate}" ]]; then
       printf '%s\n' "${candidate}"
       return 0
@@ -67,6 +69,7 @@ Searched, in order:
   \$ASTROOM_BIN
   ${SCRIPT_DIR}/astroom
   ${SCRIPT_DIR}/../bin/astroom
+  ${SCRIPT_DIR}/bin/astroom
   ${SCRIPT_DIR}/target/release/astroom
   ${SCRIPT_DIR}/target/debug/astroom
   astroom on PATH
@@ -105,15 +108,7 @@ fi
 # --- policy argv ------------------------------------------------------------
 # Mirrors the tuned defaults; every one of these is overridable by a trailing
 # caller argument.
-if [[ -n "${AOM_PROFILE_DIR:-}" ]]; then
-  PROFILE_DIR="${AOM_PROFILE_DIR}"
-elif [[ -d "${SCRIPT_DIR}/candidate_data" ]]; then
-  PROFILE_DIR="${SCRIPT_DIR}/candidate_data"
-elif [[ -d "${SCRIPT_DIR}/michael_martini_data" ]]; then
-  PROFILE_DIR="${SCRIPT_DIR}/michael_martini_data"
-else
-  PROFILE_DIR="${SCRIPT_DIR}/candidate_data"
-fi
+PROFILE_DIR="${AOM_PROFILE_DIR:-${SCRIPT_DIR}/candidate_data}"
 
 ARGS=(
   run-pipeline

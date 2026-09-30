@@ -128,6 +128,9 @@ impl TelemetryStore {
     }
 
     /// Record a completed LLM call with its usage, latency, and success status.
+    // One parameter per field of the Node `llmCallCompleted` telemetry event;
+    // grouping them would hide the event's shape at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn llm_call_completed(
         &self,
         model: Option<&str>,

@@ -622,8 +622,7 @@ async fn run_inner(
                     let safe_job_title = material
                         .resume_filename
                         .replacen("Candidate_Materials_", "", 1)
-                        .replacen("Candidate_Resume_", "", 1)
-                        .replacen("Michael_Martini_Materials_", "", 1);
+                        .replacen("Candidate_Resume_", "", 1);
                     let dir = ctx
                         .paths
                         .materials_dir
@@ -951,11 +950,11 @@ async fn run_inner(
                     continue;
                 }
             };
-            let safe_job_title = material
-                .resume_filename
-                .replacen("Candidate_Materials_", "", 1)
-                .replacen("Candidate_Resume_", "", 1)
-                .replacen("Michael_Martini_Materials_", "", 1);
+            let safe_job_title =
+                material
+                    .resume_filename
+                    .replacen("Candidate_Materials_", "", 1)
+                    .replacen("Candidate_Resume_", "", 1);
             let dir =
                 ctx.paths
                     .materials_dir

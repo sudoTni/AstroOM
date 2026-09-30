@@ -7,9 +7,11 @@ use crate::context::RunContext;
 use crate::error::{AppError, Result};
 use crate::jobrepo::{JobIdentity, JobRepository, JobRepositoryConfig};
 use crate::logging;
+use crate::telemetry::StageMetrics;
 use crate::types::LogLevel;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct AcquireJobsOptions {
@@ -95,6 +97,40 @@ pub fn should_disable_source(error: &AppError) -> bool {
             .any(|status| error.message.contains(status))
 }
 
+fn update_acquire_telemetry(
+    ctx: &RunContext,
+    options: &AcquireJobsOptions,
+    saved: &HashMap<Site, Vec<CanonicalAcquiredJob>>,
+) {
+    let ind_count = if options.sites.contains(&Site::Indeed) {
+        Some(saved.get(&Site::Indeed).map_or(0, |v| v.len() as u64))
+    } else {
+        saved.get(&Site::Indeed).map(|v| v.len() as u64)
+    };
+    let lnk_count = if options.sites.contains(&Site::Linkedin) {
+        Some(saved.get(&Site::Linkedin).map_or(0, |v| v.len() as u64))
+    } else {
+        saved.get(&Site::Linkedin).map(|v| v.len() as u64)
+    };
+    let total: u64 = saved.values().map(Vec::len).sum::<usize>() as u64;
+
+    ctx.telemetry.update_stage_metrics(|m| {
+        if let StageMetrics::Acquire {
+            indeed,
+            linkedin,
+            acquired,
+        } = m
+        {
+            *indeed = ind_count;
+            *linkedin = lnk_count;
+            *acquired = total;
+        }
+    });
+    ctx.telemetry.update_funnel(|f| {
+        f.acquired = Some(total);
+    });
+}
+
 pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<AcquisitionResult> {
     if options.results_wanted == 0 {
         return Err(AppError::message(
@@ -146,11 +182,15 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
         }
         saved.insert(*site, jobs);
     }
+    let total_queries = (terms.len() * locations.len() * options.sites.len()) as u64;
+    ctx.telemetry.set_progress_total(total_queries);
+    update_acquire_telemetry(ctx, options, &saved);
     let provider = JobSpyAcquisitionProvider::new();
     let mut failures = Vec::new();
     let mut disabled_sources = HashSet::new();
     let mut cooldown_until = HashMap::new();
     let mut consecutive_failures = HashMap::<Site, u32>::new();
+    let mut query_ordinal = 0u64;
     for (term_idx, term) in terms.iter().enumerate() {
         for location in &locations {
             crate::pipeline::cancellation::throw_if_cancelled(&ctx.cancellation)?;
@@ -180,7 +220,9 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
                 }
             }
             for site in &options.sites {
+                query_ordinal = query_ordinal.saturating_add(1);
                 if disabled_sources.contains(site) {
+                    ctx.telemetry.item_completed(None);
                     continue;
                 }
                 if cooldown_until.get(site).copied().unwrap_or(0) > ctx.now_ms() {
@@ -189,8 +231,29 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
                         &format!("Skipping cooling {} provider.", site.name()),
                         LogLevel::Info,
                     );
+                    ctx.telemetry.item_completed(None);
                     continue;
                 }
+                let loc_suffix = if location.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {location}")
+                };
+                let desc = format!(
+                    "[{}] {}/{}: \"{}\"{}",
+                    site.name(),
+                    term_idx + 1,
+                    terms.len(),
+                    term,
+                    loc_suffix
+                );
+                ctx.telemetry.item_started(
+                    Some(query_ordinal),
+                    Some(total_queries),
+                    Some(desc),
+                    Some(site.name().to_string()),
+                );
+                let query_start = Instant::now();
                 let query = AcquisitionQuery {
                     site: *site,
                     search_term: term.clone(),
@@ -216,6 +279,7 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
                 };
                 match provider.acquire(&query).await {
                     Ok(jobs) => {
+                        ctx.telemetry.item_completed(Some(query_start.elapsed()));
                         consecutive_failures.remove(site);
                         cooldown_until.remove(site);
                         let new: Vec<_> = jobs
@@ -241,8 +305,11 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
                         if let Err(error) = repo.add_searched_jobs(&identities) {
                             logging::log("AcquireJobs", &format!("Repository discovery update failed after artifact write: {error}"), LogLevel::Warn);
                         }
+                        update_acquire_telemetry(ctx, options, &saved);
                     }
                     Err(error) => {
+                        ctx.telemetry.record_error();
+                        ctx.telemetry.item_completed(Some(query_start.elapsed()));
                         let disable = should_disable_source(&error);
                         let cooldown = if disable {
                             None
@@ -311,6 +378,7 @@ pub async fn run(ctx: &RunContext, options: &AcquireJobsOptions) -> Result<Acqui
             LogLevel::Success,
         );
     }
+    update_acquire_telemetry(ctx, options, &saved);
     repo.close()?;
     Ok(AcquisitionResult {
         output_file: output_files[&options.sites[0]].clone(),

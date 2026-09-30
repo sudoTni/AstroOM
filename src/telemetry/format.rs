@@ -21,7 +21,7 @@ pub fn str_display_width(s: &str) -> usize {
 
 /// Returns the visual terminal width of a single unicode character.
 pub fn char_display_width(c: char) -> usize {
-    if c < ' ' || (c >= '\x7f' && c < '\u{a0}') {
+    if c < ' ' || ('\x7f'..'\u{a0}').contains(&c) {
         return 0;
     }
     // Fast path for ASCII
@@ -105,7 +105,7 @@ pub fn truncate_to_width(s: &str, max_width: usize, ellipsis: &str) -> String {
                 if next_c == '[' {
                     chars.next();
                     out.push('[');
-                    while let Some(csi_c) = chars.next() {
+                    for csi_c in chars.by_ref() {
                         out.push(csi_c);
                         if ('@'..='~').contains(&csi_c) {
                             break;

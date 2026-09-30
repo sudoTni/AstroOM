@@ -147,8 +147,7 @@ cargo build --release        # -> target/release/astroom
 # Windows (PowerShell)
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
-#   -> target_64-pc-windows-gnu
-eleasestroom.exe
+#   -> target/x86_64-pc-windows-gnu/release/astroom.exe
 ```
 
 Cross-compiling from Linux to `x86_64-pc-windows-gnu` works with the same command as long as MinGW-w64 is installed (`x86_64-w64-mingw32-gcc`). No `.cargo/config.toml` is required: rustc's target specification already selects the MinGW linker for this target.

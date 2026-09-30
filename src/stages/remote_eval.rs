@@ -491,7 +491,6 @@ pub async fn run(ctx: &RunContext, options: &RemoteEvalOptions) -> Result<Remote
             let service = &service;
             let preset = &preset;
             let system_prompt = &system_prompt;
-            let input_hash = input_hash;
 
             workers.push(Box::pin(async move {
                 loop {

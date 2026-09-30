@@ -5,7 +5,7 @@ You are evaluating a target job description against fixed “Candidate’s Rules
 ### Inputs
 - Candidate’s Rules: Use exactly as provided. Do not reinterpret or modify.
 - targJD: Full target Job Description text.
-- myResume: The candidate’s resume text. Only use for Rules 12 and 13.
+- myResume: Candidate’s resume text. Only use for Rules 12 and 13.
 
 ### Output
 - JSON array of objects, each with:
@@ -49,13 +49,13 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
     - IT Systems Administration: Systems Administrator/Engineer, Windows/Linux Admin, AD/IAM Admin.
 - Rule 3 — Location
   - Fail if:
-    - Onsite/Hybrid and specified city is not commutable: Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, or roughly ~30 minutes from Albany, NY.
-    - Remote but explicitly restricted outside New York/Northeast US or incompatible time zone (e.g., “PST hours required,” “must sit in CA/TX only”).
+    - Onsite/Hybrid and specified city is not commutable: [YOUR_COMMUTE_CITIES, e.g. Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, or roughly ~30 minutes from your location].
+    - Remote but explicitly restricted outside [YOUR_RESIDENCY_STATE/REGION] or incompatible time zone (e.g., “PST hours required,” “must sit in CA/TX only”).
     - Location is “Not Specified” and there is no textual evidence of remote or commutable status.
 - Rule 4 — Employment Type
   - Fail if Part-time, Contract, or Temporary. Pass if “Not Specified.”
 - Rule 5 — Residency
-  - Fail if residency requirements explicitly exclude New York State, USA (or candidate's home state) (e.g., “must reside in CA only,” “cannot hire NY residents”). General “US only” is fine.
+  - Fail if residency requirements explicitly exclude candidate's location ([YOUR_LOCATION / YOUR_RESIDENCY_STATE/COUNTRY], e.g., “must reside in CA only,” “cannot hire in candidate's state”). General “US only” is fine.
 - Rule 6 — Security Clearance
   - Fail if a clearance is required prior to hire, is not Public Trust, and the JD does not state it can be obtained post-hire. Public Trust required is acceptable.
 - Rule 7 — Travel
@@ -106,12 +106,12 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
 ### Definitions and Heuristics
 - Toxic/Bureaucratic/Stagnant signals (Rule 1) include rigid, punitive, or anti-modernization language; absence of modern tools without plans to modernize; excessive micromanagement phrasing.
 - Opportunity Type mapping (Rule 2) uses role function over title keywords. If split across security and non-security, choose the dominant function.
-- Location (Rule 3) commutable means within ~30 minutes of Albany, NY. Explicit PST-only hours or single-state residency outside NY/Northeast fails remote roles.
+- Location (Rule 3) commutable means within ~30 minutes of [YOUR_LOCATION]. Explicit incompatible time-zone hours or single-state residency outside [YOUR_RESIDENCY_STATE/REGION] fails remote roles.
 - Salary (Rule 8) use the stated upper bound. If a single value is given, treat it as both lower and upper.
 - Years of experience (Rule 9) must reference cybersecurity/infosec specifically to trigger failure.
 
 ### Commutable Locations
-- Treat the following as commutable: Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, and nearby locales approximately ~30 minutes from Albany, NY. If a nearby town is listed, judge commutability reasonably; when uncertain, do not assume commutable.
+- Treat the following as commutable: [YOUR_COMMUTE_CITIES, e.g. Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, and nearby locales approximately ~30 minutes from primary location]. If a nearby town is listed, judge commutability reasonably; when uncertain, do not assume commutable.
 
 ### Output Construction
 - jobTitle: From targJD; else “Not Specified.”

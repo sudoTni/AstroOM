@@ -166,15 +166,7 @@ if ($env:AOM_CLEAN_LOGS -ne '0') {
 # Mirrors astro_launcher.bash exactly. A List[string] is used rather than a
 # string so that every element reaches the process as one argument: spaces,
 # quotes and Unicode survive without any manual escaping.
-$profileDir = if ($env:AOM_PROFILE_DIR) {
-    $env:AOM_PROFILE_DIR
-} elseif (Test-Path -LiteralPath (Join-Path $scriptDir 'candidate_data') -PathType Container) {
-    Join-Path $scriptDir 'candidate_data'
-} elseif (Test-Path -LiteralPath (Join-Path $scriptDir 'michael_martini_data') -PathType Container) {
-    Join-Path $scriptDir 'michael_martini_data'
-} else {
-    Join-Path $scriptDir 'candidate_data'
-}
+$profileDir = if ($env:AOM_PROFILE_DIR) { $env:AOM_PROFILE_DIR } else { Join-Path $scriptDir 'candidate_data' }
 
 $argsList = [System.Collections.Generic.List[string]]::new()
 function Add-Pair { param([string] $Flag, [string] $Value) $argsList.Add($Flag); $argsList.Add($Value) }

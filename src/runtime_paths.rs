@@ -63,7 +63,6 @@ pub const DEFAULT_DATA_DIR: &str = "data";
 pub const DEFAULT_LOG_DIR: &str = "logs";
 pub const DEFAULT_MATERIALS_DIR: &str = "materials";
 pub const DEFAULT_PROFILE_DIR: &str = "candidate_data";
-pub const LEGACY_PROFILE_DIR: &str = "michael_martini_data";
 
 /// The file whose presence identifies a directory as an AstroOM tree.
 const PRESETS_MARKER: [&str; 2] = ["config", "presets.json"];
@@ -259,31 +258,7 @@ pub fn materials_dir(configured: Option<&Path>) -> PathBuf {
 }
 
 pub fn profile_dir(configured: Option<&Path>) -> PathBuf {
-    match configured {
-        Some(p) => {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(p)
-            }
-        }
-        None => {
-            let root = app_root().unwrap_or_else(|_| PathBuf::from("."));
-            let candidate = root.join(DEFAULT_PROFILE_DIR);
-            if candidate.is_dir() {
-                candidate
-            } else {
-                let legacy = root.join(LEGACY_PROFILE_DIR);
-                if legacy.is_dir() {
-                    legacy
-                } else {
-                    candidate
-                }
-            }
-        }
-    }
+    resolve_explicit_or(configured, DEFAULT_PROFILE_DIR)
 }
 
 /// Resolves a user-supplied relative path against the process working

@@ -377,7 +377,7 @@ mod tests {
             "His key accomplishments include deploying Carbon Black EDR across 500+ endpoints, ",
             "configuring Splunk SIEM alerts, and mitigating critical vulnerabilities. ",
             "However, the job explicitly requires Secret clearance. ",
-            "Checking the resume for clearance: the candidate has Public Trust suitability only. ",
+            "Checking the resume for clearance: Candidate has Public Trust suitability only. ",
             "Since the job mandates an active Secret clearance prior to start date, this triggers Gate 3 failure. ",
             "Therefore, the candidate is not eligible for this specific position.",
         ];

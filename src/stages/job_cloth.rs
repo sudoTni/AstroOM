@@ -453,12 +453,17 @@ pub async fn run(
         provider,
     )?;
     let mut titles = Vec::new();
+    let mut title_weights = HashMap::new();
     for job in &jobs {
         let title = job.title.clone().expect("validated title");
+        *title_weights
+            .entry(title.trim().to_ascii_lowercase())
+            .or_insert(0u64) += 1;
         if !titles.contains(&title) {
             titles.push(title);
         }
     }
+    let title_weights = std::sync::Arc::new(title_weights);
     stats.increment_counter_by("jobCloth.uniqueTitles", titles.len() as u64);
     // Node initializes the checkpoint after computing unique titles, carrying
     // forward any already-processed job ids from a previous partial run.
@@ -523,6 +528,7 @@ pub async fn run(
             );
             let item_start = Instant::now();
             let mut newly_processed = 0usize;
+            let mut batch_results: Vec<JobAnalysis> = Vec::new();
             let mut last_error: Option<AppError> = None;
             let success = if circuit.check_state() {
                 let error = AppError::message(format!(
@@ -555,8 +561,9 @@ pub async fn run(
                         newly_processed = results.len();
                         let complete = newly_processed == remaining.len();
                         if complete {
-                            analyses.extend(results);
+                            analyses.extend(results.clone());
                         }
+                        batch_results = results;
                         complete
                     }
                     Err(error) => {
@@ -603,16 +610,24 @@ pub async fn run(
             }
             processed_count += newly_processed;
             ctx.telemetry.item_completed(Some(item_start.elapsed()));
+            let (batch_passed, batch_filtered) =
+                partition_job_counts(&batch_results, &title_weights);
             ctx.telemetry.update_stage_metrics(|m| {
                 if let StageMetrics::JobCloth {
                     completed_batches,
                     successful_jobs,
+                    filtered_jobs,
                     ..
                 } = m
                 {
                     *completed_batches = completed_batches.saturating_add(1);
-                    *successful_jobs = newly_processed as u64;
+                    *successful_jobs = successful_jobs.saturating_add(batch_passed);
+                    *filtered_jobs = filtered_jobs.saturating_add(batch_filtered);
                 }
+            });
+            ctx.telemetry.update_funnel(|f| {
+                let current = f.cloth_passed.unwrap_or(0);
+                f.cloth_passed = Some(current.saturating_add(batch_passed));
             });
             progress.complete_with_context(
                 &[
@@ -647,6 +662,7 @@ pub async fn run(
             let progress_shared = progress_shared.clone();
             let analyses_shared = analyses_shared.clone();
             let fatal_error = fatal_error.clone();
+            let title_weights = title_weights.clone();
             let service = &service;
             let preset = &preset;
             let system = &system;
@@ -716,11 +732,11 @@ pub async fn run(
                         let call_progress_str = format!("{}/{}", batch_index + 1, total_batches);
                         match call_llm_for_titles(
                             ctx,
-                            &service,
-                            &preset,
+                            service,
+                            preset,
                             provider,
-                            &system,
-                            &resume,
+                            system,
+                            resume,
                             &batch_titles,
                             false,
                             options,
@@ -754,12 +770,24 @@ pub async fn run(
 
                     if batch_success {
                         ctx.telemetry.item_completed(Some(batch_start.elapsed()));
-                        let count = batch_results.len() as u64;
+                        let (batch_passed, batch_filtered) =
+                            partition_job_counts(&batch_results, &title_weights);
                         ctx.telemetry.update_stage_metrics(|m| {
-                            if let StageMetrics::JobCloth { completed_batches, successful_jobs, .. } = m {
+                            if let StageMetrics::JobCloth {
+                                completed_batches,
+                                successful_jobs,
+                                filtered_jobs,
+                                ..
+                            } = m
+                            {
                                 *completed_batches = completed_batches.saturating_add(1);
-                                *successful_jobs = successful_jobs.saturating_add(count);
+                                *successful_jobs = successful_jobs.saturating_add(batch_passed);
+                                *filtered_jobs = filtered_jobs.saturating_add(batch_filtered);
                             }
+                        });
+                        ctx.telemetry.update_funnel(|f| {
+                            let current = f.cloth_passed.unwrap_or(0);
+                            f.cloth_passed = Some(current.saturating_add(batch_passed));
                         });
                         progress_shared.lock().unwrap().complete_with_context(
                             &[
@@ -780,6 +808,7 @@ pub async fn run(
                             LogLevel::Warn,
                         );
                         circuit_shared.lock().unwrap().reset();
+                        let mut recovered_batch_results: Vec<JobAnalysis> = Vec::new();
                         for title in &batch_titles {
                             let mut success = false;
                             let mut retry_count = 0u32;
@@ -798,11 +827,11 @@ pub async fn run(
                                 let call_progress_str = format!("{}/{}", batch_index + 1, total_batches);
                                 match call_llm_for_titles(
                                     ctx,
-                                    &service,
-                                    &preset,
+                                    service,
+                                    preset,
                                     provider,
-                                    &system,
-                                    &resume,
+                                    system,
+                                    resume,
                                     std::slice::from_ref(title),
                                     true,
                                     options,
@@ -817,7 +846,8 @@ pub async fn run(
                                             call_started.elapsed().as_secs_f64() * 1000.0,
                                         );
                                         circuit_shared.lock().unwrap().record_success();
-                                        analyses_shared.lock().unwrap().extend(results);
+                                        analyses_shared.lock().unwrap().extend(results.clone());
+                                        recovered_batch_results.extend(results);
                                         success = true;
                                     }
                                     Ok(_) => {
@@ -871,11 +901,24 @@ pub async fn run(
                             }
                         }
                         ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                        let (batch_passed, batch_filtered) =
+                            partition_job_counts(&recovered_batch_results, &title_weights);
                         ctx.telemetry.update_stage_metrics(|m| {
-                            if let StageMetrics::JobCloth { completed_batches, successful_jobs, .. } = m {
+                            if let StageMetrics::JobCloth {
+                                completed_batches,
+                                successful_jobs,
+                                filtered_jobs,
+                                ..
+                            } = m
+                            {
                                 *completed_batches = completed_batches.saturating_add(1);
-                                *successful_jobs = successful_jobs.saturating_add(batch_titles.len() as u64);
+                                *successful_jobs = successful_jobs.saturating_add(batch_passed);
+                                *filtered_jobs = filtered_jobs.saturating_add(batch_filtered);
                             }
+                        });
+                        ctx.telemetry.update_funnel(|f| {
+                            let current = f.cloth_passed.unwrap_or(0);
+                            f.cloth_passed = Some(current.saturating_add(batch_passed));
                         });
                     } else {
                         ctx.telemetry.record_error();
@@ -1002,17 +1045,24 @@ pub async fn run(
             }
             if batch_success {
                 ctx.telemetry.item_completed(Some(batch_start.elapsed()));
-                let count = batch_results.len() as u64;
+                let (batch_passed, batch_filtered) =
+                    partition_job_counts(&batch_results, &title_weights);
                 ctx.telemetry.update_stage_metrics(|m| {
                     if let StageMetrics::JobCloth {
                         completed_batches,
                         successful_jobs,
+                        filtered_jobs,
                         ..
                     } = m
                     {
                         *completed_batches = completed_batches.saturating_add(1);
-                        *successful_jobs = successful_jobs.saturating_add(count);
+                        *successful_jobs = successful_jobs.saturating_add(batch_passed);
+                        *filtered_jobs = filtered_jobs.saturating_add(batch_filtered);
                     }
+                });
+                ctx.telemetry.update_funnel(|f| {
+                    let current = f.cloth_passed.unwrap_or(0);
+                    f.cloth_passed = Some(current.saturating_add(batch_passed));
                 });
                 progress.complete_with_context(
                     &[
@@ -1034,6 +1084,7 @@ pub async fn run(
                 );
                 // Node resets the circuit breaker before per-title recovery.
                 circuit.reset();
+                let mut recovered_batch_results = Vec::new();
                 for title in batch_titles {
                     let mut success = false;
                     let mut retry_count = 0u32;
@@ -1071,7 +1122,8 @@ pub async fn run(
                                     call_started.elapsed().as_secs_f64() * 1000.0,
                                 );
                                 circuit.record_success();
-                                analyses.extend(results);
+                                analyses.extend(results.clone());
+                                recovered_batch_results.extend(results);
                                 success = true;
                             }
                             Ok(_) => {
@@ -1119,17 +1171,24 @@ pub async fn run(
                     }
                 }
                 ctx.telemetry.item_completed(Some(batch_start.elapsed()));
+                let (batch_passed, batch_filtered) =
+                    partition_job_counts(&recovered_batch_results, &title_weights);
                 ctx.telemetry.update_stage_metrics(|m| {
                     if let StageMetrics::JobCloth {
                         completed_batches,
                         successful_jobs,
+                        filtered_jobs,
                         ..
                     } = m
                     {
                         *completed_batches = completed_batches.saturating_add(1);
-                        *successful_jobs =
-                            successful_jobs.saturating_add(batch_titles.len() as u64);
+                        *successful_jobs = successful_jobs.saturating_add(batch_passed);
+                        *filtered_jobs = filtered_jobs.saturating_add(batch_filtered);
                     }
+                });
+                ctx.telemetry.update_funnel(|f| {
+                    let current = f.cloth_passed.unwrap_or(0);
+                    f.cloth_passed = Some(current.saturating_add(batch_passed));
                 });
             }
             if !batch_success && batch_results.is_empty() {
@@ -1384,6 +1443,28 @@ fn coerce_confidence(value: &Value) -> f64 {
     }
 }
 
+/// Partition a batch of job analyses into passed and filtered job counts,
+/// weighted by how many jobs share each title.
+pub fn partition_job_counts(
+    analyses: &[JobAnalysis],
+    title_weights: &HashMap<String, u64>,
+) -> (u64, u64) {
+    let mut passed = 0u64;
+    let mut filtered = 0u64;
+    for analysis in analyses {
+        let weight = title_weights
+            .get(&analysis.job_title.trim().to_ascii_lowercase())
+            .copied()
+            .unwrap_or(1);
+        if analysis.passes() {
+            passed = passed.saturating_add(weight);
+        } else {
+            filtered = filtered.saturating_add(weight);
+        }
+    }
+    (passed, filtered)
+}
+
 /// Return clean passing records. Analysis fields are intentionally stripped
 /// from artifacts, matching Node's `cleanPassingJobs` destructuring.
 pub fn passing_jobs(jobs: &[JobInterface], analysis: &[JobAnalysis]) -> Vec<JobInterface> {
@@ -1464,5 +1545,44 @@ mod tests {
         assert_eq!(results[0].job_title, "Engineer");
         assert!(results[0].passes());
         assert_eq!(results[0].rationale, "ok");
+    }
+
+    #[test]
+    fn partition_job_counts_weights_by_frequency_and_passes() {
+        let mut weights = HashMap::new();
+        weights.insert("engineer".to_string(), 3);
+        weights.insert("manager".to_string(), 2);
+        weights.insert("designer".to_string(), 1);
+
+        let analyses = vec![
+            JobAnalysis {
+                job_title: "Engineer".to_string(),
+                is_worth_investigating: true,
+                is_very_highly_aligned: true,
+                is_highly_aligned: true,
+                rationale: String::new(),
+                confidence: 1.0,
+            },
+            JobAnalysis {
+                job_title: "manager".to_string(),
+                is_worth_investigating: false,
+                is_very_highly_aligned: false,
+                is_highly_aligned: false,
+                rationale: String::new(),
+                confidence: 0.2,
+            },
+            JobAnalysis {
+                job_title: "Designer".to_string(),
+                is_worth_investigating: false,
+                is_very_highly_aligned: false,
+                is_highly_aligned: false,
+                rationale: String::new(),
+                confidence: 0.1,
+            },
+        ];
+
+        let (passed, filtered) = partition_job_counts(&analyses, &weights);
+        assert_eq!(passed, 3);
+        assert_eq!(filtered, 3);
     }
 }

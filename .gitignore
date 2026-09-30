@@ -1,50 +1,42 @@
-# AstroOM Distribution & Development .gitignore
-
-# Cargo build tree
+# Rust / Cargo build output
 target/
+**/*.rs.bk
+*.pdb
 
-# Runtime mutable state (created on demand)
+# Release binaries explicitly tracked
+!bin/
+!bin/astroom
+!bin/astroom.exe
+!bin/*
+
+# Local candidate profiles and secrets
+.env
+.env.*
+!.env.example
+candidate_data/
+michael_martini_data/
+
+# Application runtime directories
 data/
 logs/
 materials/
 materials-deployed/
 
-# Private candidate profile data (template candidate_data.example is tracked)
-candidate_data/
-michael_martini_data/
-
-# Environment secrets and credentials
-.env
-.env.*
-!.env.example
-
-# Local SQLite databases and write-ahead logs
+# Database files & journals (keep committed test fixtures)
 *.sqlite
 *.sqlite-*
-*.db
-*.db-*
-
-# Runtime execution and payload logs
-*.log
-
-# Shipped test fixtures (explicit exceptions)
 !tests/fixtures/*.sqlite
 !tests/fixtures/*.sqlite-*
 
-# Distribution binaries in ./bin/
-# Distributable release binaries are tracked; intermediate/temporary build files are excluded
-bin/*
-!bin/astroom
-!bin/astroom.exe
-!bin/.gitkeep
+# Logs & debugging
+*.log
 
-# Operating system and editor metadata
-.DS_Store
-Thumbs.db
+# Editor / IDE debris
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
-.idea/
-.vscode/
-*.sublime-project
-*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini

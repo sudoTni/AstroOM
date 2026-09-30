@@ -344,7 +344,6 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     *acquired = acquisition.jobs as u64;
                 }
             });
-            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 1/8: Acquisition completed",
@@ -544,7 +543,6 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
             });
             ctx.telemetry
                 .update_funnel(|f| f.cloth_passed = Some(cloth_output.len() as u64));
-            ctx.telemetry.item_completed(None);
             crate::logging::log_kv(
                 "Pipeline",
                 "Stage 3/8: JobCloth completed",

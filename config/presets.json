@@ -121,7 +121,7 @@
 			"provider": "openrouter",
 			"base_url": "https://openrouter.ai/api/v1",
 			"modelId": "stealth/space-bunny-alpha",
-			"promptTemplate": "./prompts/rop_prompt01-mini.txt",
+			"promptTemplate": "./prompts/rop_prompt01-mini-sba.txt",
 			"temperature": 1.0,
 			"topP": 1.0,
 			"maxTokens": 64000

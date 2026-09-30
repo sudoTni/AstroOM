@@ -302,7 +302,7 @@ Do not treat an unknown employment type as sufficiently confirmed for a "very hi
 
 ## GATE 3 — RESIDENCY REQUIREMENTS
 
-FAIL only if an explicit residency requirement excludes New York State (or candidate's home state).
+FAIL only if an explicit residency requirement excludes the candidate's location ([YOUR_LOCATION / YOUR_RESIDENCY_STATE/COUNTRY]).
 
 Examples:
 
@@ -809,7 +809,7 @@ Do not confuse required travel with optional company events, voluntary conferenc
 
 Maximum: **5 points**
 
-The candidate holds a Bachelor's degree (non-technical field).
+The candidate holds a Bachelor's degree: [YOUR_DEGREE, e.g. a Bachelor of Arts in Psychology].
 
 Evaluate both the **degree level** and any explicitly required **field of study**.
 
@@ -822,7 +822,7 @@ Score:
 * **3:** A specific technical or role-related Bachelor's field is preferred but not mandatory.
 * **3:** A specific technical or role-related Bachelor's degree is required, but the JD explicitly permits equivalent professional experience and the candidate's documented experience reasonably supports that equivalence.
 * **1:** Master's degree is preferred but not required.
-* **0:** A specific Bachelor's field is explicitly mandatory, no equivalent-experience provision is allowed, and the candidate's non-technical degree does not satisfy the stated field requirement.
+* **0:** A specific Bachelor's field is explicitly mandatory, no equivalent-experience provision is allowed, and the candidate's degree ([YOUR_DEGREE]) does not satisfy the stated field requirement.
 * **0:** Master's or PhD is explicitly mandatory and no acceptable equivalence provision is stated.
 
 Do not award full credit merely because the candidate has a Bachelor's degree if the JD explicitly mandates a specific field of study that their degree does not satisfy.

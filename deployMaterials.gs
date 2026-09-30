@@ -41,7 +41,7 @@ const LOG_LEVELS = Object.freeze({
 const CURRENT_LOG_LEVEL = LOG_LEVELS.INFO; // Default to INFO in production (options: DEBUG, INFO, WARN, ERROR)
 const ENABLE_SPREADSHEET_LOGGING = true;
 const ENABLE_DOC_LOGGING = true;
-const DEFAULT_DOC_LOG_FOLDER_ID = '1opblh5TCDX7AslZK3hBESKZGJNYW-6XR';
+const DEFAULT_DOC_LOG_FOLDER_ID = '';
 const DOC_LOG_FOLDER_ID = DEFAULT_DOC_LOG_FOLDER_ID; // Backward-compatibility alias
 const DOC_LOG_FILE_NAME_PREFIX = 'AstroEX-RunLog';
 const DOC_LOG_FILE_TS_FORMAT = 'yyyyMMdd-HHmmss-SSS';
@@ -2163,7 +2163,7 @@ function getRearJobTitlePortion(metadata) {
  */
 function getLinkedInDocBaseName(metadata, config) {
   const rearPortion = getRearJobTitlePortion(metadata).replace(/\.pdf$/i, '');
-  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate Name';
+  const applicantName = (config && config.applicantName) ? config.applicantName : '[YOUR_NAME]';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
   return `${applicantPrefix}_LinkedIn_${rearPortion}`;
 }
@@ -2223,7 +2223,7 @@ function generateLinkedInDoc(targetFolder, metadata, jobUrl, config) {
  * Computes a standardized folder name for an application's rendered package materials.
  */
 function getRenderPackageFolderName(metadata, config) {
-  const applicantName = (config && config.applicantName) ? config.applicantName : 'Candidate Name';
+  const applicantName = (config && config.applicantName) ? config.applicantName : '[YOUR_NAME]';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
 
   const manualResumeName = getMetadataValue(metadata, 'Resume Filename') || getMetadataValue(metadata, 'Materials Filename');

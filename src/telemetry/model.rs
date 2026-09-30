@@ -227,7 +227,7 @@ pub struct FunnelTelemetry {
 }
 
 /// Stage-specific detailed outcome counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StageMetrics {
     Acquire {
         indeed: Option<u64>,
@@ -274,13 +274,8 @@ pub enum StageMetrics {
         skipped: u64,
         failed: u64,
     },
+    #[default]
     None,
-}
-
-impl Default for StageMetrics {
-    fn default() -> Self {
-        StageMetrics::None
-    }
 }
 
 /// Immutable snapshot of complete telemetry state for UI rendering and inspection.
