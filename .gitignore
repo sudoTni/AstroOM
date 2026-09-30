@@ -14,7 +14,6 @@ target/
 .env.*
 !.env.example
 candidate_data/
-michael_martini_data/
 
 # Application runtime directories
 data/
