@@ -98,6 +98,8 @@ Each stage writes a JSON artifact plus a companion `<artifact>.json.manifest.jso
 
 **Option A — use a prebuilt binary.** No toolchain needed.
 
+Release binaries located in [`bin/`](bin).
+
 A release binary needs the `config/`, `prompts/`, and `sysprompts/` directories **next to it**. AstroOM locates them relative to its own executable path, not to your working directory and not to wherever it was built, so you can copy the whole directory anywhere:
 
 ```
