@@ -111,16 +111,6 @@ astro/
 └── astro_launcher.bash # or astro_launcher.ps1
 ```
 
-```bash
-# Linux
-./target/release/astroom --help
-```
-
-```powershell
-# Windows (PowerShell)
-.\target\x86_64-pc-windows-gnu\release\astroom.exe --help
-```
-
 The `data/`, `logs/` and `materials/` directories are created on first run beside the executable. If they are not writable there, pass `--data-dir` / `--log-dir` / `--materials-dir`, or set `ASTROOM_HOME`.
 
 > **Linux runtime prerequisite:** the binary links against OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`) because `reqwest` uses the platform TLS stack. It is dynamically linked; check with `ldd target/release/astroom` before deploying to a minimal image.
