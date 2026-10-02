@@ -92,7 +92,11 @@ Each stage writes a JSON artifact plus a companion `<artifact>.json.manifest.jso
 ## Quick Start Guide
 
 > [!NOTE]
-> The AOM contributors highly recommend the use of a codex / AI coding assistant for rapidly configuring the software with your application materials!
+> **Windows support:** The Windows version of AOM has not been tested as extensively as the Linux version, so some additional configuration or troubleshooting may be required to get everything running smoothly.
+>
+> The AOM contributors highly recommend using Codex or another AI coding assistant to help configure the software for your application and environment. This can significantly speed up setup and troubleshooting.
+>
+> **YMMV!**
 
 ### 1. Prerequisites
 
