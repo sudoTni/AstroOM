@@ -3316,20 +3316,20 @@ function classifyApplicationTransparencyRole(metadata) {
 
 function buildApplicationTransparencyFooterText(metadata) {
   const profile = classifyApplicationTransparencyRole(metadata);
-  const roleSpecific = profile === 'SECURITY'
-    ? 'The downstream Google Apps Script workflow I built generates the final documents and manages application routing, delivery tracking, and bounce handling.'
-    : 'The downstream Google Apps Script workflow I built generates the final documents and manages application routing, delivery tracking, and exception handling.';
+  const deliveryDetail = profile === 'SECURITY'
+    ? ', including delivery tracking and bounce handling'
+    : '';
 
   return [
-    'I built AstroOM, an AI-assisted workflow that helps me find and evaluate relevant opportunities and prepare tailored application materials.',
-    roleSpecific,
-    'This message was sent from my personal email through that workflow, and I personally review and approve each application.'
+    'I built AstroOM, an AI-assisted system that helps me identify relevant opportunities and prepare tailored application materials.',
+    `I also built the Google Apps Script workflow that generated and delivered this application${deliveryDetail}.`,
+    'I personally review and approve every application.'
   ].join(' ');
 }
 
 function buildApplicationTransparencyFooterPlaintext(metadata) {
   const text = buildApplicationTransparencyFooterText(metadata);
-  return `---\nBuilt with Astro — transparency note:\n${text}\nGitHub: ${ASTRO_PROJECT_URL}`;
+  return `---\nBuilt with Astro:\n${text}\nAstroOM on GitHub: ${ASTRO_PROJECT_URL}`;
 }
 
 function buildApplicationTransparencyFooterHtml(metadata) {
@@ -3337,7 +3337,7 @@ function buildApplicationTransparencyFooterHtml(metadata) {
   const projectUrl = escapeHtml(ASTRO_PROJECT_URL);
   return [
     '<div style="margin-top: 1.6em; padding-top: 0.9em; border-top: 1px solid #dadce0; font-size: 11px; line-height: 1.45; color: #5f6368;">',
-    '<strong style="color: #3c4043;">Built with Astro — transparency note:</strong> ',
+    '<strong style="color: #3c4043;">Built with Astro:</strong> ',
     text,
     ` <a href="${projectUrl}" style="color: #5f6368;">AstroOM on GitHub</a>`,
     '</div>'
