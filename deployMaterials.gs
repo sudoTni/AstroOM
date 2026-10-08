@@ -2,22 +2,19 @@
  * Job-material deployment automation (OpenRouter Edition).
  *
  * Revised pipeline:
- * 1. Read structured markdown material files from SOURCE_FOLDER_ID.
- * 2. Parse JD/application metadata and cover-letter body.
- * 3. Consult centralized Google Sheet to ensure JD hasn't already been processed.
- * 4. Discover ranked, evidence-backed application routes AND fetch company HQ address via OpenRouter.
- * 5. Generate tailored resume and cover-letter Google Docs from templates using custom filenames if specified.
- * 6. Generate a third custom output Google Doc containing the LinkedIn posting URL.
- * 7. Render tailored resume PDF, cover letter PDF, and LinkedIn .desktop shortcut into a dedicated package subfolder within TARGET_FOLDER_ID_RENDER.
- * 8. Create Gmail drafts (or auto-send) for ALL defensible routing addresses (comma-separated).
- * 9. Extract the final, fully-templated text from the Cover Letter Doc for the email body.
- * 10. Attach the generated resume PDF to the email.
- * 11. Log the dispatch event to a centralized Google Sheet (comma-separated statuses).
- * 12. Dual-Log execution events to the Apps Script console AND a per-run Google Doc log file.
- * 13. Annotate generated Drive files (including rendered files and the LinkedIn file) with discovery evidence and candidate scoring.
- * 14. Move the source material file to PROCESSED_FOLDER_ID only when successful.
- * 15. Gracefully halt file processing if approaching the 5-minute execution limit.
- * 16. Auto-scan inbox for bounce-backs and surgically update granular spreadsheet statuses.
+ * 1. Read and parse structured markdown material files from SOURCE_FOLDER_ID.
+ * 2. Route ingest/parse failures to FAILED_FOLDER_ID.
+ * 3. Route already-processed Job IDs to DUPE_FOLDER_ID.
+ * 4. Discover application routes and resolve a USPS single-line company mailing address.
+ * 5. Generate resume, cover-letter, and LinkedIn Google Docs (DOCGEN).
+ * 6. Route DOCGEN failures to FAILED_FOLDER_ID.
+ * 7. Optionally render PDF/.desktop package artifacts when ENABLE_RENDER is true (disabled by default).
+ * 8. Independently dispatch Gmail drafts/messages; dispatch failure never invalidates successful DOCGEN.
+ * 9. Upsert one Applications row per Job ID with core/render/dispatch/recipient state; store unmatched DSNs in a separate Bounce Audit sheet.
+ * 10. Dual-log execution events to Apps Script console and a per-run Google Doc log file.
+ * 11. Move successfully generated source material to PROCESSED_FOLDER_ID regardless of dispatch outcome.
+ * 12. Detect/classify standards-based delivery-status notifications (Gmail and external mail systems), persist selective suppression, and archive logged bounce threads.
+ * 13. Gracefully halt file processing if approaching the 5-minute execution limit.
  */
 
 // ============================================================================
@@ -31,6 +28,18 @@ const AUTO_SEND_EMAILS = true;
 // Set to false to completely disable both drafting and sending emails.
 const ENABLE_EMAIL_DISPATCH = true;
 
+// Append a compact transparency note to the dispatched email body only.
+// This does not modify the generated cover-letter document.
+const ENABLE_APPLICATION_TRANSPARENCY_FOOTER = true;
+const ASTRO_PROJECT_URL = 'https://github.com/sudoTni/AstroOM';
+
+// Render workflow is opt-in. DOCGEN remains active when rendering is disabled.
+const ENABLE_RENDER = false;
+
+// Bounce scanning policy.
+const BOUNCE_SCAN_LOOKBACK_DAYS = 14;
+const BOUNCE_SCAN_MAX_THREADS = 100;
+
 // Centralized logging configuration
 const LOG_LEVELS = Object.freeze({
   DEBUG: 1,
@@ -41,23 +50,25 @@ const LOG_LEVELS = Object.freeze({
 const CURRENT_LOG_LEVEL = LOG_LEVELS.INFO; // Default to INFO in production (options: DEBUG, INFO, WARN, ERROR)
 const ENABLE_SPREADSHEET_LOGGING = true;
 const ENABLE_DOC_LOGGING = true;
-const DEFAULT_DOC_LOG_FOLDER_ID = '';
+const DEFAULT_DOC_LOG_FOLDER_ID = '1opblh5TCDX7AslZK3hBESKZGJNYW-6XR';
 const DOC_LOG_FOLDER_ID = DEFAULT_DOC_LOG_FOLDER_ID; // Backward-compatibility alias
 const DOC_LOG_FILE_NAME_PREFIX = 'AstroEX-RunLog';
 const DOC_LOG_FILE_TS_FORMAT = 'yyyyMMdd-HHmmss-SSS';
-const ARCHIVE_UNRESOLVED_FILES = true; // Move unresolvable files to processed folder to prevent infinite retry loops
 
 // ============================================================================
 
 /**
  * Script Property names.
- * Ensure ALL of these are set in your Apps Script Project Settings -> Script Properties.
+ * Configure these in Apps Script Project Settings -> Script Properties.
+ * TARGET_FOLDER_ID_RENDER is required only when ENABLE_RENDER is true.
  */
 const SCRIPT_PROPERTIES = Object.freeze({
   SOURCE_FOLDER_ID: 'SOURCE_FOLDER_ID',
   TARGET_FOLDER_ID: 'TARGET_FOLDER_ID',
   TARGET_FOLDER_ID_RENDER: 'TARGET_FOLDER_ID_RENDER',
   PROCESSED_FOLDER_ID: 'PROCESSED_FOLDER_ID',
+  FAILED_FOLDER_ID: 'FAILED_FOLDER_ID',
+  DUPE_FOLDER_ID: 'DUPE_FOLDER_ID',
   RESUME_TEMPLATE_ID: 'RESUME_TEMPLATE_ID',
   COVER_LETTER_TEMPLATE_ID: 'COVER_LETTER_TEMPLATE_ID',
   OR_API_KEY: 'OR_API_KEY', // REPLACED: POE_API_KEY -> OR_API_KEY
@@ -72,6 +83,15 @@ const SCRIPT_PROPERTIES = Object.freeze({
  */
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODEL = 'google/gemini-3.1-flash-lite';
+const OPENROUTER_REQUEST_TIMEOUT_SECONDS = 30;
+const OPENROUTER_MAX_ATTEMPTS = 2;
+const OPENROUTER_RETRY_BASE_DELAY_MS = 1500;
+const OPENROUTER_DEFAULT_MAX_TOKENS = 1400;
+const OPENROUTER_DISCOVERY_MAX_TOKENS = 1400;
+const OPENROUTER_ADDRESS_MAX_TOKENS = 256;
+const OPENROUTER_MAX_RESPONSE_CHARS = 24000;
+const SAFE_EXECUTION_LIMIT_MS = 5 * 60 * 1000;
+const OPENROUTER_EXECUTION_CUSHION_MS = 5000;
 
 /**
  * Routing policy.
@@ -88,24 +108,86 @@ const MAX_DISCOVERY_CANDIDATES_TO_ANNOTATE = 8;
 /**
  * Execution & Validation Policies.
  */
-const REQUIRE_DRAFT_SUCCESS_FOR_DRAFTABLE_EMAIL = true;
 const STRICT_GMAIL_FROM_VALIDATION = false;
 const PREFLIGHT_GMAIL_DRAFT_AUTH = true;
 const MOVE_SOURCE_FILE_AFTER_SUCCESS = true;
 const ANNOTATE_DRIVE_FILES_WITH_DISCOVERY = true;
 const ATTACH_RESUME_PDF = true;
 const REUSE_EXISTING_GENERATED_FILES = true;
-const REQUIRE_EMAIL_DISCOVERY_SUCCESS_WHEN_DRAFTING = true;
 const REQUIRE_TEMPLATE_PLACEHOLDER_COMPLETION = true;
 const INCLUDE_VISIBLE_JOB_URL_IN_RESUME = false;
 const VISIBLE_JOB_URL_LABEL = 'Job posting';
 const STRIP_LINKEDIN_FROM_RESUME_HEADER = false;
+const LOG_STATUS_INGEST_PARSE_FAILED = 'INGEST_PARSE_FAILED';
+const LOG_STATUS_DOCGEN_FAILED = 'DOCGEN_FAILED';
+const LOG_STATUS_CORE_PROCESSED = 'CORE_PROCESSED';
+const LOG_STATUS_DUPLICATE = 'DUPLICATE';
+const LOG_STATUS_RENDER_FAILED = 'RENDER_FAILED';
 const LOG_STATUS_NO_DRAFTABLE_ROUTE = 'NO_DRAFTABLE_ROUTE';
+const LOG_STATUS_DISPATCH_DISABLED = 'DISPATCH_DISABLED';
 const LOG_STATUS_DISPATCH_FAILED = 'DISPATCH_FAILED';
 const LOG_STATUS_SUPPRESSED_BOUNCE = 'SUPPRESSED_BOUNCE';
+const LOG_STATUS_BOUNCE_UNMATCHED = 'BOUNCE_UNMATCHED';
+const LOG_STATUS_BOUNCE_RECONCILED = 'BOUNCE_RECONCILED';
 const LOG_EMAIL_TIER_NO_DRAFTABLE_ROUTE = 'NO_DRAFTABLE_ROUTE';
+const LOG_EMAIL_TIER_DISPATCH_DISABLED = 'DISPATCH_DISABLED';
 const LOG_EMAIL_TIER_DISPATCH_FAILED = 'DISPATCH_FAILED';
 const LOG_EMAIL_TIER_SUPPRESSED_BOUNCE = 'SUPPRESSED';
+
+const APPLICATIONS_SHEET_NAME = 'Applications';
+const BOUNCE_AUDIT_SHEET_NAME = 'Bounce Audit';
+const MAX_APPLICATION_RECIPIENT_SLOTS = 5;
+const LOG_STATUS_RENDER_COMPLETE = 'RENDER_COMPLETE';
+const LOG_STATUS_RENDER_DISABLED = 'RENDER_DISABLED';
+const LOG_STATUS_PARTIAL_DELIVERY = 'PARTIAL_DELIVERY';
+
+const LEGACY_SPREADSHEET_LOG_HEADERS = Object.freeze([
+  'Timestamp', 'Status', 'Company', 'Job ID', 'Job Title', 'Target Email', 'Email Tier', 'Score', 'Draft/Message ID', 'Job URL',
+  'Bounce Type', 'Bounce Code', 'Bounce Suppressed', 'Bounce Message ID', 'Bounce Detected At'
+]);
+
+function buildApplicationsSheetHeaders() {
+  const headers = [
+    'Created At', 'Updated At', 'Company', 'Job ID', 'Job Title', 'Job URL', 'Company Address',
+    'Core Status', 'Core Completed At', 'Core Error',
+    'Render Status', 'Render Completed At', 'Render Error',
+    'Dispatch Status', 'Dispatch Completed At', 'Dispatch Error',
+    'Discovery Score', 'Source File Name', 'Duplicate Count', 'Last Duplicate Detected At',
+    'Last Run ID', 'Notes'
+  ];
+  for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+    headers.push(
+      `Recipient ${slot} Email`,
+      `Recipient ${slot} Tier`,
+      `Recipient ${slot} Score`,
+      `Recipient ${slot} Delivery Status`,
+      `Recipient ${slot} Message ID`,
+      `Recipient ${slot} Bounce Type`,
+      `Recipient ${slot} Bounce Code`,
+      `Recipient ${slot} Bounce Suppressed`,
+      `Recipient ${slot} Bounce Message ID`,
+      `Recipient ${slot} Bounce Detected At`
+    );
+  }
+  return headers;
+}
+
+const APPLICATIONS_SHEET_HEADERS = Object.freeze(buildApplicationsSheetHeaders());
+
+const BOUNCE_AUDIT_HEADERS = Object.freeze([
+  'Detected At', 'Gmail Message ID', 'Gmail Thread ID', 'Status',
+  'Bounce Type', 'Bounce Code', 'Bounce Suppressed', 'Target Email',
+  'Subject', 'Diagnostic', 'Archived At', 'Run ID', 'Notes'
+]);
+
+const BOUNCE_TYPES = Object.freeze({
+  INVALID_RECIPIENT: Object.freeze({ id: 'INVALID_RECIPIENT', label: 'Recipient address does not exist / invalid address' }),
+  POLICY_SPAM_SECURITY: Object.freeze({ id: 'POLICY_SPAM_SECURITY', label: 'Spam, reputation, security, or policy rejection' }),
+  SENDER_LIMIT: Object.freeze({ id: 'SENDER_LIMIT', label: 'Sender has reached a sending limit' }),
+  TEMPORARY_DELIVERY: Object.freeze({ id: 'TEMPORARY_DELIVERY', label: 'Temporary recipient/server delivery problem' }),
+  MAILBOX_FULL: Object.freeze({ id: 'MAILBOX_FULL', label: 'Recipient mailbox full / out of storage / receiving too quickly' }),
+  HELO_EHLO_ERROR: Object.freeze({ id: 'HELO_EHLO_ERROR', label: 'HELO/EHLO / SMTP server identification error' })
+});
 
 /**
  * Canonical placeholder names expected in the templates.
@@ -163,6 +245,7 @@ const DISCOVERY_ACTIONS = Object.freeze({
 let CACHED_GMAIL_ALIASES = null;
 let CACHED_EFFECTIVE_USER_EMAIL = null;
 let CACHED_BOUNCED_ADDRESS_SET = null;
+let APPLICATION_RECONCILIATION_COMPLETED = false;
 
 // ============================================================================
 // 📝 STANDARDIZED DUAL-LOGGING SYSTEM & EXECUTION METRICS
@@ -174,11 +257,16 @@ const RUN_METRICS = {
   filesDiscovered: 0,
   filesProcessed: 0,
   filesSkipped: 0,
+  filesFailed: 0,
+  filesDuplicated: 0,
   emailsSent: 0,
   emailsDrafted: 0,
   routesUnresolved: 0,
+  renderFailures: 0,
+  dispatchFailures: 0,
   errorsEncountered: 0,
   bouncesDetected: 0,
+  bouncesArchived: 0,
   timeLimitReached: false
 };
 
@@ -248,7 +336,8 @@ const AppLogger = {
              .replace(/EMAIL ENGINE|DISPATCH/i, 'DISPATCH')
              .replace(/BOUNCE TRACKER|BOUNCE SUPPRESSION|BOUNCES/i, 'BOUNCES')
              .replace(/LLM GATEWAY|API EXECUTION|API SUCCESS|API ERROR|LLM/i, 'LLM')
-             .replace(/RESUME GENERATOR|COVER LETTER GENERATOR|LINKEDIN DOC GENERATOR|TEMPLATE ENGINE|REPLACE ENGINE|LINK ENGINE|ADDRESS FORMATTING|DRIVE|DOCGEN/i, 'DOCGEN')
+             .replace(/ADDRESS FORMATTING|ADDRESS SCRAPER/i, 'GENERAL')
+             .replace(/RESUME GENERATOR|COVER LETTER GENERATOR|LINKEDIN DOC GENERATOR|TEMPLATE ENGINE|REPLACE ENGINE|LINK ENGINE|DRIVE|DOCGEN/i, 'DOCGEN')
              .replace(/RENDER ENGINE|RENDER/i, 'RENDER')
              .replace(/DISCOVERY MODULE|DISCOVERY|NORMALIZER|PROMPT BUILDER|ROUTING/i, 'ROUTING')
              .replace(/PRE-FILTER|PREFILTER|AUTH|PREFLIGHT/i, 'PREFLIGHT')
@@ -328,13 +417,18 @@ function flushDocLogs(folderIdOverride) {
           ['Execution Duration', `${item.elapsedSec} seconds`],
           ['Time Limit Reached', RUN_METRICS.timeLimitReached ? 'YES (Batch paused at 5-min threshold)' : 'NO (Completed within window)'],
           ['Files Discovered', String(RUN_METRICS.filesDiscovered)],
-          ['Files Processed', String(RUN_METRICS.filesProcessed)],
-          ['Files Skipped / Archived', String(RUN_METRICS.filesSkipped)],
+          ['Files Processed (DOCGEN complete)', String(RUN_METRICS.filesProcessed)],
+          ['Files Skipped', String(RUN_METRICS.filesSkipped)],
+          ['Files Failed', String(RUN_METRICS.filesFailed)],
+          ['Duplicates Diverted', String(RUN_METRICS.filesDuplicated)],
           ['Emails Sent', String(RUN_METRICS.emailsSent)],
           ['Emails Drafted', String(RUN_METRICS.emailsDrafted)],
           ['Unresolvable Routes', String(RUN_METRICS.routesUnresolved)],
+          ['Render Failures', String(RUN_METRICS.renderFailures)],
+          ['Dispatch Failures', String(RUN_METRICS.dispatchFailures)],
           ['Errors Encountered', String(RUN_METRICS.errorsEncountered)],
           ['Bounces Detected', String(RUN_METRICS.bouncesDetected)],
+          ['Bounce Threads Archived', String(RUN_METRICS.bouncesArchived)],
           ['Suppressed Address Set', `${CACHED_BOUNCED_ADDRESS_SET ? CACHED_BOUNCED_ADDRESS_SET.size : 0} addresses`]
         ];
         const table = body.appendTable(tableData);
@@ -401,14 +495,19 @@ function outputExecutionSummary() {
     'INTAKE & DISPATCH METRICS:',
     `  - Files Discovered:       ${RUN_METRICS.filesDiscovered}`,
     `  - Files Processed:        ${RUN_METRICS.filesProcessed}`,
-    `  - Files Skipped/Archived: ${RUN_METRICS.filesSkipped}`,
+    `  - Files Skipped:          ${RUN_METRICS.filesSkipped}`,
+    `  - Files Failed:           ${RUN_METRICS.filesFailed}`,
+    `  - Duplicates Diverted:    ${RUN_METRICS.filesDuplicated}`,
     `  - Emails Sent:            ${RUN_METRICS.emailsSent}`,
     `  - Emails Drafted:         ${RUN_METRICS.emailsDrafted}`,
     `  - Unresolvable Routes:    ${RUN_METRICS.routesUnresolved}`,
+    `  - Render Failures:        ${RUN_METRICS.renderFailures}`,
+    `  - Dispatch Failures:      ${RUN_METRICS.dispatchFailures}`,
     `  - Errors Encountered:     ${RUN_METRICS.errorsEncountered}`,
     '',
     'BOUNCE DETECTION & SUPPRESSION:',
     `  - Bounces Detected:       ${RUN_METRICS.bouncesDetected}`,
+    `  - Threads Archived:       ${RUN_METRICS.bouncesArchived}`,
     `  - Suppressed Address Set: ${CACHED_BOUNCED_ADDRESS_SET ? CACHED_BOUNCED_ADDRESS_SET.size : 0} addresses`,
     '================================================================================',
     ''
@@ -506,187 +605,1352 @@ function preflightSpreadsheetAuthorization(config) {
 }
 
 /**
- * Scans the Gmail inbox for bounce-backs (Delivery Status Notifications)
- * and surgically updates the corresponding comma-separated entries in the Spreadsheet log to 'BOUNCED'.
+ * Scans delivery-status notifications (Gmail and external mail systems), classifies
+ * the six supported bounce categories, updates the corresponding spreadsheet
+ * recipient slot, and archives only after the bounce event has been durably logged.
  */
 function scanForBounces(config) {
-  vLog('[BOUNCE TRACKER] Initiating search for standard mailer bounce indicators...');
+  vLog('[BOUNCE TRACKER] Initiating six-type delivery-status notification scan...');
   if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) {
     vLog('  - [BOUNCE TRACKER] Spreadsheet logging disabled. Skipping bounce scan.');
     return;
   }
 
   try {
-    const sheet = SpreadsheetApp.openById(config.spreadsheetLogId).getSheets()[0];
-    const lastRow = sheet.getLastRow();
-    vLog(`  - [BOUNCE TRACKER] Logging Sheet has ${lastRow} total rows.`);
-    
-    if (lastRow <= 1) {
-      vLog('  - [BOUNCE TRACKER] Spreadsheet contains only header elements. Skipping bounce scan.');
-      return;
-    }
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetLogId);
+    const applicationsSheet = getOrCreateApplicationsSheet(spreadsheet);
+    const bounceAuditSheet = getOrCreateBounceAuditSheet(spreadsheet);
+    normalizeHistoricalTemporaryBounceClassifications(applicationsSheet, bounceAuditSheet);
+    reconcileBounceAuditEvents(applicationsSheet, bounceAuditSheet);
+    const sentJobs = loadBounceTrackingJobs(applicationsSheet);
+    const loggedBounceMessageIds = getLoggedBounceMessageIds(applicationsSheet, bounceAuditSheet);
 
-    // Fetch relevant columns (Status is Col 2, Job ID is Col 4, Job Title is Col 5, Target Email is Col 6)
-    const data = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
-    const sentJobs =[];
+    vLog(`  - [BOUNCE TRACKER] Applications sheet contains ${applicationsSheet.getLastRow()} total row(s).`);
+    vLog(`  - [BOUNCE TRACKER] Loaded ${sentJobs.length} application row(s) containing trackable recipient statuses.`);
 
-    for (let i = 0; i < data.length; i++) {
-      const statusStr = String(data[i][1] || '').trim().toUpperCase();
-      const emailStr = String(data[i][5] || '').trim().toLowerCase();
-      
-      const statuses = statusStr.split(',').map(s => s.trim());
-      const emails = emailStr.split(',').map(e => e.trim());
+    const query = `in:inbox newer_than:${BOUNCE_SCAN_LOOKBACK_DAYS}d {from:mailer-daemon from:postmaster subject:"Delivery Status Notification" subject:"Undeliverable" subject:"Mail delivery failed" subject:"Returned mail" subject:"Delivery failure" subject:"Failure notice" subject:"Delivery delayed" subject:"Delivery incomplete"}`;
+    vLog(`  - [BOUNCE TRACKER] Querying Gmail with filter: ${query}`);
+    const threads = GmailApp.search(query, 0, BOUNCE_SCAN_MAX_THREADS);
+    vLog(`  - [BOUNCE TRACKER] Found ${threads.length} candidate delivery-status thread(s).`);
 
-      // Only track jobs that have at least one active SENT status
-      if (statuses.includes('SENT')) {
-        sentJobs.push({
-          rowIndex: i + 2,
-          jobId: String(data[i][3] || '').trim().toLowerCase(),
-          jobTitle: String(data[i][4] || '').trim().toLowerCase(),
-          emails: emails,
-          statuses: statuses
-        });
-      }
-    }
-
-    vLog(`  - [BOUNCE TRACKER] Loaded ${sentJobs.length} potential tracking records currently set to "SENT".`);
-    if (sentJobs.length === 0) {
-      vLog('  - [BOUNCE TRACKER] No active "SENT" records found. Skipping bounce scan.');
-      return;
-    }
-
-    // Search for delivery failures in the inbox in the last 14 days
-    const query = 'in:inbox (from:mailer-daemon OR from:postmaster OR subject:"Delivery Status Notification" OR subject:"Undeliverable" OR subject:"Returned to sender") newer_than:14d';
-    vLog(`  - [BOUNCE TRACKER] Querying Gmail threads with filter: ${query}`);
-    const threads = GmailApp.search(query, 0, 50);
-    vLog(`  - [BOUNCE TRACKER] Found ${threads.length} bounce-related message threads.`);
     let bounceCount = 0;
+    let archivedThreadCount = 0;
 
     threads.forEach((thread, threadIdx) => {
-      vLog(`  - [BOUNCE TRACKER] Evaluating Thread #${threadIdx + 1}`);
+      let threadCanArchive = false;
+      let threadHasUnpersistedRecognizedBounce = false;
+      const persistedMessageIds = [];
       const messages = thread.getMessages();
+      const threadId = (() => {
+        try { return String(thread.getId() || ''); } catch (e) { return ''; }
+      })();
+      vLog(`  - [BOUNCE TRACKER] Evaluating Thread #${threadIdx + 1} (${messages.length} message(s)).`);
+
       messages.forEach((msg, msgIdx) => {
-        const body = msg.getPlainBody().toLowerCase();
-        const subject = msg.getSubject().toLowerCase();
-        let rawContent = null; // Lazy loaded to prevent loading large strings from Gmail unless required
-        vLog(`    - [BOUNCE TRACKER] Parsing Message #${msgIdx + 1}: Subject: "${msg.getSubject()}"`);
+        const messageId = String(msg.getId() || '').trim();
+        const messageWasPreviouslyLogged = Boolean(messageId && loggedBounceMessageIds.has(messageId));
 
-        // Check against our known sent jobs
-        for (let j = sentJobs.length - 1; j >= 0; j--) {
-          const job = sentJobs[j];
-          let updated = false;
+        const body = String(msg.getPlainBody() || '');
+        const subject = String(msg.getSubject() || '');
+        let rawContent = '';
+        try {
+          rawContent = String(msg.getRawContent() || '');
+        } catch (rawErr) {
+          vLog(`    - [BOUNCE TRACKER] [WARNING] Could not inspect raw DSN content: ${rawErr.message}`);
+        }
 
-          for (let k = 0; k < job.emails.length; k++) {
-            if (job.statuses[k] !== 'SENT') continue;
+        if (!isDeliveryStatusNotificationMessage(msg, rawContent, body, subject)) {
+          vLog(`    - [BOUNCE TRACKER] Message #${msgIdx + 1} is part of the matched thread but does not satisfy DSN validation; skipping classification.`);
+          return;
+        }
+
+        const classification = classifyGmailBounce(`${subject}\n${body}\n${rawContent}`);
+        if (!classification) {
+          vLog(`    - [BOUNCE TRACKER] Message #${msgIdx + 1} is a validated DSN but did not match one of the six configured bounce categories.`);
+          return;
+        }
+
+        if (messageWasPreviouslyLogged) {
+          vLog(`    - [BOUNCE TRACKER] DSN ${messageId} already logged; skipping duplicate mutation and retaining thread for archive retry.`);
+          threadCanArchive = true;
+          persistedMessageIds.push(messageId);
+          return;
+        }
+
+        const searchable = `${subject}\n${body}\n${rawContent}`.toLowerCase();
+        const authoritativeRecipients = extractBounceRecipientCandidates(`${body}\n${rawContent}`, config);
+        const resolvedTargets = resolveBounceTargets(sentJobs, searchable, authoritativeRecipients);
+        const suppressRecipient = shouldSuppressBounceRecipient(classification);
+        const detectedAt = getCurrentTimestampString();
+        let messagePersisted = false;
+
+        if (resolvedTargets.length > 0) {
+          resolvedTargets.forEach(target => {
+            const job = target.job;
+            const k = target.emailIndex;
             const email = job.emails[k];
-            if (!email) continue;
-
-            // Must contain the target email in the bounce body or raw headers
-            let hasEmailMatch = body.includes(email);
-            if (!hasEmailMatch) {
-              if (rawContent === null) {
-                vLog(`      - [BOUNCE TRACKER] [LAZY] Fetching raw message headers for Thread #${threadIdx + 1} Msg #${msgIdx + 1} due to email lookup...`);
-                rawContent = msg.getRawContent().toLowerCase();
-              }
-              hasEmailMatch = rawContent.includes(email);
-            }
-            if (!hasEmailMatch) continue;
-
-            let isMatch = false;
-            // Must also contain the Job ID (or Job Title if ID is missing) to prevent false positives
-            if (job.jobId) {
-              if (body.includes(job.jobId) || subject.includes(job.jobId)) {
-                isMatch = true;
-              } else {
-                if (rawContent === null) {
-                  vLog(`      - [BOUNCE TRACKER] [LAZY] Fetching raw message headers for Thread #${threadIdx + 1} Msg #${msgIdx + 1} due to Job ID lookup...`);
-                  rawContent = msg.getRawContent().toLowerCase();
-                }
-                isMatch = rawContent.includes(job.jobId);
-              }
-            } else if (job.jobTitle) {
-              if (body.includes(job.jobTitle) || subject.includes(job.jobTitle)) {
-                isMatch = true;
-              } else {
-                if (rawContent === null) {
-                  vLog(`      - [BOUNCE TRACKER] [LAZY] Fetching raw message headers for Thread #${threadIdx + 1} Msg #${msgIdx + 1} due to Job Title lookup...`);
-                  rawContent = msg.getRawContent().toLowerCase();
-                }
-                isMatch = rawContent.includes(job.jobTitle);
-              }
-            }
-
-            if (isMatch) {
-              vLog(`    - [BOUNCE TRACKER] ⚠️ BOUNCE DETECTED for Job ID: ${job.jobId || job.jobTitle} (${email})`);
-              job.statuses[k] = 'BOUNCED';
-              persistBouncedAddress(email); // Layer 1: Persist to suppression store immediately
-              updated = true;
+            try {
+              persistMatchedBounceToApplication(applicationsSheet, job, k, classification, suppressRecipient, messageId, detectedAt);
+              if (suppressRecipient) persistBouncedAddress(email);
               bounceCount++;
+              messagePersisted = true;
+              vLog(`    - [BOUNCE TRACKER] ${classification.type} recorded for ${email} on application row ${job.rowIndex}; suppression=${suppressRecipient ? 'YES' : 'NO'}.`);
+            } catch (sheetErr) {
+              threadHasUnpersistedRecognizedBounce = true;
+              AppLogger.error('BOUNCES', `Failed persisting bounce update for application row ${job.rowIndex}: ${sheetErr.message}`);
             }
-          }
+          });
 
-          if (updated) {
-            vLog(`    - [BOUNCE TRACKER] Saving updated row index ${job.rowIndex} with new status configuration: ${job.statuses.join(', ')}`);
-            sheet.getRange(job.rowIndex, 2).setValue(job.statuses.join(', '));
-            // If no 'SENT' statuses remain for this job, remove it from the tracking array
-            if (!job.statuses.includes('SENT')) {
-              sentJobs.splice(j, 1);
-            }
+          for (let i = sentJobs.length - 1; i >= 0; i--) {
+            const stillTrackable = sentJobs[i].emails.some((email, idx) => email && isBounceRecipientTrackable(sentJobs[i], idx));
+            if (!stillTrackable) sentJobs.splice(i, 1);
+          }
+        } else {
+          const extractedRecipients = authoritativeRecipients.length > 0
+            ? authoritativeRecipients
+            : extractBounceRecipientCandidates(searchable, config);
+          messagePersisted = appendBounceAuditRecord({
+            detectedAt,
+            gmailMessageId: messageId,
+            gmailThreadId: threadId,
+            status: LOG_STATUS_BOUNCE_UNMATCHED,
+            bounceType: classification.type,
+            bounceCode: classification.statusCode || '',
+            bounceSuppressed: 'NO',
+            targetEmail: extractedRecipients.join(', '),
+            subject,
+            diagnostic: classification.diagnosticExcerpt || '',
+            archivedAt: '',
+            notes: 'Recognized delivery-status notification could not be uniquely correlated to an application recipient.'
+          }, bounceAuditSheet);
+          if (messagePersisted) {
+            bounceCount++;
+            vLog(`    - [BOUNCE TRACKER] ${classification.type} logged to Bounce Audit as BOUNCE_UNMATCHED; no unique application recipient could be correlated.`);
+          } else {
+            threadHasUnpersistedRecognizedBounce = true;
           }
         }
+
+        if (messagePersisted) {
+          if (messageId) {
+            loggedBounceMessageIds.add(messageId);
+            persistedMessageIds.push(messageId);
+          }
+          threadCanArchive = true;
+        }
       });
+
+      if (threadCanArchive && !threadHasUnpersistedRecognizedBounce) {
+        try {
+          thread.moveToArchive();
+          archivedThreadCount++;
+          RUN_METRICS.bouncesArchived++;
+          markBounceAuditMessagesArchived(bounceAuditSheet, persistedMessageIds, getCurrentTimestampString());
+          vLog(`  - [BOUNCE TRACKER] Archived fully logged bounce thread #${threadIdx + 1}.`);
+        } catch (archiveErr) {
+          vLog(`  - [BOUNCE TRACKER] [WARNING] Bounce thread #${threadIdx + 1} was logged but could not be archived: ${archiveErr.message}`);
+        }
+      }
     });
 
-    vLog(`  - [BOUNCE TRACKER] Scan execution complete. Modified ${bounceCount} bounce statuses.`);
     RUN_METRICS.bouncesDetected += bounceCount;
+    vLog(`  - [BOUNCE TRACKER] Scan complete. Classified/logged ${bounceCount} bounce event(s); archived ${archivedThreadCount} thread(s).`);
   } catch (e) {
     vLog(`  - [BOUNCE TRACKER] Warning: Tracking execution encountered an error: ${e.message}`);
   }
 }
+function extractEmailAddressFromHeader(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const angleMatch = text.match(/<\s*([^<>\s]+@[^<>\s]+)\s*>/);
+  if (angleMatch) return sanitizeEmailAddress(angleMatch[1]);
+  const bareMatch = text.match(/([a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
+  return bareMatch ? sanitizeEmailAddress(bareMatch[1]) : '';
+}
 
 /**
- * Hydrates suppression memory from historical sheet rows already marked BOUNCED.
- * This avoids repeated retries to addresses that failed in prior runs.
+ * Validates an individual message as a delivery-status notification (DSN).
+ *
+ * Gmail search results are thread-scoped, so sender/subject search terms alone
+ * are not sufficient: an ordinary outbound application can share a thread with
+ * a DSN. Require standards-based DSN structure or a system sender plus strong
+ * DSN evidence before the bounce classifier may inspect a message.
+ */
+function isDeliveryStatusNotificationMessage(msg, rawContent, plainBody, subjectValue) {
+  if (!msg) return false;
+  try {
+    const from = extractEmailAddressFromHeader(msg.getFrom ? msg.getFrom() : '');
+    const localPart = from ? String(from.split('@')[0] || '').toLowerCase() : '';
+    const systemSender = /^(?:mailer-daemon|mail-daemon|postmaster)$/.test(localPart);
+    const raw = String(rawContent || '');
+    const body = String(plainBody || '');
+    const subject = String(subjectValue || (msg.getSubject ? msg.getSubject() : '') || '');
+    const combined = `${subject}\n${body}\n${raw}`;
+
+    const multipartReport = /content-type\s*:\s*multipart\/report[\s\S]{0,300}?report-type\s*=\s*["']?delivery-status/i.test(raw);
+    const deliveryStatusPart = /content-type\s*:\s*message\/delivery-status/i.test(raw);
+    const hasRecipientField = /(?:^|\r?\n)(?:final-recipient|original-recipient)\s*:/im.test(raw);
+    const hasActionField = /(?:^|\r?\n)action\s*:\s*(?:failed|delayed|expanded|relayed|delivered)\b/im.test(raw);
+    const hasStatusField = /(?:^|\r?\n)status\s*:\s*[245]\.\d\.\d{1,3}\b/im.test(raw);
+    const hasDiagnosticField = /(?:^|\r?\n)diagnostic-code\s*:\s*(?:smtp|x-[^;]+)\s*;/im.test(raw);
+    const emptyReturnPath = /(?:^|\r?\n)return-path\s*:\s*<>\s*$/im.test(raw);
+    const subjectSignal = /delivery status notification|undeliverable|mail delivery (?:failed|failure)|returned mail|delivery failure|failure notice|delivery incomplete|delivery delayed/i.test(subject);
+    const bodySignal = /delivery (?:has )?failed|wasn['’]?t delivered|couldn['’]?t be found|recipient address rejected|message could not be delivered/i.test(body);
+    const hasEnhancedBounceCode = /\b[45]\.\d\.\d{1,3}\b/.test(combined);
+
+    const structuredDsn = (multipartReport || deliveryStatusPart) && hasRecipientField && (hasStatusField || hasDiagnosticField);
+    const fieldRichDsn = hasRecipientField && hasActionField && hasStatusField && (hasDiagnosticField || emptyReturnPath);
+    const proseSystemDsn = systemSender && subjectSignal && bodySignal && hasEnhancedBounceCode;
+    const systemGeneratedDsn = systemSender && (structuredDsn || fieldRichDsn || proseSystemDsn || ((subjectSignal || bodySignal) && hasRecipientField && (hasStatusField || hasDiagnosticField)));
+
+    return structuredDsn || fieldRichDsn || systemGeneratedDsn;
+  } catch (e) {
+    vLog(`    - [BOUNCE TRACKER] [WARNING] Could not validate delivery-status message: ${e.message}`);
+    return false;
+  }
+}
+
+// Backward-compatible alias retained for callers/tests using the older helper.
+function isGmailMailDeliverySubsystemMessage(msg) {
+  if (!msg) return false;
+  let raw = '';
+  let body = '';
+  let subject = '';
+  try { raw = String(msg.getRawContent ? msg.getRawContent() : ''); } catch (e) {}
+  try { body = String(msg.getPlainBody ? msg.getPlainBody() : ''); } catch (e) {}
+  try { subject = String(msg.getSubject ? msg.getSubject() : ''); } catch (e) {}
+  return isDeliveryStatusNotificationMessage(msg, raw, body, subject);
+}
+
+function extractAuthoritativeDsnStatus(content) {
+  const source = String(content || '');
+  if (!source) return { statusCode: '', enhancedStatusCode: '' };
+
+  // Prefer RFC-style delivery-status fields over arbitrary codes embedded in
+  // the original message/MIME payload. A DSN's Status and Diagnostic-Code
+  // describe the actual delivery result and therefore outrank broad text.
+  const statusMatch = source.match(/(?:^|\r?\n)Status\s*:\s*([245]\.\d\.\d{1,3})\b/im);
+  const diagnosticMatch = source.match(/(?:^|\r?\n)Diagnostic-Code\s*:\s*[^;\r\n]+;([^\r\n]*)/im);
+  const diagnostic = diagnosticMatch ? String(diagnosticMatch[1] || '').trim() : '';
+  const combinedMatch = diagnostic.match(/\b([245]\d{2})[\s-]+([245]\.\d\.\d{1,3})\b/i);
+  const diagnosticEnhanced = diagnostic.match(/\b([245]\.\d\.\d{1,3})\b/i);
+  const diagnosticSmtp = diagnostic.match(/(?:^|\s)([245]\d{2})(?:\s|$)/);
+
+  const enhancedStatusCode = statusMatch
+    ? statusMatch[1]
+    : (combinedMatch ? combinedMatch[2] : (diagnosticEnhanced ? diagnosticEnhanced[1] : ''));
+  const statusCode = combinedMatch
+    ? `${combinedMatch[1]} ${combinedMatch[2]}`
+    : (diagnosticSmtp
+      ? `${diagnosticSmtp[1]}${enhancedStatusCode ? ` ${enhancedStatusCode}` : ''}`.trim()
+      : enhancedStatusCode);
+
+  return { statusCode, enhancedStatusCode };
+}
+
+function classifyGmailBounce(content) {
+  const source = String(content || '');
+  const text = source.toLowerCase();
+  if (!text) return null;
+
+  const authoritative = extractAuthoritativeDsnStatus(source);
+  const statusCode = authoritative.statusCode || extractBounceStatusCode(text);
+  const enhanced = authoritative.enhancedStatusCode || extractEnhancedStatusCode(text);
+  const hasPolicySignal = /message blocked|flagged as spam|spam-like|spam detected|reputation|policy rejection|policy violation|unauthenticated|authentication required|prohibited attachment|unsolicited|dmarc|dkim|spf fail|security policy/i.test(text);
+
+  // Specific conditions always win, even when their enhanced code belongs to
+  // a broader 4.x/5.x family.
+  if (/(?:helo|ehlo)/i.test(text) && (/(?:5\.5\.4|501\s+5\.5\.4)/i.test(text) || /invalid|empty|argument|hostname|identif/i.test(text))) {
+    return buildBounceClassification(BOUNCE_TYPES.HELO_EHLO_ERROR, statusCode, enhanced, text);
+  }
+
+  if (/(?:reached|exceeded|hit).{0,40}(?:sending|send|message|recipient|daily|relay).{0,25}limit|limit for sending mail|too many messages|daily sending quota|5\.4\.5/i.test(text)) {
+    return buildBounceClassification(BOUNCE_TYPES.SENDER_LIMIT, statusCode, enhanced, text);
+  }
+
+  if (/(?:4\.2\.2|5\.2\.2|4\.2\.1)/i.test(text) || /(?:inbox|mailbox).{0,25}(?:full|over quota)|out of storage|storage quota|receiving mail too rapidly|mailbox quota/i.test(text)) {
+    return buildBounceClassification(BOUNCE_TYPES.MAILBOX_FULL, statusCode, enhanced, text);
+  }
+
+  if (/(?:5\.1\.1|5\.1\.2|5\.1\.3)/i.test(text) || /address not found|recipient address.*(?:not found|invalid|rejected)|no such user|unknown user|user unknown|mailbox unavailable|does not exist|nonexistent (?:mailbox|recipient|domain)/i.test(text) || (/(?:5\.2\.1)/i.test(text) && /inactive|disabled|not accepting|cannot receive/i.test(text))) {
+    return buildBounceClassification(BOUNCE_TYPES.INVALID_RECIPIENT, statusCode, enhanced, text);
+  }
+
+  // When an RFC DSN provides an authoritative enhanced status code, let that
+  // code outrank unrelated words contained in the embedded original message.
+  // 4.7.x is policy/security only when the diagnostic itself carries a policy
+  // signal; other 4.x.x codes are temporary delivery failures.
+  if (authoritative.enhancedStatusCode) {
+    if (/^4\.7\./.test(authoritative.enhancedStatusCode) && hasPolicySignal) {
+      return buildBounceClassification(BOUNCE_TYPES.POLICY_SPAM_SECURITY, statusCode, enhanced, text);
+    }
+    if (/^4\./.test(authoritative.enhancedStatusCode)) {
+      return buildBounceClassification(BOUNCE_TYPES.TEMPORARY_DELIVERY, statusCode, enhanced, text);
+    }
+    if (/^5\.7\./.test(authoritative.enhancedStatusCode)) {
+      return buildBounceClassification(BOUNCE_TYPES.POLICY_SPAM_SECURITY, statusCode, enhanced, text);
+    }
+  }
+
+  // Fallback for prose/non-structured DSNs that do not expose authoritative
+  // Status/Diagnostic-Code fields.
+  if (/(?:4\.7\.\d+|5\.7\.\d+)/i.test(text) || hasPolicySignal) {
+    return buildBounceClassification(BOUNCE_TYPES.POLICY_SPAM_SECURITY, statusCode, enhanced, text);
+  }
+
+  if (/(?:delivery incomplete|temporary problem delivering|will retry|will keep trying|temporarily rejected|server busy|server unavailable|connection timed out|connection timeout|dns|routing trouble|throttl)/i.test(text) || /\b4\.\d\.\d+\b/i.test(text) || /\b4\d\d\b/i.test(text)) {
+    return buildBounceClassification(BOUNCE_TYPES.TEMPORARY_DELIVERY, statusCode, enhanced, text);
+  }
+
+  return null;
+}
+
+function buildBounceClassification(typeDef, statusCode, enhancedStatusCode, sourceText) {
+  const resolvedCode = statusCode || enhancedStatusCode || '';
+  const policyPermanent = typeDef.id === BOUNCE_TYPES.POLICY_SPAM_SECURITY.id &&
+    (/(?:^|\s)5\.7\./.test(String(enhancedStatusCode || resolvedCode)) || /^5\d\d\b/.test(String(resolvedCode)));
+  const permanentRecipientFailure = typeDef.id === BOUNCE_TYPES.INVALID_RECIPIENT.id || policyPermanent;
+  return {
+    type: typeDef.id,
+    label: typeDef.label,
+    statusCode: resolvedCode,
+    enhancedStatusCode: enhancedStatusCode || '',
+    permanentRecipientFailure,
+    retryable: !permanentRecipientFailure,
+    diagnosticExcerpt: truncateText(oneLinePlainText(sourceText || ''), 240)
+  };
+}
+
+function extractBounceStatusCode(text) {
+  const source = String(text || '');
+  const combined = source.match(/\b([245]\d{2})[\s-]+([245]\.\d\.\d{1,3})\b/i);
+  if (combined) return `${combined[1]} ${combined[2]}`;
+
+  const enhanced = source.match(/\b([245]\.\d\.\d{1,3})\b/i);
+  if (enhanced) return enhanced[1];
+
+  // A bare 4xx/5xx number is only a valid SMTP code when it appears in a
+  // diagnostic context. This prevents unrelated numbers in subjects or normal
+  // message text (for example, job IDs) from becoming bounce codes.
+  const lines = source.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = String(lines[i] || '').trim();
+    if (!line) continue;
+    const leading = line.match(/^([245]\d{2})(?:[\s-]|$)/);
+    if (leading) return leading[1];
+    const contextual = line.match(/(?:diagnostic-code|smtp|remote server|server response|response was|reply|said|status)[^\r\n]{0,80}\b([245]\d{2})\b/i);
+    if (contextual) return contextual[1];
+  }
+  return '';
+}
+
+function extractEnhancedStatusCode(text) {
+  const match = String(text || '').match(/\b([245]\.\d\.\d{1,3})\b/i);
+  return match ? match[1] : '';
+}
+
+function shouldSuppressBounceRecipient(classification) {
+  if (!classification) return false;
+  if (typeof classification.permanentRecipientFailure === 'boolean') return classification.permanentRecipientFailure;
+  if (classification.type === BOUNCE_TYPES.INVALID_RECIPIENT.id) return true;
+  if (classification.type !== BOUNCE_TYPES.POLICY_SPAM_SECURITY.id) return false;
+  const code = String(classification.enhancedStatusCode || classification.statusCode || '');
+  return /(?:^|\s)5\.7\./.test(code) || /^5\d\d\b/.test(code);
+}
+
+function isBounceRecipientTrackable(job, emailIndex) {
+  if (!job) return false;
+  const status = String((job.statuses && job.statuses[emailIndex]) || '').toUpperCase();
+  if (status === 'SENT') return true;
+  // New-format temporary/non-recipient failures stay correlatable so a later
+  // final DSN can refine the type and, when appropriate, suppression.
+  if (status === 'BOUNCED') {
+    const suppressed = String((job.bounceSuppressed && job.bounceSuppressed[emailIndex]) || '').toUpperCase();
+    return suppressed === 'NO';
+  }
+  return false;
+}
+
+function resolveBounceTargets(sentJobs, searchableContent, recipientHints, includeTerminalRecipients) {
+  const content = String(searchableContent || '').toLowerCase();
+  const hintedRecipients = new Set((recipientHints || []).map(sanitizeEmailAddress).filter(Boolean));
+  const candidatesByEmail = {};
+
+  sentJobs.forEach(job => {
+    job.emails.forEach((email, emailIndex) => {
+      if (!email || (!includeTerminalRecipients && !isBounceRecipientTrackable(job, emailIndex))) return;
+      if (hintedRecipients.size > 0) {
+        if (!hintedRecipients.has(email)) return;
+      } else if (!content.includes(email)) {
+        return;
+      }
+      if (!candidatesByEmail[email]) candidatesByEmail[email] = [];
+      const strongJobMatch = Boolean(
+        (job.jobId && content.includes(job.jobId)) ||
+        (job.jobTitle && content.includes(job.jobTitle))
+      );
+      candidatesByEmail[email].push({ job, emailIndex, strongJobMatch });
+    });
+  });
+
+  const resolved = [];
+  Object.keys(candidatesByEmail).forEach(email => {
+    const candidates = candidatesByEmail[email];
+    const strong = candidates.filter(c => c.strongJobMatch);
+    if (strong.length === 1) {
+      resolved.push(strong[0]);
+    } else if (strong.length === 0 && candidates.length === 1) {
+      resolved.push(candidates[0]);
+    } else if (strong.length > 1) {
+      vLog(`    - [BOUNCE TRACKER] [WARNING] Ambiguous strong match for ${email}; refusing to guess among ${strong.length} application rows.`);
+    } else {
+      vLog(`    - [BOUNCE TRACKER] [WARNING] ${email} maps to ${candidates.length} candidate application rows without a unique Job ID/title match.`);
+    }
+  });
+  return resolved;
+}
+
+function extractBounceRecipientCandidates(content, config) {
+  const text = String(content || '');
+  const out = new Set();
+  let match;
+
+  // Prefer explicit DSN recipient fields. These are authoritative and avoid
+  // collecting sender, DKIM, relay, and Google infrastructure addresses.
+  const dsnHeaderPatterns = [
+    /(?:final-recipient|original-recipient)\s*:\s*(?:rfc822\s*;\s*)?([^\s<>;,]+)/gi,
+    /(?:x-failed-recipients|failed-recipient)\s*:\s*([^\s<>;,]+)/gi
+  ];
+  dsnHeaderPatterns.forEach(pattern => {
+    while ((match = pattern.exec(text)) !== null) {
+      const email = sanitizeEmailAddress(match[1]);
+      if (isProbableBounceRecipientCandidate(email, config)) out.add(email);
+    }
+  });
+
+  // Gmail's human-readable DSNs often name the failed recipient directly.
+  const prosePatterns = [
+    /(?:delivered|delivering|delivery|message)\s+(?:to|for)\s+([a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,})/gi,
+    /(?:recipient|address|mailbox)\s*[:=]?\s*<?([a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,})>?/gi,
+    /(?:couldn't|could not|wasn't|was not|unable to)\s+(?:be\s+)?delivered\s+to\s+([a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,})/gi
+  ];
+  prosePatterns.forEach(pattern => {
+    while ((match = pattern.exec(text)) !== null) {
+      const email = sanitizeEmailAddress(match[1]);
+      if (isProbableBounceRecipientCandidate(email, config)) out.add(email);
+    }
+  });
+
+  // Only if DSN-specific fields yielded nothing, use a tightly filtered email
+  // fallback. This keeps BOUNCE_UNMATCHED useful without exposing MIME-routing
+  // addresses as if they were failed recipients.
+  if (out.size === 0) {
+    const emailRegex = /[a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+    while ((match = emailRegex.exec(text)) !== null) {
+      const email = sanitizeEmailAddress(match[0]);
+      if (isProbableBounceRecipientCandidate(email, config)) out.add(email);
+    }
+  }
+  return Array.from(out).slice(0, 10);
+}
+
+function isProbableBounceRecipientCandidate(email, config) {
+  const normalized = sanitizeEmailAddress(email);
+  if (!normalized || !isValidEmailAddress(normalized)) return false;
+  if (normalized === 'mailer-daemon@googlemail.com') return false;
+
+  const parts = normalized.split('@');
+  const localPart = parts[0] || '';
+  const domain = parts[1] || '';
+  if (!localPart || !domain) return false;
+  if (/^(?:postmaster|mailer-daemon|daemon|header\.i=?)$/i.test(localPart)) return false;
+  if (/^header\.i=/i.test(localPart)) return false;
+  if (domain === 'mail.gmail.com' || domain === 'mx.google.com' || domain.endsWith('.mx.google.com')) return false;
+
+  const ownAddresses = getBounceOwnAddressSet(config);
+  return !ownAddresses.has(normalized);
+}
+
+function getBounceOwnAddressSet(config) {
+  const ownAddresses = new Set();
+  const configured = sanitizeEmailAddress(config && config.applicantEmail);
+  if (configured) ownAddresses.add(configured);
+
+  if (CACHED_EFFECTIVE_USER_EMAIL === null) {
+    try {
+      CACHED_EFFECTIVE_USER_EMAIL = sanitizeEmailAddress(Session.getEffectiveUser().getEmail());
+    } catch (e) {
+      CACHED_EFFECTIVE_USER_EMAIL = '';
+    }
+  }
+  if (CACHED_EFFECTIVE_USER_EMAIL) ownAddresses.add(CACHED_EFFECTIVE_USER_EMAIL);
+
+  getNormalizedGmailAliases().forEach(alias => {
+    const clean = sanitizeEmailAddress(alias);
+    if (clean) ownAddresses.add(clean);
+  });
+  return ownAddresses;
+}
+
+function splitAlignedCsv(value) {
+  const text = String(value == null ? '' : value);
+  if (!text.trim()) return [];
+  return text.split(',').map(v => String(v || '').trim());
+}
+
+function alignArrayToLength(values, length) {
+  const out = Array.isArray(values) ? values.slice(0, length) : [];
+  while (out.length < length) out.push('');
+  return out;
+}
+
+function sanitizeAlignedCsvField(value) {
+  return String(value == null ? '' : value).replace(/[\r\n]+/g, ' ').replace(/,/g, ';').trim();
+}
+
+/**
+ * Hydrates suppression memory from historical sheet rows. New-format rows use the
+ * explicit Bounce Suppressed column; legacy BOUNCED rows retain prior behavior.
  */
 function syncBouncedAddressesFromSheet(config) {
   if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) return;
 
   try {
-    const sheet = SpreadsheetApp.openById(config.spreadsheetLogId).getSheets()[0];
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetLogId);
+    const sheet = getOrCreateApplicationsSheet(spreadsheet);
+    const headerMap = getSheetHeaderMap(sheet);
     const lastRow = sheet.getLastRow();
     if (lastRow <= 1) return;
 
-    // Pull Status (B) and Target Email (F)
-    const rows = sheet.getRange(2, 2, lastRow - 1, 5).getValues();
+    const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
     const addressesToPersist = new Set();
-
-    for (let i = 0; i < rows.length; i++) {
-      const statusStr = String(rows[i][0] || '').trim().toUpperCase();
-      const emailStr = String(rows[i][4] || '').trim();
-      if (!statusStr || !emailStr) continue;
-
-      const statuses = statusStr.split(',').map(s => s.trim());
-      if (!statuses.includes('BOUNCED')) continue;
-
-      emailStr
-        .split(',')
-        .map(e => sanitizeEmailAddress(e))
-        .filter(Boolean)
-        .forEach(email => addressesToPersist.add(email));
-    }
+    rows.forEach(row => {
+      for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+        const email = sanitizeEmailAddress(getApplicationRowValue(row, headerMap, `Recipient ${slot} Email`));
+        const suppressed = String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Suppressed`) || '').toUpperCase();
+        if (email && suppressed === 'YES') addressesToPersist.add(email);
+      }
+    });
 
     if (addressesToPersist.size > 0) {
       persistBouncedAddresses(Array.from(addressesToPersist));
-      vLog(`  - [BOUNCE SUPPRESSION] Hydrated ${addressesToPersist.size} unique bounced target(s) from historical sheet rows.`);
+      vLog(`  - [BOUNCE SUPPRESSION] Hydrated ${addressesToPersist.size} unique permanently suppressed target(s) from Applications.`);
     }
   } catch (e) {
-    vLog(`  - [BOUNCE SUPPRESSION] Warning: Could not hydrate historical bounced addresses: ${e.message}`);
+    vLog(`  - [BOUNCE SUPPRESSION] Warning: Could not hydrate Applications bounce suppression data: ${e.message}`);
   }
 }
 
+function getOrCreateApplicationsSheet(spreadsheet) {
+  let sheet = spreadsheet.getSheetByName(APPLICATIONS_SHEET_NAME);
+  if (sheet && !isApplicationsSheetSchema(sheet)) {
+    const legacyName = getUniqueSheetName(spreadsheet, 'Legacy Log');
+    sheet.setName(legacyName);
+    vLog(`[SHEET LOG] Existing sheet named "${APPLICATIONS_SHEET_NAME}" used the legacy schema and was preserved as "${legacyName}".`);
+    sheet = null;
+  }
+
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(APPLICATIONS_SHEET_NAME);
+  }
+  ensureApplicationsSheetSchema(sheet);
+
+  // Reconcile once per execution even when Applications already contains data.
+  // This makes the one-row model self-healing if an earlier migration/upsert
+  // omitted legacy positions; existing Applications rows are never overwritten.
+  if (!APPLICATION_RECONCILIATION_COMPLETED) {
+    migrateLegacySpreadsheetLogIfNeeded(spreadsheet, sheet);
+    APPLICATION_RECONCILIATION_COMPLETED = true;
+  }
+  return sheet;
+}
+
+function getOrCreateBounceAuditSheet(spreadsheet) {
+  let sheet = spreadsheet.getSheetByName(BOUNCE_AUDIT_SHEET_NAME);
+  if (!sheet) sheet = spreadsheet.insertSheet(BOUNCE_AUDIT_SHEET_NAME);
+  ensureBounceAuditSheetSchema(sheet);
+  return sheet;
+}
+
+function getUniqueSheetName(spreadsheet, baseName) {
+  if (!spreadsheet.getSheetByName(baseName)) return baseName;
+  let suffix = 2;
+  while (spreadsheet.getSheetByName(`${baseName} ${suffix}`)) suffix++;
+  return `${baseName} ${suffix}`;
+}
+
+function isApplicationsSheetSchema(sheet) {
+  if (!sheet || sheet.getLastRow() === 0 || sheet.getLastColumn() < 8) return false;
+  const headers = sheet.getRange(1, 1, 1, 8).getValues()[0].map(v => String(v || '').trim());
+  return headers[0] === 'Created At' && headers[3] === 'Job ID' && headers[7] === 'Core Status';
+}
+
+function isLegacySpreadsheetLogSheet(sheet) {
+  if (!sheet || sheet.getLastRow() === 0 || sheet.getLastColumn() < 10) return false;
+  const headers = sheet.getRange(1, 1, 1, 10).getValues()[0].map(v => String(v || '').trim());
+  return LEGACY_SPREADSHEET_LOG_HEADERS.slice(0, 10).every((header, idx) => headers[idx] === header);
+}
+
+function ensureApplicationsSheetSchema(sheet) {
+  if (!sheet) throw new Error('Applications sheet is required.');
+  const requiredColumns = APPLICATIONS_SHEET_HEADERS.length;
+  if (sheet.getMaxColumns() < requiredColumns) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredColumns - sheet.getMaxColumns());
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, requiredColumns).setValues([APPLICATIONS_SHEET_HEADERS.slice()]).setFontWeight('bold');
+    return;
+  }
+
+  const current = sheet.getRange(1, 1, 1, requiredColumns).getValues()[0];
+  const filled = current.slice();
+  APPLICATIONS_SHEET_HEADERS.forEach((header, idx) => {
+    const actual = String(current[idx] || '').trim();
+    if (!actual) filled[idx] = header;
+    else if (actual !== header) {
+      throw new Error(`Applications schema mismatch at column ${idx + 1}: found "${actual}", expected "${header}".`);
+    }
+  });
+  if (filled.some((v, idx) => v !== current[idx])) {
+    sheet.getRange(1, 1, 1, requiredColumns).setValues([filled]).setFontWeight('bold');
+  }
+}
+
+function ensureBounceAuditSheetSchema(sheet) {
+  if (!sheet) throw new Error('Bounce Audit sheet is required.');
+  const requiredColumns = BOUNCE_AUDIT_HEADERS.length;
+  if (sheet.getMaxColumns() < requiredColumns) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredColumns - sheet.getMaxColumns());
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, requiredColumns).setValues([BOUNCE_AUDIT_HEADERS.slice()]).setFontWeight('bold');
+    return;
+  }
+  const current = sheet.getRange(1, 1, 1, requiredColumns).getValues()[0];
+  const filled = current.slice();
+  BOUNCE_AUDIT_HEADERS.forEach((header, idx) => {
+    const actual = String(current[idx] || '').trim();
+    if (!actual) filled[idx] = header;
+    else if (actual !== header) throw new Error(`Bounce Audit schema mismatch at column ${idx + 1}: found "${actual}", expected "${header}".`);
+  });
+  if (filled.some((v, idx) => v !== current[idx])) {
+    sheet.getRange(1, 1, 1, requiredColumns).setValues([filled]).setFontWeight('bold');
+  }
+}
+
+function getSheetHeaderMap(sheet) {
+  const lastColumn = Math.max(1, sheet.getLastColumn());
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const map = {};
+  headers.forEach((header, idx) => {
+    const key = String(header || '').trim();
+    if (key) map[key] = idx;
+  });
+  return map;
+}
+
+function getApplicationRowValue(row, headerMap, header) {
+  const idx = headerMap[header];
+  return typeof idx === 'number' ? row[idx] : '';
+}
+
+function setApplicationRowValue(row, headerMap, header, value) {
+  const idx = headerMap[header];
+  if (typeof idx === 'number') row[idx] = value == null ? '' : value;
+}
+
+function normalizeSheetTimestamp(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone() || 'America/New_York', 'yyyy-MM-dd HH:mm:ss');
+  }
+  return String(value || '').trim();
+}
+
+function appendApplicationNote(row, headerMap, note) {
+  const clean = String(note || '').trim();
+  if (!clean) return;
+  const existing = String(getApplicationRowValue(row, headerMap, 'Notes') || '').trim();
+  if (!existing) setApplicationRowValue(row, headerMap, 'Notes', clean);
+  else if (!existing.includes(clean)) setApplicationRowValue(row, headerMap, 'Notes', `${existing} | ${clean}`);
+}
+
+function findApplicationRowIndex(sheet, headerMap, jobId, sourceFileName) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 0;
+  if (jobId && typeof headerMap['Job ID'] === 'number') {
+    const values = sheet.getRange(2, headerMap['Job ID'] + 1, lastRow - 1, 1).getValues();
+    const target = String(jobId).trim().toLowerCase();
+    for (let i = 0; i < values.length; i++) {
+      if (String(values[i][0] || '').trim().toLowerCase() === target) return i + 2;
+    }
+  }
+  if (!jobId && sourceFileName && typeof headerMap['Source File Name'] === 'number') {
+    const values = sheet.getRange(2, headerMap['Source File Name'] + 1, lastRow - 1, 1).getValues();
+    const target = String(sourceFileName).trim().toLowerCase();
+    for (let i = 0; i < values.length; i++) {
+      if (String(values[i][0] || '').trim().toLowerCase() === target) return i + 2;
+    }
+  }
+  return 0;
+}
+
+function getRecipientSlotForEmail(row, headerMap, email, allocateIfMissing) {
+  const normalized = sanitizeEmailAddress(email);
+  if (!normalized) return 0;
+  let firstEmpty = 0;
+  for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+    const existing = sanitizeEmailAddress(getApplicationRowValue(row, headerMap, `Recipient ${slot} Email`));
+    if (existing === normalized) return slot;
+    if (!existing && !firstEmpty) firstEmpty = slot;
+  }
+  return allocateIfMissing ? firstEmpty : 0;
+}
+
+function expandAlignedValues(values, length) {
+  const source = Array.isArray(values) ? values.slice() : [];
+  if (source.length === 1 && length > 1) return Array(length).fill(source[0]);
+  return alignArrayToLength(source, length);
+}
+
+function upsertRecipientFields(row, headerMap, params, deliveryStatuses) {
+  const emails = splitAlignedCsv(params.targetEmail).map(e => sanitizeEmailAddress(e)).filter(Boolean);
+  if (!emails.length) return;
+  const tiers = expandAlignedValues(splitAlignedCsv(params.emailTier), emails.length);
+  const messages = expandAlignedValues(splitAlignedCsv(params.messageId), emails.length);
+  const recipientScores = Array.isArray(params.recipientScores)
+    ? expandAlignedValues(params.recipientScores.map(v => String(v == null ? '' : v)), emails.length)
+    : Array(emails.length).fill(params.score || '');
+  const statuses = deliveryStatuses ? expandAlignedValues(deliveryStatuses, emails.length) : [];
+
+  emails.forEach((email, idx) => {
+    const slot = getRecipientSlotForEmail(row, headerMap, email, true);
+    if (!slot) {
+      appendApplicationNote(row, headerMap, `Recipient capacity exceeded; could not store ${email}.`);
+      return;
+    }
+    setApplicationRowValue(row, headerMap, `Recipient ${slot} Email`, email);
+    const tier = String(tiers[idx] || '').trim();
+    if (tier && !/^(CORE|RENDER|BOUNCE|DUPLICATE)$/i.test(tier)) setApplicationRowValue(row, headerMap, `Recipient ${slot} Tier`, tier);
+    if (recipientScores[idx] !== '') setApplicationRowValue(row, headerMap, `Recipient ${slot} Score`, recipientScores[idx]);
+    if (statuses.length && statuses[idx]) setApplicationRowValue(row, headerMap, `Recipient ${slot} Delivery Status`, statuses[idx]);
+    if (messages[idx]) setApplicationRowValue(row, headerMap, `Recipient ${slot} Message ID`, messages[idx]);
+  });
+}
+
+function deriveDispatchStatusFromApplicationRow(row, headerMap) {
+  const statuses = [];
+  for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+    const email = sanitizeEmailAddress(getApplicationRowValue(row, headerMap, `Recipient ${slot} Email`));
+    const status = String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Delivery Status`) || '').trim().toUpperCase();
+    if (email && status) statuses.push(status);
+  }
+  if (!statuses.length) return '';
+  const unique = Array.from(new Set(statuses));
+  if (unique.length === 1) return unique[0];
+  return LOG_STATUS_PARTIAL_DELIVERY;
+}
+
+function applicationErrorText(messageId) {
+  return String(messageId || '').replace(/^ERROR:\s*/i, '').trim();
+}
+
+function applyApplicationParamsToRow(row, headerMap, params, timestampOverride) {
+  const now = timestampOverride || getCurrentTimestampString();
+  if (!getApplicationRowValue(row, headerMap, 'Created At')) setApplicationRowValue(row, headerMap, 'Created At', now);
+  setApplicationRowValue(row, headerMap, 'Updated At', now);
+  if (params.company) setApplicationRowValue(row, headerMap, 'Company', params.company);
+  if (params.jobId) setApplicationRowValue(row, headerMap, 'Job ID', params.jobId);
+  if (params.jobTitle) setApplicationRowValue(row, headerMap, 'Job Title', params.jobTitle);
+  if (params.jobUrl) setApplicationRowValue(row, headerMap, 'Job URL', params.jobUrl);
+  if (params.companyAddress) setApplicationRowValue(row, headerMap, 'Company Address', params.companyAddress);
+  if (params.score !== undefined && params.score !== '') setApplicationRowValue(row, headerMap, 'Discovery Score', params.score);
+  if (params.sourceFileName && String(params.status || '').toUpperCase() !== LOG_STATUS_DUPLICATE) setApplicationRowValue(row, headerMap, 'Source File Name', params.sourceFileName);
+  setApplicationRowValue(row, headerMap, 'Last Run ID', RUN_METRICS.runId);
+
+  const statusText = String(params.status || 'UNKNOWN').trim();
+  const statusUpper = statusText.toUpperCase();
+
+  if (statusUpper === LOG_STATUS_INGEST_PARSE_FAILED || statusUpper === LOG_STATUS_DOCGEN_FAILED) {
+    setApplicationRowValue(row, headerMap, 'Core Status', statusUpper);
+    setApplicationRowValue(row, headerMap, 'Core Error', applicationErrorText(params.messageId));
+    upsertRecipientFields(row, headerMap, params, null);
+    return;
+  }
+
+  if (statusUpper === LOG_STATUS_CORE_PROCESSED) {
+    setApplicationRowValue(row, headerMap, 'Core Status', LOG_STATUS_CORE_PROCESSED);
+    setApplicationRowValue(row, headerMap, 'Core Completed At', now);
+    setApplicationRowValue(row, headerMap, 'Core Error', '');
+    upsertRecipientFields(row, headerMap, params, null);
+    return;
+  }
+
+  if (statusUpper === LOG_STATUS_DUPLICATE) {
+    const count = Number(getApplicationRowValue(row, headerMap, 'Duplicate Count') || 0) + 1;
+    setApplicationRowValue(row, headerMap, 'Duplicate Count', count);
+    setApplicationRowValue(row, headerMap, 'Last Duplicate Detected At', now);
+    appendApplicationNote(row, headerMap, params.messageId || 'Duplicate source material detected.');
+    return;
+  }
+
+  if (statusUpper === LOG_STATUS_RENDER_COMPLETE || statusUpper === LOG_STATUS_RENDER_DISABLED || statusUpper === LOG_STATUS_RENDER_FAILED) {
+    setApplicationRowValue(row, headerMap, 'Render Status', statusUpper);
+    setApplicationRowValue(row, headerMap, 'Render Completed At', now);
+    setApplicationRowValue(row, headerMap, 'Render Error', statusUpper === LOG_STATUS_RENDER_FAILED ? applicationErrorText(params.messageId) : '');
+    return;
+  }
+
+  const directDispatchStatuses = new Set([
+    LOG_STATUS_NO_DRAFTABLE_ROUTE, LOG_STATUS_DISPATCH_DISABLED, LOG_STATUS_DISPATCH_FAILED,
+    LOG_STATUS_SUPPRESSED_BOUNCE, 'SENT', 'DRAFTED', 'BOUNCED', LOG_STATUS_PARTIAL_DELIVERY
+  ]);
+  const statusParts = splitAlignedCsv(statusUpper);
+  const isDispatch = statusParts.some(s => directDispatchStatuses.has(s));
+  if (isDispatch) {
+    upsertRecipientFields(row, headerMap, params, statusParts);
+    let derived = deriveDispatchStatusFromApplicationRow(row, headerMap);
+    if (!derived && statusParts.length === 1) derived = statusParts[0];
+    setApplicationRowValue(row, headerMap, 'Dispatch Status', derived || statusUpper);
+    setApplicationRowValue(row, headerMap, 'Dispatch Completed At', now);
+    if (statusParts.includes(LOG_STATUS_DISPATCH_FAILED)) {
+      const emails = splitAlignedCsv(params.targetEmail).map(e => sanitizeEmailAddress(e)).filter(Boolean);
+      const alignedStatuses = expandAlignedValues(statusParts, emails.length || statusParts.length);
+      const alignedMessages = expandAlignedValues(splitAlignedCsv(params.messageId), emails.length || statusParts.length);
+      const errors = alignedStatuses.map((status, idx) => status === LOG_STATUS_DISPATCH_FAILED ? applicationErrorText(alignedMessages[idx]) : '').filter(Boolean);
+      setApplicationRowValue(row, headerMap, 'Dispatch Error', errors.join(' | '));
+    } else {
+      setApplicationRowValue(row, headerMap, 'Dispatch Error', '');
+    }
+    return;
+  }
+
+  appendApplicationNote(row, headerMap, `Unrecognized stage status: ${statusText}`);
+}
+
+function upsertApplicationRecordOnSheet(sheet, params, timestampOverride) {
+  ensureApplicationsSheetSchema(sheet);
+  const headerMap = getSheetHeaderMap(sheet);
+  const sourceKey = params.sourceFileName || ((params.status === LOG_STATUS_INGEST_PARSE_FAILED && !params.jobId) ? params.jobTitle : '');
+  let rowIndex = findApplicationRowIndex(sheet, headerMap, params.jobId, sourceKey);
+  const lastColumn = sheet.getLastColumn();
+  let row = rowIndex ? sheet.getRange(rowIndex, 1, 1, lastColumn).getValues()[0] : Array(lastColumn).fill('');
+  applyApplicationParamsToRow(row, headerMap, params, timestampOverride);
+  if (!rowIndex) rowIndex = sheet.getLastRow() + 1;
+  sheet.getRange(rowIndex, 1, 1, row.length).setValues([row]);
+  vLog(`[SHEET LOG] Upserted Applications row ${rowIndex} | core=${getApplicationRowValue(row, headerMap, 'Core Status') || ''} dispatch=${getApplicationRowValue(row, headerMap, 'Dispatch Status') || ''} company="${params.company || ''}" jobId="${params.jobId || ''}"`);
+  return true;
+}
+
+function ensureCustomApplicationHeaders(applicationsSheet, customHeaders) {
+  const cleanHeaders = (customHeaders || []).map(v => String(v || '').trim()).filter(Boolean);
+  if (!cleanHeaders.length) return;
+  let headers = applicationsSheet.getRange(1, 1, 1, applicationsSheet.getLastColumn()).getValues()[0].map(v => String(v || '').trim());
+  cleanHeaders.forEach(header => {
+    if (headers.includes(header)) return;
+    const col = headers.length + 1;
+    if (applicationsSheet.getMaxColumns() < col) applicationsSheet.insertColumnsAfter(applicationsSheet.getMaxColumns(), col - applicationsSheet.getMaxColumns());
+    applicationsSheet.getRange(1, col).setValue(header).setFontWeight('bold');
+    headers.push(header);
+  });
+}
+
+function migrateLegacySpreadsheetLogIfNeeded(spreadsheet, applicationsSheet) {
+  const legacySheet = spreadsheet.getSheets().find(sheet =>
+    sheet.getName() !== APPLICATIONS_SHEET_NAME &&
+    sheet.getName() !== BOUNCE_AUDIT_SHEET_NAME &&
+    isLegacySpreadsheetLogSheet(sheet)
+  );
+  if (!legacySheet || legacySheet.getLastRow() <= 1) return { addedApplications: 0, migratedBounceAudits: 0 };
+
+  const wasEmpty = applicationsSheet.getLastRow() <= 1;
+  const legacyLastColumn = legacySheet.getLastColumn();
+  const legacyHeaders = legacySheet.getRange(1, 1, 1, legacyLastColumn).getValues()[0].map(v => String(v || '').trim());
+  const customHeaders = legacyHeaders.slice(LEGACY_SPREADSHEET_LOG_HEADERS.length).filter(Boolean);
+  ensureCustomApplicationHeaders(applicationsSheet, customHeaders);
+  const appHeaders = applicationsSheet.getRange(1, 1, 1, applicationsSheet.getLastColumn()).getValues()[0].map(v => String(v || '').trim());
+  const appHeaderMap = {};
+  appHeaders.forEach((h, i) => { if (h) appHeaderMap[h] = i; });
+
+  const values = legacySheet.getRange(2, 1, legacySheet.getLastRow() - 1, legacyLastColumn).getValues();
+  const groups = new Map();
+  const groupOrder = [];
+  const bounceAuditRows = [];
+
+  values.forEach((legacyRow, rowOffset) => {
+    const timestamp = normalizeSheetTimestamp(legacyRow[0]) || getCurrentTimestampString();
+    const status = String(legacyRow[1] || '').trim();
+    const company = String(legacyRow[2] || '').trim();
+    const jobId = String(legacyRow[3] || '').trim();
+    const jobTitle = String(legacyRow[4] || '').trim();
+    const targetEmail = String(legacyRow[5] || '').trim();
+    const emailTier = String(legacyRow[6] || '').trim();
+    const score = legacyRow[7] == null ? '' : legacyRow[7];
+    const messageId = String(legacyRow[8] || '').trim();
+    const jobUrl = String(legacyRow[9] || '').trim();
+    const bounceType = String(legacyRow[10] || '').trim();
+    const bounceCode = String(legacyRow[11] || '').trim();
+    const bounceSuppressed = String(legacyRow[12] || '').trim();
+    const bounceMessageId = String(legacyRow[13] || '').trim();
+    const bounceDetectedAt = normalizeSheetTimestamp(legacyRow[14]);
+
+    if (status.toUpperCase() === LOG_STATUS_BOUNCE_UNMATCHED) {
+      bounceAuditRows.push({
+        detectedAt: bounceDetectedAt || timestamp,
+        gmailMessageId: bounceMessageId,
+        gmailThreadId: '',
+        status: LOG_STATUS_BOUNCE_UNMATCHED,
+        bounceType,
+        bounceCode,
+        bounceSuppressed: bounceSuppressed || 'NO',
+        targetEmail,
+        subject: jobTitle || 'Migrated unmatched bounce',
+        diagnostic: '',
+        archivedAt: '',
+        notes: `Migrated from legacy sheet "${legacySheet.getName()}" row ${rowOffset + 2}.`
+      });
+      return;
+    }
+
+    const sourceFileName = !jobId && status.toUpperCase() === LOG_STATUS_INGEST_PARSE_FAILED ? jobTitle : '';
+    const key = jobId ? `JOB:${jobId.toLowerCase()}` : `FILE:${(sourceFileName || jobTitle || rowOffset).toString().toLowerCase()}`;
+    if (!groups.has(key)) {
+      groups.set(key, Array(appHeaders.length).fill(''));
+      groupOrder.push(key);
+    }
+    const row = groups.get(key);
+    applyApplicationParamsToRow(row, appHeaderMap, {
+      status, company, jobId, jobTitle, targetEmail, emailTier, score, messageId, jobUrl, sourceFileName
+    }, timestamp);
+
+    const emails = splitAlignedCsv(targetEmail).map(e => sanitizeEmailAddress(e)).filter(Boolean);
+    const bounceTypes = expandAlignedValues(splitAlignedCsv(bounceType), emails.length);
+    const bounceCodes = expandAlignedValues(splitAlignedCsv(bounceCode), emails.length);
+    const bounceFlags = expandAlignedValues(splitAlignedCsv(bounceSuppressed), emails.length);
+    const bounceIds = expandAlignedValues(splitAlignedCsv(bounceMessageId), emails.length);
+    const bounceTimes = expandAlignedValues(splitAlignedCsv(bounceDetectedAt), emails.length);
+    emails.forEach((email, idx) => {
+      const slot = getRecipientSlotForEmail(row, appHeaderMap, email, true);
+      if (!slot) return;
+      if (bounceTypes[idx]) setApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Bounce Type`, bounceTypes[idx]);
+      if (bounceCodes[idx]) setApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Bounce Code`, bounceCodes[idx]);
+      let flag = bounceFlags[idx];
+      const deliveryStatus = String(getApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Delivery Status`) || '').toUpperCase();
+      if (!flag && deliveryStatus === 'BOUNCED') flag = 'YES';
+      if (flag) setApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Bounce Suppressed`, flag);
+      if (bounceIds[idx]) setApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Bounce Message ID`, bounceIds[idx]);
+      if (bounceTimes[idx]) setApplicationRowValue(row, appHeaderMap, `Recipient ${slot} Bounce Detected At`, bounceTimes[idx]);
+    });
+
+    customHeaders.forEach((header, customIdx) => {
+      const legacyValue = legacyRow[LEGACY_SPREADSHEET_LOG_HEADERS.length + customIdx];
+      if (legacyValue !== '' && legacyValue != null && typeof appHeaderMap[header] === 'number') row[appHeaderMap[header]] = legacyValue;
+    });
+    appendApplicationNote(row, appHeaderMap, `Migrated from legacy sheet "${legacySheet.getName()}".`);
+  });
+
+  groupOrder.forEach(key => {
+    const row = groups.get(key);
+    const coreStatus = String(getApplicationRowValue(row, appHeaderMap, 'Core Status') || '').toUpperCase();
+    if (!coreStatus) {
+      const dispatchStatus = String(getApplicationRowValue(row, appHeaderMap, 'Dispatch Status') || '').toUpperCase();
+      const safeLegacyCoreEvidence = new Set(['SENT', 'DRAFTED', 'BOUNCED', LOG_STATUS_PARTIAL_DELIVERY]);
+      if (safeLegacyCoreEvidence.has(dispatchStatus)) {
+        setApplicationRowValue(row, appHeaderMap, 'Core Status', LOG_STATUS_CORE_PROCESSED);
+        setApplicationRowValue(row, appHeaderMap, 'Core Completed At', getApplicationRowValue(row, appHeaderMap, 'Updated At'));
+      }
+    }
+  });
+
+  // Build a durable identity set from Applications and only append missing
+  // legacy records. Never overwrite a newer Applications row with old data.
+  const existingKeys = new Set();
+  if (applicationsSheet.getLastRow() > 1) {
+    const existingRows = applicationsSheet.getRange(2, 1, applicationsSheet.getLastRow() - 1, applicationsSheet.getLastColumn()).getValues();
+    existingRows.forEach((row, idx) => {
+      const jobId = String(getApplicationRowValue(row, appHeaderMap, 'Job ID') || '').trim();
+      const sourceFileName = String(getApplicationRowValue(row, appHeaderMap, 'Source File Name') || '').trim();
+      const jobTitle = String(getApplicationRowValue(row, appHeaderMap, 'Job Title') || '').trim();
+      if (jobId) existingKeys.add(`JOB:${jobId.toLowerCase()}`);
+      else if (sourceFileName || jobTitle) existingKeys.add(`FILE:${(sourceFileName || jobTitle || idx).toLowerCase()}`);
+    });
+  }
+
+  const missingKeys = groupOrder.filter(key => !existingKeys.has(key));
+  if (missingKeys.length) {
+    applicationsSheet.getRange(applicationsSheet.getLastRow() + 1, 1, missingKeys.length, appHeaders.length)
+      .setValues(missingKeys.map(key => groups.get(key)));
+  }
+
+  let migratedBounceAudits = 0;
+  // Historical unmatched events are copied on first migration. Subsequent
+  // reconciliation passes focus on missing application rows; this avoids
+  // repeatedly reproducing legacy audit entries that have no message ID.
+  if (wasEmpty && bounceAuditRows.length) {
+    const auditSheet = getOrCreateBounceAuditSheet(spreadsheet);
+    bounceAuditRows.forEach(params => {
+      if (appendBounceAuditRecord(params, auditSheet)) migratedBounceAudits++;
+    });
+  }
+
+  if (wasEmpty) {
+    vLog(`[SHEET LOG] Migrated ${missingKeys.length} application record(s) and ${migratedBounceAudits} unmatched bounce audit event(s) from legacy sheet "${legacySheet.getName()}". Legacy data was left untouched.`);
+  } else if (missingKeys.length) {
+    vLog(`[SHEET LOG] Reconciled ${missingKeys.length} missing application record(s) from legacy sheet "${legacySheet.getName()}". Existing Applications rows were left unchanged.`);
+  }
+  return { addedApplications: missingKeys.length, migratedBounceAudits };
+}
+
+function loadBounceTrackingJobs(sheet, includeTerminalRecipients) {
+  ensureApplicationsSheetSchema(sheet);
+  const headerMap = getSheetHeaderMap(sheet);
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  const jobs = [];
+  rows.forEach((row, idx) => {
+    const job = {
+      rowIndex: idx + 2,
+      rowValues: row,
+      headerMap,
+      jobId: String(getApplicationRowValue(row, headerMap, 'Job ID') || '').trim().toLowerCase(),
+      jobTitle: String(getApplicationRowValue(row, headerMap, 'Job Title') || '').trim().toLowerCase(),
+      emails: [], statuses: [], bounceTypes: [], bounceCodes: [], bounceSuppressed: [], bounceMessageIds: [], bounceDetectedAt: []
+    };
+    for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+      job.emails.push(sanitizeEmailAddress(getApplicationRowValue(row, headerMap, `Recipient ${slot} Email`)));
+      job.statuses.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Delivery Status`) || '').trim().toUpperCase());
+      job.bounceTypes.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Type`) || '').trim());
+      job.bounceCodes.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Code`) || '').trim());
+      job.bounceSuppressed.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Suppressed`) || '').trim());
+      job.bounceMessageIds.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Message ID`) || '').trim());
+      job.bounceDetectedAt.push(String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Detected At`) || '').trim());
+    }
+    if (job.emails.some((email, emailIdx) => email && (includeTerminalRecipients || isBounceRecipientTrackable(job, emailIdx)))) jobs.push(job);
+  });
+  return jobs;
+}
+
 /**
- * Persists a single bounced address to the in-memory cache and script properties store.
+ * Self-heals historical false-positive policy labels when an authoritative
+ * enhanced status code is a non-policy temporary 4.x.x result (for example
+ * 4.4.1). This keeps already-archived audit evidence accurate without needing
+ * the Gmail message to be re-opened. 4.7.x is deliberately excluded because
+ * it can legitimately represent temporary policy/security enforcement.
  */
+function normalizeHistoricalTemporaryBounceClassifications(applicationsSheet, bounceAuditSheet) {
+  let applicationCorrections = 0;
+  let auditCorrections = 0;
+
+  if (applicationsSheet && applicationsSheet.getLastRow() > 1) {
+    const headerMap = getSheetHeaderMap(applicationsSheet);
+    const rowCount = applicationsSheet.getLastRow() - 1;
+    const colCount = applicationsSheet.getLastColumn();
+    const rows = applicationsSheet.getRange(2, 1, rowCount, colCount).getValues();
+    let changed = false;
+
+    rows.forEach(row => {
+      let rowChanged = false;
+      for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+        const typeHeader = `Recipient ${slot} Bounce Type`;
+        const codeHeader = `Recipient ${slot} Bounce Code`;
+        const suppressedHeader = `Recipient ${slot} Bounce Suppressed`;
+        const type = String(getApplicationRowValue(row, headerMap, typeHeader) || '').trim().toUpperCase();
+        const code = String(getApplicationRowValue(row, headerMap, codeHeader) || '').trim();
+        const enhanced = extractEnhancedStatusCode(code);
+        if (type !== BOUNCE_TYPES.POLICY_SPAM_SECURITY.id || !/^4\.(?!7\.)/.test(enhanced)) continue;
+
+        setApplicationRowValue(row, headerMap, typeHeader, BOUNCE_TYPES.TEMPORARY_DELIVERY.id);
+        setApplicationRowValue(row, headerMap, suppressedHeader, 'NO');
+        rowChanged = true;
+        applicationCorrections++;
+      }
+      if (rowChanged) {
+        setApplicationRowValue(row, headerMap, 'Updated At', getCurrentTimestampString());
+        changed = true;
+      }
+    });
+
+    if (changed) applicationsSheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  if (bounceAuditSheet && bounceAuditSheet.getLastRow() > 1) {
+    const headerMap = getSheetHeaderMap(bounceAuditSheet);
+    const rows = bounceAuditSheet.getRange(2, 1, bounceAuditSheet.getLastRow() - 1, bounceAuditSheet.getLastColumn()).getValues();
+    let changed = false;
+
+    rows.forEach(row => {
+      const type = String(row[headerMap['Bounce Type']] || '').trim().toUpperCase();
+      const code = String(row[headerMap['Bounce Code']] || '').trim();
+      const enhanced = extractEnhancedStatusCode(code);
+      if (type !== BOUNCE_TYPES.POLICY_SPAM_SECURITY.id || !/^4\.(?!7\.)/.test(enhanced)) return;
+
+      row[headerMap['Bounce Type']] = BOUNCE_TYPES.TEMPORARY_DELIVERY.id;
+      row[headerMap['Bounce Suppressed']] = 'NO';
+      if (typeof headerMap['Notes'] === 'number') {
+        const correctionNote = `Classification normalized from POLICY_SPAM_SECURITY to TEMPORARY_DELIVERY based on authoritative ${enhanced} status.`;
+        const existing = String(row[headerMap['Notes']] || '').trim();
+        if (!existing.includes(correctionNote)) row[headerMap['Notes']] = existing ? `${existing} | ${correctionNote}` : correctionNote;
+      }
+      changed = true;
+      auditCorrections++;
+    });
+
+    if (changed) bounceAuditSheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  const total = applicationCorrections + auditCorrections;
+  if (total > 0) {
+    vLog(`[BOUNCE TRACKER] Normalized ${total} historical temporary bounce classification(s) (${applicationCorrections} Applications; ${auditCorrections} Bounce Audit).`);
+  }
+  return total;
+}
+
+function getBounceTypeDefinitionById(typeId) {
+  const target = String(typeId || '').trim().toUpperCase();
+  return Object.values(BOUNCE_TYPES).find(def => def.id === target) || null;
+}
+
+function buildBounceClassificationFromAuditRow(typeId, bounceCode, diagnostic) {
+  const typeDef = getBounceTypeDefinitionById(typeId);
+  if (!typeDef) return null;
+  const code = String(bounceCode || '').trim();
+  const diagnosticText = String(diagnostic || '').trim();
+  return buildBounceClassification(typeDef, code, extractEnhancedStatusCode(`${code}\n${diagnosticText}`), `${code}\n${diagnosticText}`);
+}
+
+/**
+ * Replays unresolved Bounce Audit events after Applications reconciliation.
+ * A previously unmatched DSN can become safely correlatable when its legacy
+ * application row is restored. Reconciliation mutates the application row,
+ * marks the audit event BOUNCE_RECONCILED, and never requires Gmail re-scan.
+ */
+function reconcileBounceAuditEvents(applicationsSheet, bounceAuditSheet) {
+  if (!applicationsSheet || !bounceAuditSheet || bounceAuditSheet.getLastRow() <= 1) return 0;
+
+  const auditHeaderMap = getSheetHeaderMap(bounceAuditSheet);
+  const auditRows = bounceAuditSheet.getRange(2, 1, bounceAuditSheet.getLastRow() - 1, bounceAuditSheet.getLastColumn()).getValues();
+  const applicationJobs = loadBounceTrackingJobs(applicationsSheet, true);
+  if (!applicationJobs.length) return 0;
+
+  let reconciled = 0;
+  let auditChanged = false;
+  auditRows.forEach((auditRow, auditOffset) => {
+    const status = String(auditRow[auditHeaderMap['Status']] || '').trim().toUpperCase();
+    if (status !== LOG_STATUS_BOUNCE_UNMATCHED) return;
+
+    const classification = buildBounceClassificationFromAuditRow(
+      auditRow[auditHeaderMap['Bounce Type']],
+      auditRow[auditHeaderMap['Bounce Code']],
+      auditRow[auditHeaderMap['Diagnostic']]
+    );
+    if (!classification) return;
+
+    const targetEmailText = String(auditRow[auditHeaderMap['Target Email']] || '').trim();
+    const recipientHints = splitAlignedCsv(targetEmailText).map(sanitizeEmailAddress).filter(Boolean);
+    const searchable = `${auditRow[auditHeaderMap['Subject']] || ''}\n${auditRow[auditHeaderMap['Diagnostic']] || ''}\n${targetEmailText}`.toLowerCase();
+    const resolvedTargets = resolveBounceTargets(applicationJobs, searchable, recipientHints, true);
+    if (!resolvedTargets.length) return;
+
+    const suppressRecipient = shouldSuppressBounceRecipient(classification);
+    const detectedAt = normalizeSheetTimestamp(auditRow[auditHeaderMap['Detected At']]) || getCurrentTimestampString();
+    const messageId = String(auditRow[auditHeaderMap['Gmail Message ID']] || '').trim();
+    const matchedLabels = [];
+
+    resolvedTargets.forEach(target => {
+      const job = target.job;
+      const emailIndex = target.emailIndex;
+      const email = job.emails[emailIndex];
+      if (!email) return;
+
+      const existingStatus = String(job.statuses[emailIndex] || '').toUpperCase();
+      const existingSuppressed = String(job.bounceSuppressed[emailIndex] || '').toUpperCase();
+      const existingBounceMessageId = String(job.bounceMessageIds[emailIndex] || '').trim();
+      const shouldApplyToRecipient = existingStatus !== 'BOUNCED' ||
+        !existingBounceMessageId ||
+        (existingSuppressed !== 'YES' && suppressRecipient);
+
+      // Do not replace already-durable permanent bounce evidence with an older
+      // audit event. A replay may still reconcile the audit row to that
+      // application without mutating the recipient slot.
+      if (shouldApplyToRecipient) {
+        persistMatchedBounceToApplication(applicationsSheet, job, emailIndex, classification, suppressRecipient, messageId, detectedAt);
+      }
+      if (suppressRecipient) persistBouncedAddress(email);
+      matchedLabels.push(`${job.jobId || `row:${job.rowIndex}`} -> ${email}${shouldApplyToRecipient ? '' : ' (already terminal)'}`);
+    });
+
+    if (!matchedLabels.length) return;
+    auditRow[auditHeaderMap['Status']] = LOG_STATUS_BOUNCE_RECONCILED;
+    auditRow[auditHeaderMap['Bounce Suppressed']] = suppressRecipient ? 'YES' : 'NO';
+    if (typeof auditHeaderMap['Run ID'] === 'number') auditRow[auditHeaderMap['Run ID']] = RUN_METRICS.runId;
+    if (typeof auditHeaderMap['Notes'] === 'number') {
+      const note = `Reconciled to Applications: ${matchedLabels.join('; ')}.`;
+      const existing = String(auditRow[auditHeaderMap['Notes']] || '').trim();
+      auditRow[auditHeaderMap['Notes']] = existing && !existing.includes(note) ? `${existing} | ${note}` : (existing || note);
+    }
+    auditChanged = true;
+    reconciled++;
+  });
+
+  if (auditChanged) {
+    bounceAuditSheet.getRange(2, 1, auditRows.length, auditRows[0].length).setValues(auditRows);
+    vLog(`[BOUNCE TRACKER] Reconciled ${reconciled} previously unmatched Bounce Audit event(s) against Applications.`);
+  }
+  return reconciled;
+}
+
+function getLoggedBounceMessageIds(applicationsSheet, bounceAuditSheet) {
+  const ids = new Set();
+  const headerMap = getSheetHeaderMap(applicationsSheet);
+  if (applicationsSheet.getLastRow() > 1) {
+    const rows = applicationsSheet.getRange(2, 1, applicationsSheet.getLastRow() - 1, applicationsSheet.getLastColumn()).getValues();
+    rows.forEach(row => {
+      for (let slot = 1; slot <= MAX_APPLICATION_RECIPIENT_SLOTS; slot++) {
+        const id = String(getApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Message ID`) || '').trim();
+        if (id) ids.add(id);
+      }
+    });
+  }
+  if (bounceAuditSheet && bounceAuditSheet.getLastRow() > 1) {
+    const auditHeaderMap = getSheetHeaderMap(bounceAuditSheet);
+    const col = auditHeaderMap['Gmail Message ID'];
+    if (typeof col === 'number') {
+      bounceAuditSheet.getRange(2, col + 1, bounceAuditSheet.getLastRow() - 1, 1).getValues().forEach(row => {
+        const id = String(row[0] || '').trim();
+        if (id) ids.add(id);
+      });
+    }
+  }
+  return ids;
+}
+
+function persistMatchedBounceToApplication(sheet, job, emailIndex, classification, suppressRecipient, messageId, detectedAt) {
+  const row = job.rowValues;
+  const headerMap = job.headerMap;
+  const slot = emailIndex + 1;
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Delivery Status`, 'BOUNCED');
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Type`, classification.type);
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Code`, classification.statusCode || '');
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Suppressed`, suppressRecipient ? 'YES' : 'NO');
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Message ID`, messageId || '');
+  setApplicationRowValue(row, headerMap, `Recipient ${slot} Bounce Detected At`, detectedAt || getCurrentTimestampString());
+  setApplicationRowValue(row, headerMap, 'Dispatch Status', deriveDispatchStatusFromApplicationRow(row, headerMap) || 'BOUNCED');
+  setApplicationRowValue(row, headerMap, 'Updated At', detectedAt || getCurrentTimestampString());
+  setApplicationRowValue(row, headerMap, 'Last Run ID', RUN_METRICS.runId);
+  sheet.getRange(job.rowIndex, 1, 1, row.length).setValues([row]);
+
+  job.statuses[emailIndex] = 'BOUNCED';
+  job.bounceTypes[emailIndex] = classification.type;
+  job.bounceCodes[emailIndex] = classification.statusCode || '';
+  job.bounceSuppressed[emailIndex] = suppressRecipient ? 'YES' : 'NO';
+  job.bounceMessageIds[emailIndex] = messageId || '';
+  job.bounceDetectedAt[emailIndex] = detectedAt || '';
+}
+
+function appendBounceAuditRecord(params, sheet) {
+  ensureBounceAuditSheetSchema(sheet);
+  const messageId = String(params.gmailMessageId || '').trim();
+  if (messageId && sheet.getLastRow() > 1) {
+    const headerMap = getSheetHeaderMap(sheet);
+    const col = headerMap['Gmail Message ID'];
+    if (typeof col === 'number') {
+      const existing = sheet.getRange(2, col + 1, sheet.getLastRow() - 1, 1).getValues();
+      if (existing.some(row => String(row[0] || '').trim() === messageId)) return true;
+    }
+  }
+  const row = [
+    params.detectedAt || getCurrentTimestampString(),
+    messageId,
+    params.gmailThreadId || '',
+    params.status || LOG_STATUS_BOUNCE_UNMATCHED,
+    params.bounceType || '',
+    params.bounceCode || '',
+    params.bounceSuppressed || 'NO',
+    params.targetEmail || '',
+    params.subject || '',
+    params.diagnostic || '',
+    params.archivedAt || '',
+    RUN_METRICS.runId,
+    params.notes || ''
+  ];
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  return true;
+}
+
+function markBounceAuditMessagesArchived(sheet, messageIds, archivedAt) {
+  const ids = new Set((messageIds || []).map(v => String(v || '').trim()).filter(Boolean));
+  if (!ids.size || !sheet || sheet.getLastRow() <= 1) return;
+  const headerMap = getSheetHeaderMap(sheet);
+  const messageCol = headerMap['Gmail Message ID'];
+  const archivedCol = headerMap['Archived At'];
+  if (typeof messageCol !== 'number' || typeof archivedCol !== 'number') return;
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  let changed = false;
+  values.forEach(row => {
+    const id = String(row[messageCol] || '').trim();
+    if (ids.has(id) && !row[archivedCol]) {
+      row[archivedCol] = archivedAt;
+      changed = true;
+    }
+  });
+  if (changed) sheet.getRange(2, 1, values.length, values[0].length).setValues(values);
+}
+
+function getProcessedJobIds(config) {
+  vLog('[PRE-FILTER] Compiling list of previously processed Job IDs from Applications...');
+  if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) return new Set();
+  try {
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetLogId);
+    const sheet = getOrCreateApplicationsSheet(spreadsheet);
+    const headerMap = getSheetHeaderMap(sheet);
+    const processed = new Set();
+    if (sheet.getLastRow() > 1) {
+      const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+      rows.forEach(row => {
+        const jobId = String(getApplicationRowValue(row, headerMap, 'Job ID') || '').trim();
+        const coreStatus = String(getApplicationRowValue(row, headerMap, 'Core Status') || '').trim().toUpperCase();
+        if (jobId && coreStatus === LOG_STATUS_CORE_PROCESSED) processed.add(jobId);
+      });
+    }
+    vLog(`  - [PRE-FILTER] Detected ${processed.size} historically processed Job IDs.`);
+    return processed;
+  } catch (e) {
+    vLog(`  - [PRE-FILTER] Warning: Failed to populate processed cache: ${e.message}`);
+    return new Set();
+  }
+}
+
+function appendToSpreadsheetLog(params, config) {
+  vLog(`[SHEET LOG] Building one-row application update for Job ID: ${params.jobId || ''}...`);
+  if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) {
+    vLog('[SHEET LOG] Sheet logging bypassed.');
+    return false;
+  }
+  try {
+    const spreadsheet = SpreadsheetApp.openById(config.spreadsheetLogId);
+    if (String(params.status || '').toUpperCase() === LOG_STATUS_BOUNCE_UNMATCHED) {
+      const auditSheet = getOrCreateBounceAuditSheet(spreadsheet);
+      return appendBounceAuditRecord({
+        detectedAt: params.bounceDetectedAt || getCurrentTimestampString(),
+        gmailMessageId: params.bounceMessageId || '',
+        gmailThreadId: '',
+        status: LOG_STATUS_BOUNCE_UNMATCHED,
+        bounceType: params.bounceType || '',
+        bounceCode: params.bounceCode || '',
+        bounceSuppressed: params.bounceSuppressed || 'NO',
+        targetEmail: params.targetEmail || '',
+        subject: params.jobTitle || '',
+        diagnostic: params.messageId || '',
+        notes: 'Compatibility path from appendToSpreadsheetLog.'
+      }, auditSheet);
+    }
+    const sheet = getOrCreateApplicationsSheet(spreadsheet);
+    return upsertApplicationRecordOnSheet(sheet, params);
+  } catch (e) {
+    vLog(`  - [SHEET LOG] Warning: Applications upsert failed: ${e.message}`);
+    return false;
+  }
+}
 function persistBouncedAddress(email) {
   if (!email) return;
   persistBouncedAddresses([email]);
@@ -761,91 +2025,8 @@ function getBouncedAddressSet() {
 }
 
 /**
- * Retrieves a set of Job IDs that have already been processed and logged.
- * Optimized to fetch only necessary columns via batch getValues().
- */
-function getProcessedJobIds(config) {
-  vLog('[PRE-FILTER] Compiling list of previously resolved Job IDs from sheet...');
-  if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) {
-    vLog('[PRE-FILTER] Logging is currently bypassed. Returning blank exception list.');
-    return new Set();
-  }
-
-  try {
-    const sheet = SpreadsheetApp.openById(config.spreadsheetLogId).getSheets()[0];
-    const lastRow = sheet.getLastRow();
-    
-    if (lastRow <= 1) {
-      vLog('[PRE-FILTER] Spreadsheet is empty or contains only headers. Proceeding with clear cache.');
-      return new Set();
-    }
-
-    // Fetch Status (Col B) and Job ID (Col D)
-    const data = sheet.getRange(2, 2, lastRow - 1, 3).getValues();
-    const processed = new Set();
-
-    for (let i = 0; i < data.length; i++) {
-      const statusStr = String(data[i][0] || '').trim().toUpperCase();
-      const jobId = String(data[i][2] || '').trim();
-      const statuses = statusStr.split(',').map(s => s.trim());
-
-      // Treat any completed terminal state as processed to prevent duplicate retries.
-      if (jobId && (statuses.includes('SENT') || statuses.includes('DRAFTED') || statuses.includes('BOUNCED'))) {
-        processed.add(jobId);
-      }
-    }
-    
-    vLog(`  - [PRE-FILTER] Detected ${processed.size} historically processed Job IDs.`);
-    return processed;
-  } catch (e) {
-    vLog(`  - [PRE-FILTER] Warning: Failed to populate resolved cache: ${e.message}`);
-    return new Set();
-  }
-}
-
-/**
- * Appends a log entry to the configured Google Sheet using fast batch setValues.
- */
-function appendToSpreadsheetLog(params, config) {
-  vLog(`[SHEET LOG] Building dispatch logging packet for Job ID: ${params.jobId}...`);
-  if (!ENABLE_SPREADSHEET_LOGGING || !config.spreadsheetLogId) {
-    vLog('[SHEET LOG] Sheet logging bypassed. skipping record entry.');
-    return;
-  }
-
-  try {
-    const sheet = SpreadsheetApp.openById(config.spreadsheetLogId).getSheets()[0];
-
-    if (sheet.getLastRow() === 0) {
-      vLog('[SHEET LOG] Targeting blank log sheet. Initializing default column structure...');
-      const headers =['Timestamp', 'Status', 'Company', 'Job ID', 'Job Title', 'Target Email', 'Email Tier', 'Score', 'Draft/Message ID', 'Job URL'];
-      sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
-    }
-
-    const newRow =[
-      getCurrentTimestampString(),
-      params.status || 'UNKNOWN',
-      params.company || '',
-      params.jobId || '',
-      params.jobTitle || '',
-      params.targetEmail || '',
-      params.emailTier || '',
-      params.score || '',
-      params.messageId || '',
-      params.jobUrl || ''
-    ];
-
-    vLog(`[SHEET LOG] Appended row ${sheet.getLastRow() + 1} | status=${params.status || 'UNKNOWN'} company="${params.company || ''}" targetEmail="${params.targetEmail || ''}"`);
-    sheet.getRange(sheet.getLastRow() + 1, 1, 1, newRow.length).setValues([newRow]);
-    vLog(`[SHEET LOG] Successfully verified logging entry.`);
-  } catch (e) {
-    vLog(`  - [SHEET LOG] Warning: Appending to spreadsheet failed: ${e.message}`);
-  }
-}
-
-/**
- * Parses the specific markdown format of the material files.
- * Uses a robust first-occurrence regex split and safely amputates trailing tool inputs.
+ * Retrieves Job IDs whose core material generation already completed. Dispatch
+ * and render outcomes are deliberately treated independently from DOCGEN success.
  */
 function parseMarkdown(fileContent) {
   vLog('[PARSER] Initiating markdown syntactic decomposition...');
@@ -947,67 +2128,184 @@ function extractBoldMetadataField(metadataBlock, fieldName) {
 }
 
 /**
- * Format corporate address block matching standard layouts
+ * Formats a corporate mailing address as a conservative USPS-style single line:
+ *   123 MAIN ST APT 4B, NEW YORK NY 10001
+ * Company/contact labels are intentionally excluded because the cover-letter template
+ * already has a dedicated company placeholder.
  */
 function formatCorporateHQAddressBlock(metadata, rawAddress, companyName) {
-  vLog(`[ADDRESS FORMATTING] Starting HQ address block compilation...`);
-  vLog(`[ADDRESS FORMATTING] Input rawAddress: "${rawAddress}"`);
-  vLog(`[ADDRESS FORMATTING] Input companyName: "${companyName}"`);
+  return formatUspsSingleLineAddress(rawAddress, companyName, metadata);
+}
 
-  const managerName = getMetadataValue(metadata, 'Hiring Manager Name');
-  const recruiterName = getMetadataValue(metadata, 'Recruiter Name');
-  
-  // 1. [Hiring Manager Name / Department, if known]
-  let contactLine = '';
-  if (managerName) {
-    contactLine = managerName;
-    vLog(`[ADDRESS FORMATTING] Contact entity identified (Hiring Manager Name): "${contactLine}"`);
-  } else if (recruiterName) {
-    contactLine = recruiterName;
-    vLog(`[ADDRESS FORMATTING] Contact entity identified (Recruiter Name): "${contactLine}"`);
+function formatUspsSingleLineAddress(rawAddress, companyName, metadata) {
+  vLog('[ADDRESS FORMATTING] Starting USPS single-line address normalization...');
+  vLog(`[ADDRESS FORMATTING] Input rawAddress: "${rawAddress || ''}"`);
+
+  let raw = decodeCommonHtmlEntities(String(rawAddress || ''))
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[\t\u00A0]+/g, ' ')
+    .trim();
+  if (!raw) return '';
+
+  const removableLabels = [
+    companyName,
+    getMetadataValue(metadata, 'Canonical Company'),
+    getMetadataValue(metadata, 'Hiring Manager Name'),
+    getMetadataValue(metadata, 'Recruiter Name')
+  ].map(v => oneLinePlainText(v).toUpperCase()).filter(Boolean);
+
+  let parts = raw
+    .split(/\n+|\s*;\s*/)
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  // Preserve comma structure from one-line addresses while removing company/contact-only lines.
+  parts = parts.filter(part => {
+    const normalized = oneLinePlainText(part).replace(/,+$/, '').trim().toUpperCase();
+    return !removableLabels.includes(normalized);
+  });
+
+  let joined = parts.join(', ');
+  removableLabels.forEach(label => {
+    const re = new RegExp(`^${escapeRegex(label)}\\s*[,\\-:]\\s*`, 'i');
+    joined = joined.replace(re, '');
+  });
+
+  let segments = joined.split(/\s*,\s*/).map(v => v.trim()).filter(Boolean);
+  if (segments.length === 0) return '';
+
+  let streetSegments = [];
+  let cityStateZip = '';
+
+  if (segments.length >= 2 && looksLikeCityStateZipSegment(segments[segments.length - 1])) {
+    cityStateZip = segments.pop();
+    streetSegments = segments;
+  } else if (segments.length >= 2 && looksLikeStateZipSegment(segments[segments.length - 1])) {
+    const stateZip = segments.pop();
+    const city = segments.pop() || '';
+    cityStateZip = `${city} ${stateZip}`.trim();
+    streetSegments = segments;
+  } else if (parts.length >= 2) {
+    cityStateZip = parts[parts.length - 1];
+    streetSegments = parts.slice(0, -1);
   } else {
-    vLog(`[ADDRESS FORMATTING] No direct Hiring Manager or Recruiter name found in metadata. Omitting top contact line.`);
+    // Comma-free one-line fallback: split conservatively using ZIP/state tokens and
+    // a recognized street suffix before normalizing street/locality separately.
+    const single = oneLinePlainText(segments[0]).toUpperCase().replace(/[.]/g, '').replace(/\s+/g, ' ').trim();
+    const split = splitStreetFromCityStateZip(single);
+    if (split) {
+      streetSegments = [split.street];
+      cityStateZip = split.cityStateZip;
+    } else {
+      vLog(`[ADDRESS FORMATTING] [WARNING] Could not confidently separate street from city/state/ZIP; returning normalized one-line value.`);
+      return normalizeUspsAddressText(single, false);
+    }
   }
 
-  const lines = [];
-  
-  if (contactLine) {
-    lines.push(contactLine);
-  }
-  
-  // 2. [Company Name]
-  if (companyName) {
-    lines.push(companyName);
-  }
-  
-  // 3. [Street Address] & 4. [City, State ZIP Code]
-  if (rawAddress) {
-    const addressLines = rawAddress.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    vLog(`[ADDRESS FORMATTING] Split rawAddress into ${addressLines.length} component line(s).`);
+  const street = normalizeUspsAddressText(streetSegments.join(' '), true);
+  const locality = normalizeUspsCityStateZip(cityStateZip);
+  const finalized = [street, locality].filter(Boolean).join(', ');
+  vLog(`[ADDRESS FORMATTING] USPS single-line address: "${finalized}"`);
+  return finalized;
+}
 
-    // Filter out duplicate lines (e.g. if rawAddress already starts with company name or contact name)
-    const cleanedAddressLines = addressLines.filter(line => {
-      const lowerLine = line.toLowerCase();
-      const lowerCompany = companyName ? companyName.toLowerCase() : '';
-      const lowerContact = contactLine ? contactLine.toLowerCase() : '';
-      
-      if (lowerCompany && (lowerLine === lowerCompany || lowerLine.startsWith(lowerCompany + ','))) {
-        vLog(`[ADDRESS FORMATTING] Filtering out redundant company name line: "${line}"`);
-        return false;
-      }
-      if (lowerContact && lowerLine === lowerContact) {
-        vLog(`[ADDRESS FORMATTING] Filtering out redundant contact name line: "${line}"`);
-        return false;
-      }
+function getUspsStateMap() {
+  return {
+    'ALABAMA':'AL','ALASKA':'AK','ARIZONA':'AZ','ARKANSAS':'AR','CALIFORNIA':'CA','COLORADO':'CO','CONNECTICUT':'CT','DELAWARE':'DE',
+    'DISTRICT OF COLUMBIA':'DC','FLORIDA':'FL','GEORGIA':'GA','HAWAII':'HI','IDAHO':'ID','ILLINOIS':'IL','INDIANA':'IN','IOWA':'IA',
+    'KANSAS':'KS','KENTUCKY':'KY','LOUISIANA':'LA','MAINE':'ME','MARYLAND':'MD','MASSACHUSETTS':'MA','MICHIGAN':'MI','MINNESOTA':'MN',
+    'MISSISSIPPI':'MS','MISSOURI':'MO','MONTANA':'MT','NEBRASKA':'NE','NEVADA':'NV','NEW HAMPSHIRE':'NH','NEW JERSEY':'NJ','NEW MEXICO':'NM',
+    'NEW YORK':'NY','NORTH CAROLINA':'NC','NORTH DAKOTA':'ND','OHIO':'OH','OKLAHOMA':'OK','OREGON':'OR','PENNSYLVANIA':'PA',
+    'RHODE ISLAND':'RI','SOUTH CAROLINA':'SC','SOUTH DAKOTA':'SD','TENNESSEE':'TN','TEXAS':'TX','UTAH':'UT','VERMONT':'VT','VIRGINIA':'VA',
+    'WASHINGTON':'WA','WEST VIRGINIA':'WV','WISCONSIN':'WI','WYOMING':'WY','PUERTO RICO':'PR'
+  };
+}
+
+function getUspsStateTokens() {
+  const stateMap = getUspsStateMap();
+  return [...Object.keys(stateMap), ...Object.values(stateMap)]
+    .filter((value, index, arr) => arr.indexOf(value) === index)
+    .sort((a, b) => b.length - a.length);
+}
+
+function looksLikeStateZipSegment(value) {
+  const text = String(value || '').trim().toUpperCase().replace(/\./g, '');
+  const match = text.match(/^(.+?)\s+(\d{5}(?:-\d{4})?)$/);
+  if (!match) return false;
+  const stateToken = match[1].trim();
+  return getUspsStateTokens().includes(stateToken);
+}
+
+function looksLikeCityStateZipSegment(value) {
+  const text = String(value || '').trim().toUpperCase().replace(/\./g, '');
+  const match = text.match(/^(.+?)\s+(\d{5}(?:-\d{4})?)$/);
+  if (!match) return false;
+  const preZip = match[1].trim();
+  return getUspsStateTokens().some(stateToken => {
+    const suffix = ` ${stateToken}`;
+    return preZip.endsWith(suffix) && preZip.slice(0, -suffix.length).trim().length > 0;
+  });
+}
+
+function splitStreetFromCityStateZip(value) {
+  const text = String(value || '').trim().toUpperCase().replace(/[.]/g, '').replace(/\s+/g, ' ');
+  const zipMatch = text.match(/^(.*?)\s+(\d{5}(?:-\d{4})?)$/);
+  if (!zipMatch) return null;
+
+  const beforeZip = zipMatch[1].trim();
+  const zip = zipMatch[2];
+  const stateToken = getUspsStateTokens().find(token => beforeZip === token || beforeZip.endsWith(` ${token}`));
+  if (!stateToken) return null;
+
+  const beforeState = beforeZip.slice(0, beforeZip.length - stateToken.length).trim();
+  if (!beforeState) return null;
+  const streetSuffix = '(?:STREET|ST|AVENUE|AVE|BOULEVARD|BLVD|ROAD|RD|DRIVE|DR|LANE|LN|COURT|CT|CIRCLE|CIR|PARKWAY|PKWY|HIGHWAY|HWY|WAY|PLACE|PL|TERRACE|TER)';
+  const directional = '(?:N|S|E|W|NE|NW|SE|SW)';
+  const unit = '(?:APARTMENT|APT|SUITE|STE|UNIT|FLOOR|FL|BUILDING|BLDG|ROOM|RM|DEPARTMENT|DEPT|#)';
+  const streetCity = beforeState.match(new RegExp(`^(.+?\\b${streetSuffix}(?:\\s+${directional})?(?:\\s+${unit}\\s*[A-Z0-9-]+)?)\\s+(.+)$`, 'i'));
+  if (!streetCity) return null;
+
+  return {
+    street: streetCity[1].trim(),
+    cityStateZip: `${streetCity[2].trim()} ${stateToken} ${zip}`
+  };
+}
+
+function normalizeUspsAddressText(value, isStreet) {
+  let text = oneLinePlainText(value)
+    .toUpperCase()
+    .replace(/[.]/g, '')
+    .replace(/\s*,\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (isStreet) {
+    const replacements = [
+      [/\bSTREET\b/g, 'ST'], [/\bAVENUE\b/g, 'AVE'], [/\bBOULEVARD\b/g, 'BLVD'],
+      [/\bROAD\b/g, 'RD'], [/\bDRIVE\b/g, 'DR'], [/\bLANE\b/g, 'LN'], [/\bCOURT\b/g, 'CT'],
+      [/\bCIRCLE\b/g, 'CIR'], [/\bPARKWAY\b/g, 'PKWY'], [/\bHIGHWAY\b/g, 'HWY'],
+      [/\bPLACE\b/g, 'PL'], [/\bTERRACE\b/g, 'TER'], [/\bAPARTMENT\b/g, 'APT'],
+      [/\bSUITE\b/g, 'STE'], [/\bBUILDING\b/g, 'BLDG'], [/\bFLOOR\b/g, 'FL'],
+      [/\bROOM\b/g, 'RM'], [/\bDEPARTMENT\b/g, 'DEPT']
+    ];
+    replacements.forEach(([pattern, replacement]) => { text = text.replace(pattern, replacement); });
+  }
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeUspsCityStateZip(value) {
+  let text = normalizeUspsAddressText(value, false).replace(/\s*,\s*/g, ' ');
+  const stateMap = getUspsStateMap();
+  Object.keys(stateMap).sort((a,b) => b.length-a.length).some(stateName => {
+    const re = new RegExp(`\\b${escapeRegex(stateName)}\\b(?=\\s+\\d{5}(?:-\\d{4})?$)`);
+    if (re.test(text)) {
+      text = text.replace(re, stateMap[stateName]);
       return true;
-    });
-
-    lines.push(...cleanedAddressLines);
-  }
-
-  const finalizedBlock = lines.join('\n');
-  vLog(`[ADDRESS FORMATTING] Compiled block:\n${finalizedBlock}`);
-  return finalizedBlock;
+    }
+    return false;
+  });
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -1028,14 +2326,15 @@ Job URL, if known: ${jobUrl || 'UNKNOWN'}
 Rules:
 - Prefer the company entity connected to the provided job URL/domain.
 - Avoid similarly named but unrelated companies.
-- Format as an envelope address containing street number, city, state, zip code (preferably in ALL CAPS).
-- Include company name.
-- Return only the address lines. No commentary.
+- Return only the postal mailing address; do not include company name or contact name.
+- Prefer USPS single-line format in ALL CAPS: 123 MAIN ST APT 4B, NEW YORK NY 10001.
+- Include street number, city, two-letter state abbreviation, and ZIP/ZIP+4 when known.
+- Return only the address. No commentary.
 `.trim();
 
   vLog(`[ADDRESS SCRAPER] Prompt payload built. length: ${prompt.length} characters.`);
   try {
-    const fullResponse = askOpenRouter(prompt, config, { temperature: 0.15, top_p: 0.8 });
+    const fullResponse = askOpenRouter(prompt, config, { temperature: 0.15, top_p: 0.8, maxTokens: OPENROUTER_ADDRESS_MAX_TOKENS });
     const cleaned = cleanOpenRouterPlainTextResponse(fullResponse);
     vLog(`[ADDRESS SCRAPER] Resolved Mailing Address response:\n${cleaned}`);
     return cleaned;
@@ -1067,28 +2366,58 @@ function cleanOpenRouterPlainTextResponse(fullResponse) {
 }
 
 /**
- * Calls OpenRouter and returns choices[0].message.content with exponential backoff.
+ * Calls OpenRouter and returns choices[0].message.content with bounded retry/backoff.
+ *
+ * Defaults intentionally cap a single logical LLM operation at two 30-second attempts.
+ * Retries are limited to transport failures and transient HTTP statuses.
  */
 function askOpenRouter(prompt, config, overrides) {
   overrides = overrides || {};
-  const maxAttempts = typeof overrides.maxAttempts === 'number' ? Math.max(1, overrides.maxAttempts) : 3;
-  const retryBaseMs = typeof overrides.retryBaseMs === 'number' ? Math.max(0, overrides.retryBaseMs) : 1000;
+  const maxAttempts = typeof overrides.maxAttempts === 'number'
+    ? Math.max(1, Math.floor(overrides.maxAttempts))
+    : OPENROUTER_MAX_ATTEMPTS;
+  const retryBaseMs = typeof overrides.retryBaseMs === 'number'
+    ? Math.max(0, Math.floor(overrides.retryBaseMs))
+    : OPENROUTER_RETRY_BASE_DELAY_MS;
+  const timeoutSeconds = typeof overrides.timeoutSeconds === 'number'
+    ? Math.max(1, Math.floor(overrides.timeoutSeconds))
+    : OPENROUTER_REQUEST_TIMEOUT_SECONDS;
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (!hasOpenRouterExecutionBudget(timeoutSeconds)) {
+      const remainingMs = Math.max(0, SAFE_EXECUTION_LIMIT_MS - (Date.now() - RUN_METRICS.startTime));
+      const budgetError = new Error(
+        `OpenRouter request skipped because only ${Math.floor(remainingMs / 1000)}s remain in the safe execution window.`
+      );
+      budgetError.retryable = false;
+      throw budgetError;
+    }
+
     try {
-      vLog(`[LLM GATEWAY] Invoking OpenRouter transaction [Attempt ${attempt}/${maxAttempts}]...`);
-      return askOpenRouterOnce(prompt, config, overrides);
+      vLog(
+        `[LLM GATEWAY] Invoking OpenRouter transaction [Attempt ${attempt}/${maxAttempts}] ` +
+        `(timeout=${timeoutSeconds}s)...`
+      );
+      return askOpenRouterOnce(prompt, config, Object.assign({}, overrides, { timeoutSeconds }));
     } catch (e) {
       lastError = e;
       const shouldRetry = isRetryableOpenRouterError(e) && attempt < maxAttempts;
       if (!shouldRetry) {
-        vLog(`[LLM GATEWAY] [FATAL] Transaction failed irrecoverably: ${e.message}`);
+        vLog(`[LLM GATEWAY] [FATAL] Transaction failed without further retry: ${e.message}`);
         throw e;
       }
 
       const sleepMs = retryBaseMs * Math.pow(2, attempt - 1);
-      vLog(`[LLM GATEWAY] Attempt ${attempt} hit retryable latency error: ${e.message}. backing off for ${sleepMs} ms.`);
+      if (!hasOpenRouterExecutionBudget(timeoutSeconds, sleepMs)) {
+        vLog('[LLM GATEWAY] Retry suppressed because the remaining safe execution budget is insufficient.');
+        throw e;
+      }
+
+      vLog(
+        `[LLM GATEWAY] Attempt ${attempt}/${maxAttempts} failed with a retryable error: ${e.message}. ` +
+        `Retrying in ${sleepMs} ms.`
+      );
       Utilities.sleep(sleepMs);
     }
   }
@@ -1097,34 +2426,68 @@ function askOpenRouter(prompt, config, overrides) {
 }
 
 /**
+ * Returns whether there is enough room in the script's safe execution window to
+ * start another bounded OpenRouter attempt.
+ */
+function hasOpenRouterExecutionBudget(timeoutSeconds, additionalDelayMs) {
+  const elapsedMs = Date.now() - RUN_METRICS.startTime;
+  const requestBudgetMs = Math.max(1, Number(timeoutSeconds) || OPENROUTER_REQUEST_TIMEOUT_SECONDS) * 1000;
+  const delayMs = Math.max(0, Number(additionalDelayMs) || 0);
+  return elapsedMs + delayMs + requestBudgetMs + OPENROUTER_EXECUTION_CUSHION_MS < SAFE_EXECUTION_LIMIT_MS;
+}
+
+/**
  * Calls OpenRouter once.
  */
 function askOpenRouterOnce(prompt, config, overrides) {
+  overrides = overrides || {};
+  const timeoutSeconds = typeof overrides.timeoutSeconds === 'number'
+    ? Math.max(1, Math.floor(overrides.timeoutSeconds))
+    : OPENROUTER_REQUEST_TIMEOUT_SECONDS;
+  const maxTokens = typeof overrides.maxTokens === 'number'
+    ? Math.max(1, Math.floor(overrides.maxTokens))
+    : OPENROUTER_DEFAULT_MAX_TOKENS;
+  const maxResponseChars = typeof overrides.maxResponseChars === 'number'
+    ? Math.max(1000, Math.floor(overrides.maxResponseChars))
+    : OPENROUTER_MAX_RESPONSE_CHARS;
+
   const payload = {
     model: OPENROUTER_MODEL,
-    messages:[{ role: 'user', content: prompt }],
+    messages: [{ role: 'user', content: prompt }],
     stream: false,
     temperature: typeof overrides.temperature === 'number' ? overrides.temperature : 0.25,
-    top_p: typeof overrides.top_p === 'number' ? overrides.top_p : 0.9
+    top_p: typeof overrides.top_p === 'number' ? overrides.top_p : 0.9,
+    max_tokens: maxTokens
   };
 
   const options = {
     method: 'post',
     contentType: 'application/json',
-    headers: { 
+    headers: {
       'Authorization': `Bearer ${config.orApiKey}`,
-      'HTTP-Referer': 'https://google.com', 
+      'HTTP-Referer': 'https://google.com',
       'X-Title': 'Apps Script Job Material Pipeline'
     },
     payload: JSON.stringify(payload),
-    muteHttpExceptions: true
+    muteHttpExceptions: true,
+    timeoutSeconds: timeoutSeconds
   };
 
   vLog(`[API EXECUTION] Target endpoint: ${OPENROUTER_API_URL}`);
   vLog(`[API EXECUTION] Active model mapping: ${OPENROUTER_MODEL}`);
+  vLog(`[API EXECUTION] Request timeout: ${timeoutSeconds}s | max_tokens: ${maxTokens}`);
   vLog(`[API EXECUTION] Payload parameters size: ${JSON.stringify(payload).length} chars.`);
 
-  const response = UrlFetchApp.fetch(OPENROUTER_API_URL, options);
+  let response;
+  try {
+    response = UrlFetchApp.fetch(OPENROUTER_API_URL, options);
+  } catch (fetchError) {
+    const error = new Error(`OpenRouter transport/timeout failure: ${fetchError.message || fetchError}`);
+    error.retryable = true;
+    error.transportError = true;
+    throw error;
+  }
+
   const responseCode = response.getResponseCode();
   const responseBody = response.getContentText();
 
@@ -1133,7 +2496,9 @@ function askOpenRouterOnce(prompt, config, overrides) {
 
   if (responseCode !== 200) {
     vLog(`[API ERROR] Non-200 Status (${responseCode}): ${truncateText(responseBody, 300)}`);
-    const error = new Error(`OpenRouter API request failed with status code ${responseCode}. Response: ${truncateText(responseBody, 500)}`);
+    const error = new Error(
+      `OpenRouter API request failed with status code ${responseCode}. Response: ${truncateText(responseBody, 500)}`
+    );
     error.responseCode = responseCode;
     throw error;
   }
@@ -1142,18 +2507,32 @@ function askOpenRouterOnce(prompt, config, overrides) {
   try {
     jsonResponse = JSON.parse(responseBody);
   } catch (parseError) {
-    vLog(`[API ERROR] Execution returned malformed JSON payload.`);
-    throw new Error(`OpenRouter API returned non-JSON response.`);
+    vLog('[API ERROR] Execution returned malformed JSON payload.');
+    const error = new Error('OpenRouter API returned non-JSON response.');
+    error.retryable = false;
+    throw error;
   }
 
   const content = jsonResponse?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') {
     if (jsonResponse?.error?.message) {
       vLog(`[API ERROR] OpenRouter returned API error: ${jsonResponse.error.message}`);
-      throw new Error(`OpenRouter API returned error: ${jsonResponse.error.message}`);
+      const error = new Error(`OpenRouter API returned error: ${jsonResponse.error.message}`);
+      error.retryable = false;
+      throw error;
     }
-    vLog(`[API ERROR] Complied structure is missing text targets choices[0].message.content.`);
-    throw new Error(`OpenRouter API response did not contain message content.`);
+    vLog('[API ERROR] Complied structure is missing text targets choices[0].message.content.');
+    const error = new Error('OpenRouter API response did not contain message content.');
+    error.retryable = false;
+    throw error;
+  }
+
+  if (content.length > maxResponseChars) {
+    const error = new Error(
+      `OpenRouter content exceeded safety limit (${content.length} > ${maxResponseChars} characters).`
+    );
+    error.retryable = false;
+    throw error;
   }
 
   vLog(`[API SUCCESS] Extracted choice content (${content.length} characters). Preview:\n${content.substring(0, 300)}...`);
@@ -1161,21 +2540,18 @@ function askOpenRouterOnce(prompt, config, overrides) {
 }
 
 /**
- * Returns true for transient OpenRouter/API failures worth retrying.
+ * Returns true only for transient OpenRouter/API failures worth retrying.
  */
 function isRetryableOpenRouterError(error) {
   if (!error) return false;
-  
-  // If we have an HTTP status code, retry on 408, 409, 425, 429, and 5xx
+  if (typeof error.retryable === 'boolean') return error.retryable;
+
   if (error.responseCode) {
     const code = Number(error.responseCode);
-    return code === 408 || code === 409 || code === 425 || code === 429 || (code >= 500 && code <= 599);
+    return code === 408 || code === 429 || code === 500 || code === 502 || code === 503 || code === 504;
   }
-  
-  // If there's no response code, it is a network-level or timeout exception from Google's infrastructure
-  const msg = String(error.message || '').toLowerCase();
-  vLog(`[LLM GATEWAY] Network-level exception encountered: "${msg}". Treating as retryable transient failure.`);
-  return true;
+
+  return false;
 }
 
 /**
@@ -1205,7 +2581,7 @@ function discoverApplicationEmailRoutes(metadata, config) {
 
   try {
     const prompt = buildApplicationEmailDiscoveryPrompt(metadata, config);
-    fullResponse = askOpenRouter(prompt, config, { temperature: 0.12, top_p: 0.75 });
+    fullResponse = askOpenRouter(prompt, config, { temperature: 0.12, top_p: 0.75, maxTokens: OPENROUTER_DISCOVERY_MAX_TOKENS });
     vLog('[DISCOVERY] Extracting JSON structure from raw text response...');
     parsed = parseJsonObjectFromText(fullResponse);
   } catch (e) {
@@ -1309,7 +2685,7 @@ Return ONLY valid JSON. No markdown. No commentary outside JSON.
 
 JSON schema:
 {
-  "company_mailing_address": "string (HQ mailing address containing street, city, state, zip in envelope format, or null)",
+  "company_mailing_address": "string (postal address only, no company/contact name; prefer USPS single-line ALL CAPS format such as 123 MAIN ST APT 4B, NEW YORK NY 10001, or null)",
   "canonical_company": "string",
   "canonical_domain": "string",
   "entity_confidence": 0.0,
@@ -1775,154 +3151,137 @@ function getFullDocumentText(doc) {
 }
 
 /**
- * Dispatches the Application Email Draft or Automated Send
+ * Dispatches application mail independently from the core material pipeline.
+ * Returns a 1:1 result for every intended recipient, including suppressed and failed targets.
  */
 function dispatchApplicationEmail(metadata, fullCoverLetterText, resumeFile, discoveryResult, config) {
-  vLog('[EMAIL ENGINE] preparing and constructing envelope dispatch packets...');
+  vLog('[EMAIL ENGINE] Preparing recipient-level dispatch packets...');
   if (!ENABLE_EMAIL_DISPATCH) throw new Error('Email dispatch is disabled.');
-  
-  // Extract ALL draftable email candidates
-  let targetEmails = discoveryResult.candidates
-    .filter(c => c.recommendedAction === DISCOVERY_ACTIONS.CREATE_DRAFT)
+
+  let initialEmails = asArray(discoveryResult && discoveryResult.candidates)
+    .filter(c => c && c.recommendedAction === DISCOVERY_ACTIONS.CREATE_DRAFT)
     .map(c => sanitizeEmailAddress(c.email))
     .filter(Boolean);
 
-  // Fallback to manual metadata if no candidates passed the threshold
-  if (targetEmails.length === 0) {
+  if (initialEmails.length === 0) {
     const fallback = sanitizeEmailAddress(getMetadataValue(metadata, 'Application Email'));
-    vLog(`[EMAIL ENGINE] AI validation resolved 0 targets. Attempting fallback on manually declared targets: "${fallback}"`);
-    if (fallback) targetEmails.push(fallback);
+    if (fallback) initialEmails.push(fallback);
+  }
+  initialEmails = [...new Set(initialEmails)];
+
+  if (initialEmails.length === 0) {
+    return { recipientResults: [], targetEmails: [], isSent: AUTO_SEND_EMAILS, getId: () => '' };
   }
 
-  // Deduplicate emails cleanly
-  targetEmails = [...new Set(targetEmails)];
-
-  const initialEmailsCount = targetEmails.length;
-  const initialEmails = [...targetEmails];
-
-  // Layer 1 (Bounce Suppression): Remove any address that has previously bounced.
-  // The suppression store is populated by scanForBounces() on every run, so this
-  // filter prevents the pipeline from re-sending to known-bad addresses indefinitely.
   const bouncedAddresses = getBouncedAddressSet();
-  if (bouncedAddresses.size > 0) {
-    const preFilterCount = targetEmails.length;
-    targetEmails = targetEmails.filter(email => {
-      if (bouncedAddresses.has(email)) {
-        vLog(`[EMAIL ENGINE] [BOUNCE SUPPRESSION] Skipping known-bounced address: ${email}`);
-        return false;
-      }
-      return true;
-    });
-    const suppressed = preFilterCount - targetEmails.length;
-    if (suppressed > 0) {
-      vLog(`[EMAIL ENGINE] [BOUNCE SUPPRESSION] Suppressed ${suppressed} previously-bounced address(es). ${targetEmails.length} target(s) remaining.`);
-    }
-  }
-
-  if (targetEmails.length === 0) {
-    vLog(`[EMAIL ENGINE] [FATAL] Route resolution failed. No active destinations.`);
-    if (initialEmailsCount > 0) {
-      throw new Error(`All candidate email routes were suppressed due to previous bounces: ${initialEmails.join(', ')}`);
+  const recipientResults = [];
+  const activeEmails = [];
+  initialEmails.forEach(email => {
+    if (bouncedAddresses.has(email)) {
+      recipientResults.push({ email, status: LOG_STATUS_SUPPRESSED_BOUNCE, messageId: '', error: 'Previously confirmed permanent bounce.' });
+      vLog(`[EMAIL ENGINE] [BOUNCE SUPPRESSION] Suppressing permanently bounced address: ${email}`);
     } else {
-      throw new Error('Missing or invalid Application Email.');
+      activeEmails.push(email);
     }
+  });
+
+  if (activeEmails.length === 0) {
+    return {
+      recipientResults: orderDispatchResults(initialEmails, recipientResults),
+      targetEmails: initialEmails,
+      isSent: AUTO_SEND_EMAILS,
+      getId: () => ''
+    };
   }
 
-  const to = targetEmails.join(', ');
   const subject = buildApplicationEmailSubject(metadata, config);
-  const plainBody = formatCoverLetterPlaintext(fullCoverLetterText);
-  const htmlBody = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #202124;">${formatCoverLetterHtml(fullCoverLetterText)}</div>`;
-  
-  vLog(`[EMAIL ENGINE] Destination targets mapped: "${to}"`);
-  vLog(`[EMAIL ENGINE] Subject heading compiled: "${subject}"`);
+  const basePlainBody = formatCoverLetterPlaintext(fullCoverLetterText);
+  const baseHtmlBody = formatCoverLetterHtml(fullCoverLetterText);
+  const transparencyFooterProfile = classifyApplicationTransparencyRole(metadata);
+  const plainFooter = ENABLE_APPLICATION_TRANSPARENCY_FOOTER ? buildApplicationTransparencyFooterPlaintext(metadata) : '';
+  const htmlFooter = ENABLE_APPLICATION_TRANSPARENCY_FOOTER ? buildApplicationTransparencyFooterHtml(metadata) : '';
+  const plainBody = plainFooter ? `${basePlainBody}\n\n${plainFooter}` : basePlainBody;
+  const htmlBody = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #202124;">${baseHtmlBody}${htmlFooter}</div>`;
+  const options = { name: config.applicantName, replyTo: config.applicantEmail, htmlBody };
+  if (ENABLE_APPLICATION_TRANSPARENCY_FOOTER) {
+    vLog(`[EMAIL ENGINE] Added Astro transparency footer (profile=${transparencyFooterProfile}).`);
+  }
 
-  // Use configured sender only if Gmail permits it; otherwise degrade safely to default sender.
-  const options = { 
-    name: config.applicantName, 
-    replyTo: config.applicantEmail, 
-    htmlBody 
-  };
   if (canUseGmailFromAddress(config.applicantEmail)) {
     options.from = config.applicantEmail;
   } else if (STRICT_GMAIL_FROM_VALIDATION) {
     throw new Error(`Configured APPLICANT_EMAIL is not an authorized Gmail From address: ${config.applicantEmail}`);
   } else {
-    vLog(`[EMAIL ENGINE] [WARNING] Configured APPLICANT_EMAIL is not an authorized Gmail From alias. Using account default sender and preserving replyTo.`);
+    vLog('[EMAIL ENGINE] [WARNING] Configured APPLICANT_EMAIL is not an authorized Gmail From alias. Using account default sender and preserving replyTo.');
   }
-  
+
   if (ATTACH_RESUME_PDF && resumeFile) {
-    vLog(`[EMAIL ENGINE] Packing file attachment target: "${resumeFile.getName()}" as PDF.`);
     const cleanResumeBaseName = safeFilename(resumeFile.getName()).replace(/\.pdf$/i, '');
-    options.attachments =[resumeFile.getAs(MimeType.PDF).setName(`${cleanResumeBaseName}.pdf`)];
+    options.attachments = [resumeFile.getAs(MimeType.PDF).setName(`${cleanResumeBaseName}.pdf`)];
   }
 
   if (AUTO_SEND_EMAILS) {
-    vLog('[EMAIL ENGINE] AUTO_SEND_EMAILS configured to TRUE. Shipping immediately...');
     try {
-      GmailApp.sendEmail(to, subject, plainBody, options);
-      vLog('[EMAIL ENGINE] Mail sent successfully.');
-      RUN_METRICS.emailsSent += targetEmails.length;
-      return { getId: () => 'SENT_AUTOMATICALLY', isSent: true, targetEmails, from: options.from || '' };
-    } catch (sendError) {
-      vLog(`[EMAIL ENGINE] [WARNING] Bulk send failed ("${sendError.message}"). Attempting per-recipient dispatch...`);
-      const successfulEmails = [];
-      const failedEmails = [];
-
-      targetEmails.forEach(singleEmail => {
+      GmailApp.sendEmail(activeEmails.join(', '), subject, plainBody, options);
+      activeEmails.forEach(email => recipientResults.push({ email, status: 'SENT', messageId: 'SENT_AUTOMATICALLY', error: '' }));
+      RUN_METRICS.emailsSent += activeEmails.length;
+      vLog(`[EMAIL ENGINE] Bulk send succeeded for ${activeEmails.length} recipient(s).`);
+    } catch (bulkError) {
+      vLog(`[EMAIL ENGINE] [WARNING] Bulk send failed ("${bulkError.message}"). Attempting per-recipient sends.`);
+      activeEmails.forEach(email => {
         try {
-          GmailApp.sendEmail(singleEmail, subject, plainBody, options);
-          successfulEmails.push(singleEmail);
-          vLog(`[EMAIL ENGINE] Successfully sent email to: ${singleEmail}`);
+          GmailApp.sendEmail(email, subject, plainBody, options);
+          recipientResults.push({ email, status: 'SENT', messageId: 'SENT_AUTOMATICALLY', error: '' });
+          RUN_METRICS.emailsSent++;
+          vLog(`[EMAIL ENGINE] Successfully sent email to: ${email}`);
         } catch (singleErr) {
-          failedEmails.push(`${singleEmail}: ${singleErr.message}`);
-          vLog(`[EMAIL ENGINE] Failed sending email to ${singleEmail}: ${singleErr.message}`);
+          recipientResults.push({ email, status: LOG_STATUS_DISPATCH_FAILED, messageId: '', error: singleErr.message || 'Send failed' });
+          vLog(`[EMAIL ENGINE] Failed sending email to ${email}: ${singleErr.message}`);
         }
       });
-
-      if (successfulEmails.length > 0) {
-        RUN_METRICS.emailsSent += successfulEmails.length;
-        return { getId: () => 'SENT_AUTOMATICALLY', isSent: true, targetEmails: successfulEmails, from: options.from || '' };
-      }
-      throw new Error(`Email send failed for all recipients: ${failedEmails.join('; ')}`);
     }
   } else {
-    vLog('[EMAIL ENGINE] AUTO_SEND_EMAILS configured to FALSE. Composing Gmail Draft inside target accounts...');
     try {
-      const draft = GmailApp.createDraft(to, subject, plainBody, options);
-      draft.isSent = false;
-      draft.targetEmails = targetEmails;
-      draft.from = options.from || '';
-      vLog(`[EMAIL ENGINE] Gmail Draft compiled successfully. Draft ID: ${draft.getId()}`);
-      RUN_METRICS.emailsDrafted += targetEmails.length;
-      return draft;
-    } catch (draftError) {
-      vLog(`[EMAIL ENGINE] [WARNING] Bulk draft creation failed ("${draftError.message}"). Attempting per-recipient draft creation...`);
-      const successfulDrafts = [];
-      const failedEmails = [];
-      let lastDraft = null;
-
-      targetEmails.forEach(singleEmail => {
+      const draft = GmailApp.createDraft(activeEmails.join(', '), subject, plainBody, options);
+      const draftId = draft.getId();
+      activeEmails.forEach(email => recipientResults.push({ email, status: 'DRAFTED', messageId: draftId, error: '' }));
+      RUN_METRICS.emailsDrafted += activeEmails.length;
+      vLog(`[EMAIL ENGINE] Bulk draft created successfully. Draft ID: ${draftId}`);
+    } catch (bulkError) {
+      vLog(`[EMAIL ENGINE] [WARNING] Bulk draft creation failed ("${bulkError.message}"). Attempting per-recipient drafts.`);
+      activeEmails.forEach(email => {
         try {
-          const singleDraft = GmailApp.createDraft(singleEmail, subject, plainBody, options);
-          successfulDrafts.push(singleEmail);
-          lastDraft = singleDraft;
-          vLog(`[EMAIL ENGINE] Successfully created draft for: ${singleEmail}`);
+          const draft = GmailApp.createDraft(email, subject, plainBody, options);
+          recipientResults.push({ email, status: 'DRAFTED', messageId: draft.getId(), error: '' });
+          RUN_METRICS.emailsDrafted++;
+          vLog(`[EMAIL ENGINE] Successfully created draft for: ${email}`);
         } catch (singleErr) {
-          failedEmails.push(`${singleEmail}: ${singleErr.message}`);
-          vLog(`[EMAIL ENGINE] Failed creating draft for ${singleEmail}: ${singleErr.message}`);
+          recipientResults.push({ email, status: LOG_STATUS_DISPATCH_FAILED, messageId: '', error: singleErr.message || 'Draft creation failed' });
+          vLog(`[EMAIL ENGINE] Failed creating draft for ${email}: ${singleErr.message}`);
         }
       });
-
-      if (successfulDrafts.length > 0 && lastDraft) {
-        lastDraft.isSent = false;
-        lastDraft.targetEmails = successfulDrafts;
-        lastDraft.from = options.from || '';
-        RUN_METRICS.emailsDrafted += successfulDrafts.length;
-        return lastDraft;
-      }
-      throw new Error(`Gmail draft creation failed for all recipients: ${failedEmails.join('; ')}`);
     }
   }
+
+  const ordered = orderDispatchResults(initialEmails, recipientResults);
+  return {
+    recipientResults: ordered,
+    targetEmails: initialEmails,
+    isSent: AUTO_SEND_EMAILS,
+    from: options.from || '',
+    getId: () => ordered.map(r => r.messageId || '').filter(Boolean).join(', ')
+  };
+}
+
+function orderDispatchResults(initialEmails, recipientResults) {
+  const byEmail = {};
+  asArray(recipientResults).forEach(result => { if (result && result.email) byEmail[result.email] = result; });
+  return asArray(initialEmails).map(email => byEmail[email] || {
+    email,
+    status: LOG_STATUS_DISPATCH_FAILED,
+    messageId: '',
+    error: 'No dispatch result was returned.'
+  });
 }
 
 function buildApplicationEmailSubject(metadata, config) {
@@ -1943,6 +3302,46 @@ function formatCoverLetterHtml(text) {
     const escaped = escapeHtml(p).replace(/\n/g, '<br>');
     return `<p style="margin-bottom: 1.2em; line-height: 1.5; margin-top: 0;">${escaped}</p>`;
   }).filter(Boolean).join('\n');
+}
+
+function classifyApplicationTransparencyRole(metadata) {
+  const titleSignals = [
+    oneLinePlainText(getBestJobTitle(metadata)),
+    oneLinePlainText(getMetadataValue(metadata, 'Professional Title'))
+  ].filter(Boolean).join(' ');
+
+  const securityRolePattern = /(?:\bsecurity\b|\bcyber(?:security)?\b|\binfosec\b|\bsecops\b|\bSOC\b|\bthreat\b|\bvulnerabilit(?:y|ies)\b|\bincident response\b|\bdetection(?:\s+(?:and|&))?\s+response\b|\bsecurity operations\b|\bidentity(?:\s+(?:and|&))?\s+access\b|\bIAM\b|\bendpoint security\b)/i;
+  return securityRolePattern.test(titleSignals) ? 'SECURITY' : 'IT_SUPPORT';
+}
+
+function buildApplicationTransparencyFooterText(metadata) {
+  const profile = classifyApplicationTransparencyRole(metadata);
+  const roleSpecific = profile === 'SECURITY'
+    ? 'The downstream Google Apps Script workflow I built generates the final documents and manages application routing, delivery tracking, and bounce handling.'
+    : 'The downstream Google Apps Script workflow I built generates the final documents and manages application routing, delivery tracking, and exception handling.';
+
+  return [
+    'I built AstroOM, an AI-assisted workflow that helps me find and evaluate relevant opportunities and prepare tailored application materials.',
+    roleSpecific,
+    'This message was sent from my personal email through that workflow, and I personally review and approve each application.'
+  ].join(' ');
+}
+
+function buildApplicationTransparencyFooterPlaintext(metadata) {
+  const text = buildApplicationTransparencyFooterText(metadata);
+  return `---\nBuilt with Astro — transparency note:\n${text}\nGitHub: ${ASTRO_PROJECT_URL}`;
+}
+
+function buildApplicationTransparencyFooterHtml(metadata) {
+  const text = escapeHtml(buildApplicationTransparencyFooterText(metadata));
+  const projectUrl = escapeHtml(ASTRO_PROJECT_URL);
+  return [
+    '<div style="margin-top: 1.6em; padding-top: 0.9em; border-top: 1px solid #dadce0; font-size: 11px; line-height: 1.45; color: #5f6368;">',
+    '<strong style="color: #3c4043;">Built with Astro — transparency note:</strong> ',
+    text,
+    ` <a href="${projectUrl}" style="color: #5f6368;">AstroOM on GitHub</a>`,
+    '</div>'
+  ].join('');
 }
 
 function normalizeDiscoveryTier(tier) {
@@ -2107,8 +3506,20 @@ function generateCoverLetterDoc(coverTemplate, targetFolder, metadata, coverLett
     const replacements = {};
     replacements[TEMPLATE_PLACEHOLDERS.CUSTOM_PROF_TITLE] = getMetadataValue(metadata, 'Professional Title');
     replacements[TEMPLATE_PLACEHOLDERS.TODAYS_DATE] = getTodaysDateString();
-    replacements[TEMPLATE_PLACEHOLDERS.JOB_COMPANY_ADDRESS] = getMetadataValue(metadata, 'Company Address');
-    replacements[TEMPLATE_PLACEHOLDERS.JOB_COMPANY] = getMetadataValue(metadata, 'Company');
+    const coverCompany = getMetadataValue(metadata, 'Company');
+    const coverAddress = getMetadataValue(metadata, 'Company Address');
+    const coverTemplateText = getFullDocumentText(newCoverDoc);
+    const companyPlaceholderIndex = coverTemplateText.indexOf(TEMPLATE_PLACEHOLDERS.JOB_COMPANY);
+    const addressPlaceholderIndex = coverTemplateText.indexOf(TEMPLATE_PLACEHOLDERS.JOB_COMPANY_ADDRESS);
+    const betweenCompanyAndAddress = companyPlaceholderIndex >= 0 && addressPlaceholderIndex > companyPlaceholderIndex
+      ? coverTemplateText.slice(companyPlaceholderIndex + TEMPLATE_PLACEHOLDERS.JOB_COMPANY.length, addressPlaceholderIndex)
+      : '';
+    const companyAlreadyImmediatelyAboveAddress = companyPlaceholderIndex >= 0 && addressPlaceholderIndex > companyPlaceholderIndex && /^\s*$/.test(betweenCompanyAndAddress);
+    const coverCompanyAddressBlock = companyAlreadyImmediatelyAboveAddress
+      ? coverAddress
+      : [coverCompany, coverAddress].filter(Boolean).join('\n');
+    replacements[TEMPLATE_PLACEHOLDERS.JOB_COMPANY_ADDRESS] = coverCompanyAddressBlock;
+    replacements[TEMPLATE_PLACEHOLDERS.JOB_COMPANY] = coverCompany;
     replacements[TEMPLATE_PLACEHOLDERS.COVER_BODY] = coverLetterContent || '';
 
     applyTemplateReplacements(newCoverDoc, replacements);
@@ -2163,7 +3574,7 @@ function getRearJobTitlePortion(metadata) {
  */
 function getLinkedInDocBaseName(metadata, config) {
   const rearPortion = getRearJobTitlePortion(metadata).replace(/\.pdf$/i, '');
-  const applicantName = (config && config.applicantName) ? config.applicantName : '[YOUR_NAME]';
+  const applicantName = (config && config.applicantName) ? config.applicantName : 'Michael Martini';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
   return `${applicantPrefix}_LinkedIn_${rearPortion}`;
 }
@@ -2223,7 +3634,7 @@ function generateLinkedInDoc(targetFolder, metadata, jobUrl, config) {
  * Computes a standardized folder name for an application's rendered package materials.
  */
 function getRenderPackageFolderName(metadata, config) {
-  const applicantName = (config && config.applicantName) ? config.applicantName : '[YOUR_NAME]';
+  const applicantName = (config && config.applicantName) ? config.applicantName : 'Michael Martini';
   const applicantPrefix = applicantName.replace(/[^\w]/g, '_');
 
   const manualResumeName = getMetadataValue(metadata, 'Resume Filename') || getMetadataValue(metadata, 'Materials Filename');
@@ -2508,6 +3919,8 @@ function getRequiredDeploymentConfig() {
     targetFolderId: scriptProperties.getProperty(SCRIPT_PROPERTIES.TARGET_FOLDER_ID),
     targetFolderIdRender: scriptProperties.getProperty(SCRIPT_PROPERTIES.TARGET_FOLDER_ID_RENDER),
     processedFolderId: scriptProperties.getProperty(SCRIPT_PROPERTIES.PROCESSED_FOLDER_ID),
+    failedFolderId: scriptProperties.getProperty(SCRIPT_PROPERTIES.FAILED_FOLDER_ID),
+    dupeFolderId: scriptProperties.getProperty(SCRIPT_PROPERTIES.DUPE_FOLDER_ID),
     resumeTemplateId: scriptProperties.getProperty(SCRIPT_PROPERTIES.RESUME_TEMPLATE_ID),
     coverTemplateId: scriptProperties.getProperty(SCRIPT_PROPERTIES.COVER_LETTER_TEMPLATE_ID),
     orApiKey: scriptProperties.getProperty(SCRIPT_PROPERTIES.OR_API_KEY),
@@ -2518,15 +3931,10 @@ function getRequiredDeploymentConfig() {
   };
 
   const requiredKeys = [
-    'sourceFolderId',
-    'targetFolderId',
-    'targetFolderIdRender',
-    'processedFolderId',
-    'resumeTemplateId',
-    'coverTemplateId',
-    'orApiKey',
-    'applicantName'
+    'sourceFolderId', 'targetFolderId', 'processedFolderId', 'failedFolderId', 'dupeFolderId',
+    'resumeTemplateId', 'coverTemplateId', 'orApiKey', 'applicantName'
   ];
+  if (ENABLE_RENDER) requiredKeys.push('targetFolderIdRender');
   if (ENABLE_EMAIL_DISPATCH) requiredKeys.push('applicantEmail');
   if (ENABLE_SPREADSHEET_LOGGING) requiredKeys.push('spreadsheetLogId');
 
@@ -2540,9 +3948,8 @@ function getRequiredDeploymentConfig() {
  */
 function deployMaterials() {
   const startTime = Date.now();
-  const MAX_EXECUTION_MS = 5 * 60 * 1000; // 5 minutes (Google limit is 6)
-
   const lock = LockService.getScriptLock();
+
   if (!lock.tryLock(30000)) {
     vLog('[ORCHESTRATOR] [FATAL] Lock access execution failed. Another script run is locking process.');
     flushDocLogs();
@@ -2555,34 +3962,28 @@ function deployMaterials() {
     config = getRequiredDeploymentConfig();
     const sourceFolder = DriveApp.getFolderById(config.sourceFolderId);
     const targetFolder = DriveApp.getFolderById(config.targetFolderId);
-    const targetRenderFolder = DriveApp.getFolderById(config.targetFolderIdRender);
+    const targetRenderFolder = ENABLE_RENDER ? DriveApp.getFolderById(config.targetFolderIdRender) : null;
     const processedFolder = DriveApp.getFolderById(config.processedFolderId);
+    const failedFolder = DriveApp.getFolderById(config.failedFolderId);
+    const dupeFolder = DriveApp.getFolderById(config.dupeFolderId);
     const resumeTemplate = DriveApp.getFileById(config.resumeTemplateId);
     const coverTemplate = DriveApp.getFileById(config.coverTemplateId);
     const materialFiles = sourceFolder.getFiles();
 
-    vLog(`[ORCHESTRATOR] Folders identified. Source Folder ID: ${config.sourceFolderId}, Target Folder ID: ${config.targetFolderId}, Render Target Folder ID: ${config.targetFolderIdRender}`);
+    vLog(`[ORCHESTRATOR] Core folders identified. Render workflow: ${ENABLE_RENDER ? 'ENABLED' : 'DISABLED'}.`);
 
-    try {
-      preflightGmailDraftAuthorization(config);
-    } catch (e) {
-      vLog(`[ORCHESTRATOR] [WARNING] Gmail preflight check exception: ${e.message}`);
-    }
+    try { preflightGmailDraftAuthorization(config); }
+    catch (e) { vLog(`[ORCHESTRATOR] [WARNING] Gmail preflight check exception: ${e.message}`); }
 
-    try {
-      preflightSpreadsheetAuthorization(config);
-    } catch (e) {
-      vLog(`[ORCHESTRATOR] [WARNING] Spreadsheet preflight check exception: ${e.message}`);
-    }
+    try { preflightSpreadsheetAuthorization(config); }
+    catch (e) { vLog(`[ORCHESTRATOR] [WARNING] Spreadsheet preflight check exception: ${e.message}`); }
 
-    // Auto-scan for bounce backs before calculating processed jobs
     scanForBounces(config);
     syncBouncedAddressesFromSheet(config);
-
     const processedJobIds = getProcessedJobIds(config);
 
     while (materialFiles.hasNext()) {
-      if (Date.now() - startTime > MAX_EXECUTION_MS) {
+      if (Date.now() - startTime > SAFE_EXECUTION_LIMIT_MS) {
         vLog('[ORCHESTRATOR] ⏳ Execution window reached safe time limit (5 minutes). Halting file processing for this run.');
         RUN_METRICS.timeLimitReached = true;
         break;
@@ -2590,22 +3991,23 @@ function deployMaterials() {
 
       const file = materialFiles.next();
       RUN_METRICS.filesDiscovered++;
-
       if (!shouldProcessSourceMaterialFile(file)) {
         vLog(`[ORCHESTRATOR] File: "${file.getName()}" does not match criteria. Skipping.`);
+        RUN_METRICS.filesSkipped++;
         continue;
       }
 
       try {
-        processSingleMaterialFile({ file, targetFolder, targetRenderFolder, processedFolder, resumeTemplate, coverTemplate, processedJobIds, config });
+        processSingleMaterialFile({
+          file, targetFolder, targetRenderFolder, processedFolder, failedFolder, dupeFolder,
+          resumeTemplate, coverTemplate, processedJobIds, config
+        });
       } catch (e) {
-        vLog(`[ORCHESTRATOR] [ERROR] Failed processing loop target "${file.getName()}": ${e.message}`);
+        AppLogger.error('ORCHESTR', `Unexpected uncaught file-level failure for "${file.getName()}": ${e.message}`);
       }
-      
-      // Flush logs after processing each file to ensure safe state
       flushDocLogs(config && config.docLogFolderId);
     }
-    vLog('[ORCHESTRATOR] 🏁 Deployment loop finalized.');
+    vLog('[ORCHESTRATOR] Deployment loop finalized.');
   } catch (err) {
     vLog(`[ORCHESTRATOR] [FATAL] execution halted: ${err.message}`);
     throw err;
@@ -2618,227 +4020,294 @@ function deployMaterials() {
 }
 
 /**
- * Processes one source material file.
+ * Processes one source file through explicit, isolated pipeline stages.
  */
 function processSingleMaterialFile(params) {
-  const { file, targetFolder, targetRenderFolder, processedFolder, resumeTemplate, coverTemplate, processedJobIds, config } = params;
-  const resolvedTargetRenderFolder = targetRenderFolder || (config && config.targetFolderIdRender ? DriveApp.getFolderById(config.targetFolderIdRender) : null);
-  let shouldMoveSourceFile = MOVE_SOURCE_FILE_AFTER_SUCCESS;
-  let hasLoggedFailure = false;
-  let discoveryResult = null;
+  const {
+    file, targetFolder, targetRenderFolder, processedFolder, failedFolder, dupeFolder,
+    resumeTemplate, coverTemplate, processedJobIds, config
+  } = params;
 
-  vLog(`========================================================`);
+  vLog('========================================================');
   vLog(`📥 Loading Material File: ${file.getName()} (ID: ${file.getId()})`);
 
+  // --------------------------------------------------------------------------
+  // Stage 1: INGEST & PARSE — terminal failure -> FAILED_FOLDER_ID
+  // --------------------------------------------------------------------------
   let parsed;
   try {
-    parsed = parseMarkdown(file.getBlob().getDataAsString());
+    const fileContent = file.getBlob().getDataAsString();
+    parsed = parseMarkdown(fileContent);
   } catch (e) {
-    RUN_METRICS.errorsEncountered++;
-    vLog(`  - ❌ [PARSER ERROR] Failed to parse material file "${file.getName()}": ${e.message}`);
+    RUN_METRICS.filesFailed++;
+    AppLogger.error('PARSER', `Ingest & Parse failed for "${file.getName()}": ${e.message}`);
     appendToSpreadsheetLog({
-      status: 'PARSER_FAILED',
-      company: '',
-      jobId: '',
-      jobTitle: file.getName(),
-      targetEmail: '',
-      emailTier: '',
-      score: '',
-      messageId: `ERROR: ${truncateText(e.message || 'Parse error', 150)}`,
-      jobUrl: ''
+      status: LOG_STATUS_INGEST_PARSE_FAILED,
+      company: '', jobId: '', jobTitle: file.getName(), targetEmail: '', emailTier: '', score: '',
+      messageId: `ERROR: ${truncateText(e.message || 'Ingest/parse error', 150)}`, jobUrl: '',
+      sourceFileName: file.getName()
     }, config);
-    if (ARCHIVE_UNRESOLVED_FILES) {
-      try {
-        file.moveTo(processedFolder);
-        vLog(`  - [PARSER] Moved unparseable file to processed folder to prevent infinite retry loops.`);
-      } catch (moveErr) {}
-    }
+    moveSourceFileSafely(file, failedFolder, 'FAILED_FOLDER_ID', 'INGEST & PARSE failure');
     return;
   }
 
   const metadata = parsed.metadata;
   const companyName = getMetadataValue(metadata, 'Company');
   const jobId = getMetadataValue(metadata, 'Job ID');
-
+  const jobTitle = getBestJobTitle(metadata);
+  const jobUrl = getMetadataValue(metadata, 'Job URL');
   vLog(`  - [CORE] Parsed Company Target: "${companyName}" | Resolved Job ID: "${jobId}"`);
 
+  // --------------------------------------------------------------------------
+  // Stage 2: DUPLICATE GATE — terminal diversion -> DUPE_FOLDER_ID
+  // --------------------------------------------------------------------------
   if (jobId && processedJobIds.has(jobId)) {
     RUN_METRICS.filesSkipped++;
-    vLog(`  - [CORE] Record match: Job ID ${jobId} was already successfully executed. Skipping duplicates.`);
-    if (shouldMoveSourceFile) {
-      file.moveTo(processedFolder);
-      vLog(`  - [CORE] Source file safely archived.`);
-    }
+    RUN_METRICS.filesDuplicated++;
+    vLog(`  - [CORE] Duplicate Job ID ${jobId} detected. Diverting source to DUPE_FOLDER_ID.`);
+    appendToSpreadsheetLog({
+      status: LOG_STATUS_DUPLICATE,
+      company: companyName, jobId, jobTitle, targetEmail: '', emailTier: 'DUPLICATE', score: '',
+      messageId: `SOURCE: ${file.getName()}`, jobUrl, sourceFileName: file.getName()
+    }, config);
+    moveSourceFileSafely(file, dupeFolder, 'DUPE_FOLDER_ID', 'duplicate material');
     return;
   }
 
+  // --------------------------------------------------------------------------
+  // Stage 3: GENERAL / DISCOVERY — nonterminal; DOCGEN must not depend on dispatchability
+  // --------------------------------------------------------------------------
+  let discoveryResult;
   try {
-    vLog('  - [CORE] Querying OpenRouter API intelligence...');
     discoveryResult = discoverApplicationEmailRoutes(metadata, config);
+  } catch (e) {
+    vLog(`  - [ROUTING] [WARNING] Unexpected discovery failure: ${e.message}. Continuing DOCGEN with no draftable routes.`);
+    discoveryResult = buildFallbackDiscoveryResult(metadata, e);
+  }
 
-    if (
-      (REQUIRE_EMAIL_DISCOVERY_SUCCESS_WHEN_DRAFTING || REQUIRE_DRAFT_SUCCESS_FOR_DRAFTABLE_EMAIL) &&
-      ENABLE_EMAIL_DISPATCH &&
-      APPLICATION_DRAFT_MODE !== 'OFF' &&
-      !discoveryResult.shouldCreateDraft
-    ) {
-      RUN_METRICS.routesUnresolved++;
-      appendToSpreadsheetLog({
-        status: LOG_STATUS_NO_DRAFTABLE_ROUTE,
-        company: companyName,
-        jobId: jobId,
-        jobTitle: getBestJobTitle(metadata),
-        targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
-        emailTier: LOG_EMAIL_TIER_NO_DRAFTABLE_ROUTE,
-        score: discoveryResult.score || '',
-        messageId: '',
-        jobUrl: getMetadataValue(metadata, 'Job URL')
-      }, config);
-      hasLoggedFailure = true;
-
-      if (ARCHIVE_UNRESOLVED_FILES) {
-        shouldMoveSourceFile = true;
-        if (jobId) processedJobIds.add(jobId);
-        vLog('  - [CORE] Archiving file with no draftable route to prevent continuous re-query loops.');
-      }
-
-      throw new Error('No draftable email route found under strict discovery requirement.');
-    }
-
-    // Use LLM-extracted address, fallback to manual file, fallback to standalone LLM call
-    let companyAddress = discoveryResult.companyMailingAddress || getMetadataValue(metadata, 'Company Address');
+  // --------------------------------------------------------------------------
+  // Stage 4: ADDRESS + DOCGEN — terminal failure -> FAILED_FOLDER_ID
+  // --------------------------------------------------------------------------
+  let newResumeFile = null;
+  let coverDocResult = null;
+  let linkedInFile = null;
+  let companyAddress = '';
+  try {
+    companyAddress = discoveryResult.companyMailingAddress || getMetadataValue(metadata, 'Company Address');
     if (!companyAddress) {
-      vLog('  - [CORE] Address block empty in main payload. Fetching standalone HQ lookup...');
+      vLog('  - [CORE] Address value empty in discovery payload. Fetching standalone HQ address...');
       companyAddress = fetchCompanyAddress(companyName, metadata, config);
     }
-    
-    // Format Corporate address blocks dynamically with [Manager Name/Dept], [Company], [Address]
     companyAddress = formatCorporateHQAddressBlock(metadata, companyAddress, companyName);
     metadata['Company Address'] = companyAddress;
-    vLog(`  - [CORE] Finalized Corporate HQ Address Block mapped to Metadata:\n${companyAddress}`);
+    vLog(`  - [CORE] Finalized USPS Company Address: ${companyAddress || 'UNKNOWN'}`);
 
-    const newResumeFile = generateResumeDoc(resumeTemplate, targetFolder, metadata);
-    const coverDocResult = generateCoverLetterDoc(coverTemplate, targetFolder, metadata, parsed.content);
-    
-    // Generate the third output file mapping the clickable LinkedIn URL
-    const jobUrl = getMetadataValue(metadata, 'Job URL');
-    let linkedInFile = null;
-    if (jobUrl) {
-      linkedInFile = generateLinkedInDoc(targetFolder, metadata, jobUrl, config);
-    } else {
-      vLog(`  - [CORE] [WARNING] Job URL parameter missing. Bypassing LinkedIn Doc generation.`);
+    newResumeFile = generateResumeDoc(resumeTemplate, targetFolder, metadata);
+    coverDocResult = generateCoverLetterDoc(coverTemplate, targetFolder, metadata, parsed.content);
+    if (jobUrl) linkedInFile = generateLinkedInDoc(targetFolder, metadata, jobUrl, config);
+    else vLog('  - [DOCGEN] [WARNING] Job URL missing. Bypassing LinkedIn Doc generation.');
+  } catch (e) {
+    RUN_METRICS.filesFailed++;
+    AppLogger.error('DOCGEN', `DOCGEN failed for Job ID ${jobId || 'UNKNOWN'}: ${e.message}`);
+    appendToSpreadsheetLog({
+      status: LOG_STATUS_DOCGEN_FAILED,
+      company: companyName, jobId, jobTitle,
+      targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
+      emailTier: 'DOCGEN', score: discoveryResult && discoveryResult.score ? discoveryResult.score : '',
+      messageId: `ERROR: ${truncateText(e.message || 'DOCGEN error', 150)}`, jobUrl,
+      companyAddress, sourceFileName: file.getName()
+    }, config);
+    moveSourceFileSafely(file, failedFolder, 'FAILED_FOLDER_ID', 'DOCGEN failure');
+    return;
+  }
+
+  // Core processing is complete at this point. Later failures cannot undo it.
+  RUN_METRICS.filesProcessed++;
+  if (jobId) processedJobIds.add(jobId);
+  const plannedRecipients = getDispatchRecipientPlanForLogging(metadata, discoveryResult);
+  appendToSpreadsheetLog({
+    status: LOG_STATUS_CORE_PROCESSED,
+    company: companyName, jobId, jobTitle,
+    targetEmail: plannedRecipients.map(r => r.email).join(', '),
+    emailTier: plannedRecipients.map(r => r.tier || '').join(', '),
+    recipientScores: plannedRecipients.map(r => r.score || ''),
+    score: discoveryResult.score || '', messageId: '', jobUrl,
+    companyAddress, sourceFileName: file.getName()
+  }, config);
+
+  // --------------------------------------------------------------------------
+  // Stage 5: OPTIONAL RENDER — independent nonterminal failure
+  // --------------------------------------------------------------------------
+  let renderedArtifacts = { packageFolder: null, resumePdfFile: null, coverPdfFile: null, desktopFile: null };
+  if (ENABLE_RENDER) {
+    try {
+      renderedArtifacts = renderApplicationPackage({
+        targetRenderFolder, resumeFile: newResumeFile, coverFile: coverDocResult.file,
+        metadata, jobUrl, config
+      });
+      appendToSpreadsheetLog({
+        status: LOG_STATUS_RENDER_COMPLETE, company: companyName, jobId, jobTitle,
+        targetEmail: '', emailTier: '', score: discoveryResult.score || '', messageId: '', jobUrl
+      }, config);
+    } catch (e) {
+      RUN_METRICS.renderFailures++;
+      vLog(`  - [RENDER] [ERROR] Rendering failed independently: ${e.message}`);
+      appendToSpreadsheetLog({
+        status: LOG_STATUS_RENDER_FAILED,
+        company: companyName, jobId, jobTitle,
+        targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
+        emailTier: 'RENDER', score: discoveryResult.score || '',
+        messageId: `ERROR: ${truncateText(e.message || 'Render error', 150)}`, jobUrl
+      }, config);
     }
+  } else {
+    appendToSpreadsheetLog({
+      status: LOG_STATUS_RENDER_DISABLED, company: companyName, jobId, jobTitle,
+      targetEmail: '', emailTier: '', score: discoveryResult.score || '', messageId: '', jobUrl
+    }, config);
+    vLog('  - [RENDER] Render workflow disabled by configuration. Skipping package rendering.');
+  }
 
-    // Render application package artifacts (Resume PDF, Cover Letter PDF, LinkedIn .desktop) into TARGET_FOLDER_ID_RENDER
-    const renderedArtifacts = renderApplicationPackage({
-      targetRenderFolder: resolvedTargetRenderFolder,
-      resumeFile: newResumeFile,
-      coverFile: coverDocResult.file,
-      metadata,
-      jobUrl,
-      config
-    });
-    
+  // --------------------------------------------------------------------------
+  // Stage 6: ANNOTATION — best effort only
+  // --------------------------------------------------------------------------
+  try {
     associateApplicationEmailDiscovery(metadata, discoveryResult);
-    
-    // Consolidate output files for metadata annotation properties
     const filesToAnnotate = [newResumeFile, coverDocResult.file];
-    if (linkedInFile) {
-      filesToAnnotate.push(linkedInFile);
-    }
-    if (renderedArtifacts && renderedArtifacts.resumePdfFile) {
-      filesToAnnotate.push(renderedArtifacts.resumePdfFile);
-    }
-    if (renderedArtifacts && renderedArtifacts.coverPdfFile) {
-      filesToAnnotate.push(renderedArtifacts.coverPdfFile);
-    }
-    if (renderedArtifacts && renderedArtifacts.desktopFile) {
-      filesToAnnotate.push(renderedArtifacts.desktopFile);
-    }
-    if (renderedArtifacts && renderedArtifacts.packageFolder) {
-      filesToAnnotate.push(renderedArtifacts.packageFolder);
-    }
+    if (linkedInFile) filesToAnnotate.push(linkedInFile);
+    if (renderedArtifacts.resumePdfFile) filesToAnnotate.push(renderedArtifacts.resumePdfFile);
+    if (renderedArtifacts.coverPdfFile) filesToAnnotate.push(renderedArtifacts.coverPdfFile);
+    if (renderedArtifacts.desktopFile) filesToAnnotate.push(renderedArtifacts.desktopFile);
+    if (renderedArtifacts.packageFolder) filesToAnnotate.push(renderedArtifacts.packageFolder);
     annotateGeneratedFilesWithApplicationEmail(filesToAnnotate, metadata, discoveryResult);
+  } catch (e) {
+    vLog(`  - [FILE META] [WARNING] Annotation failed independently: ${e.message}`);
+  }
 
-    if (discoveryResult.shouldCreateDraft) {
-      vLog(`  - [CORE] Valid target endpoint routes mapped. Executing delivery mechanisms...`);
+  // --------------------------------------------------------------------------
+  // Stage 7: DISPATCH — fully independent from INGEST/PARSE/DOCGEN
+  // --------------------------------------------------------------------------
+  if (!ENABLE_EMAIL_DISPATCH || APPLICATION_DRAFT_MODE === 'OFF') {
+    appendToSpreadsheetLog({
+      status: LOG_STATUS_DISPATCH_DISABLED,
+      company: companyName, jobId, jobTitle,
+      targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
+      emailTier: LOG_EMAIL_TIER_DISPATCH_DISABLED, score: discoveryResult.score || '',
+      messageId: '', jobUrl
+    }, config);
+    vLog('  - [DISPATCH] Dispatch disabled; core material generation remains successful.');
+  } else if (!discoveryResult.shouldCreateDraft) {
+    RUN_METRICS.routesUnresolved++;
+    appendToSpreadsheetLog({
+      status: LOG_STATUS_NO_DRAFTABLE_ROUTE,
+      company: companyName, jobId, jobTitle,
+      targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
+      emailTier: LOG_EMAIL_TIER_NO_DRAFTABLE_ROUTE, score: discoveryResult.score || '',
+      messageId: '', jobUrl
+    }, config);
+    vLog('  - [DISPATCH] No draftable route found; DOCGEN remains successful.');
+  } else {
+    try {
       const dispatchResult = dispatchApplicationEmail(metadata, coverDocResult.text, newResumeFile, discoveryResult, config);
-      
-      // Create granular arrays mapping 1:1 to the target emails
-      const statusArray = dispatchResult.targetEmails.map(() => dispatchResult.isSent ? 'SENT' : 'DRAFTED');
-      const tierArray = dispatchResult.targetEmails.map(email => {
-        const cand = discoveryResult.candidates.find(c => c.email === email);
+      const recipientResults = dispatchResult.recipientResults || [];
+      if (recipientResults.length === 0) {
+        RUN_METRICS.routesUnresolved++;
+        appendToSpreadsheetLog({
+          status: LOG_STATUS_NO_DRAFTABLE_ROUTE, company: companyName, jobId, jobTitle,
+          targetEmail: '', emailTier: LOG_EMAIL_TIER_NO_DRAFTABLE_ROUTE, score: discoveryResult.score || '',
+          messageId: '', jobUrl
+        }, config);
+        vLog('  - [DISPATCH] No usable recipients remained after final dispatch validation.');
+      } else {
+      const statusArray = recipientResults.map(r => r.status || LOG_STATUS_DISPATCH_FAILED);
+      const emailArray = recipientResults.map(r => r.email || '');
+      const tierArray = recipientResults.map(r => {
+        const cand = asArray(discoveryResult.candidates).find(c => sanitizeEmailAddress(c.email) === sanitizeEmailAddress(r.email));
+        if (r.status === LOG_STATUS_SUPPRESSED_BOUNCE) return LOG_EMAIL_TIER_SUPPRESSED_BOUNCE;
+        if (r.status === LOG_STATUS_DISPATCH_FAILED) return LOG_EMAIL_TIER_DISPATCH_FAILED;
         return cand ? cand.tier : 'UNKNOWN';
       });
+      const messageIdArray = recipientResults.map(r => sanitizeAlignedCsvField(r.messageId || (r.error ? `ERROR: ${truncateText(r.error, 120)}` : '')));
+      const failedCount = recipientResults.filter(r => r.status === LOG_STATUS_DISPATCH_FAILED).length;
+      if (failedCount > 0) RUN_METRICS.dispatchFailures += failedCount;
 
+      const recipientScoreArray = recipientResults.map(r => {
+        const cand = asArray(discoveryResult.candidates).find(c => sanitizeEmailAddress(c.email) === sanitizeEmailAddress(r.email));
+        return cand && cand.score !== undefined ? cand.score : (discoveryResult.score || '');
+      });
       appendToSpreadsheetLog({
-        status: statusArray.join(', '),
-        company: companyName, 
-        jobId: jobId, 
-        jobTitle: getBestJobTitle(metadata),
-        targetEmail: dispatchResult.targetEmails.join(', '), 
-        emailTier: tierArray.join(', '),
-        score: discoveryResult.score, // Highest score
-        messageId: dispatchResult.getId(),
-        jobUrl: getMetadataValue(metadata, 'Job URL')
+        status: statusArray.join(', '), company: companyName, jobId, jobTitle,
+        targetEmail: emailArray.join(', '), emailTier: tierArray.join(', '),
+        recipientScores: recipientScoreArray,
+        score: discoveryResult.score || '', messageId: messageIdArray.join(', '), jobUrl
       }, config);
-      
-      RUN_METRICS.filesProcessed++;
-      if (jobId) processedJobIds.add(jobId);
-      shouldMoveSourceFile = true;
-      vLog(`  - 🚀 Dispatch loop successfully finalized: ${dispatchResult.isSent ? 'SENT' : 'DRAFTED'} to ${dispatchResult.targetEmails.length} recipients.`);
-    } else {
-      RUN_METRICS.routesUnresolved++;
-      vLog(`  - 🛑 Routing criteria validation failed. Dispatch bypass active.`);
-      appendToSpreadsheetLog({
-        status: LOG_STATUS_NO_DRAFTABLE_ROUTE,
-        company: companyName,
-        jobId: jobId,
-        jobTitle: getBestJobTitle(metadata),
-        targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
-        emailTier: LOG_EMAIL_TIER_NO_DRAFTABLE_ROUTE,
-        score: discoveryResult.score || '',
-        messageId: '',
-        jobUrl: getMetadataValue(metadata, 'Job URL')
-      }, config);
-      if (ARCHIVE_UNRESOLVED_FILES) {
-        shouldMoveSourceFile = true;
-        if (jobId) processedJobIds.add(jobId);
+      vLog(`  - [DISPATCH] Completed recipient-level dispatch: ${statusArray.join(', ') || 'NO TARGETS'}.`);
       }
-    }
-
-  } catch (e) {
-    const isSuppressedBounce = e.message && e.message.includes('suppressed due to previous bounces');
-    if (!hasLoggedFailure) {
+    } catch (e) {
+      RUN_METRICS.dispatchFailures++;
       appendToSpreadsheetLog({
-        status: isSuppressedBounce ? LOG_STATUS_SUPPRESSED_BOUNCE : LOG_STATUS_DISPATCH_FAILED,
-        company: companyName,
-        jobId: jobId,
-        jobTitle: getBestJobTitle(metadata),
+        status: LOG_STATUS_DISPATCH_FAILED,
+        company: companyName, jobId, jobTitle,
         targetEmail: getDispatchTargetEmailsForLogging(metadata, discoveryResult).join(', '),
-        emailTier: isSuppressedBounce ? LOG_EMAIL_TIER_SUPPRESSED_BOUNCE : LOG_EMAIL_TIER_DISPATCH_FAILED,
-        score: discoveryResult && discoveryResult.score ? discoveryResult.score : '',
-        messageId: `ERROR: ${truncateText(e.message || 'Unknown error', 150)}`,
-        jobUrl: getMetadataValue(metadata, 'Job URL')
+        emailTier: LOG_EMAIL_TIER_DISPATCH_FAILED, score: discoveryResult.score || '',
+        messageId: `ERROR: ${truncateText(e.message || 'Dispatch error', 150)}`, jobUrl
       }, config);
-    }
-    vLog(`  - ❌ [CORE ERROR] Pipeline execution failed: ${e.message}`);
-    if (isSuppressedBounce) {
-      vLog(`  - [CORE] Archiving file since retry will not bypass bounce suppression store.`);
-      shouldMoveSourceFile = true;
-      if (jobId) processedJobIds.add(jobId);
-    } else if (ARCHIVE_UNRESOLVED_FILES && e.message && e.message.includes('No draftable email route found')) {
-      shouldMoveSourceFile = true;
-      if (jobId) processedJobIds.add(jobId);
-    } else {
-      shouldMoveSourceFile = false;
+      vLog(`  - [DISPATCH] [ERROR] Dispatch failed independently: ${e.message}`);
     }
   }
 
-  if (shouldMoveSourceFile) {
-    file.moveTo(processedFolder);
-    vLog('  - [CORE] Source markdown archived to processed folder.');
+  // --------------------------------------------------------------------------
+  // Stage 8: FINALIZATION — DOCGEN success -> PROCESSED_FOLDER_ID
+  // --------------------------------------------------------------------------
+  if (MOVE_SOURCE_FILE_AFTER_SUCCESS) {
+    moveSourceFileSafely(file, processedFolder, 'PROCESSED_FOLDER_ID', 'successful core processing');
   }
+}
+
+function buildFallbackDiscoveryResult(metadata, error) {
+  return normalizeApplicationEmailDiscoveryResult({
+    canonical_company: getMetadataValue(metadata, 'Canonical Company') || getMetadataValue(metadata, 'Company'),
+    canonical_domain: getMetadataValue(metadata, 'Canonical Domain') || extractDomainFromUrl(getMetadataValue(metadata, 'Job URL')),
+    entity_confidence: 0,
+    primary_application_url: getMetadataValue(metadata, 'Primary Application URL') || getMetadataValue(metadata, 'Job URL'),
+    ats_platform: getMetadataValue(metadata, 'ATS Platform') || detectAtsPlatform(getMetadataValue(metadata, 'Job URL')),
+    all_candidates: [], suppressed_candidates: [],
+    notes: `Discovery failed unexpectedly: ${error && error.message ? error.message : 'unknown error'}`
+  }, metadata, 'fallback');
+}
+
+function moveSourceFileSafely(file, destinationFolder, destinationLabel, reason) {
+  if (!file || !destinationFolder) {
+    AppLogger.error('DRIVE', `Cannot move source for ${reason || 'unknown reason'}: destination ${destinationLabel || 'folder'} is unavailable.`);
+    return false;
+  }
+  try {
+    file.moveTo(destinationFolder);
+    vLog(`  - [DRIVE] Source file moved to ${destinationLabel}: ${file.getName()} (${reason || 'no reason supplied'}).`);
+    return true;
+  } catch (e) {
+    AppLogger.error('DRIVE', `Failed moving "${file.getName()}" to ${destinationLabel}: ${e.message}`);
+    return false;
+  }
+}
+
+function getDispatchRecipientPlanForLogging(metadata, discoveryResult) {
+  const seen = new Set();
+  const plan = [];
+  asArray(discoveryResult && discoveryResult.candidates)
+    .filter(c => c && c.recommendedAction === DISCOVERY_ACTIONS.CREATE_DRAFT)
+    .forEach(c => {
+      const email = sanitizeEmailAddress(c.email);
+      if (!email || seen.has(email)) return;
+      seen.add(email);
+      plan.push({ email, tier: c.tier || 'UNKNOWN', score: c.score !== undefined ? c.score : '' });
+    });
+
+  if (plan.length === 0) {
+    const fallback = sanitizeEmailAddress(getMetadataValue(metadata, 'Application Email'));
+    if (fallback) plan.push({ email: fallback, tier: 'MANUAL', score: discoveryResult && discoveryResult.score ? discoveryResult.score : '' });
+  }
+  return plan.slice(0, MAX_APPLICATION_RECIPIENT_SLOTS);
 }
 
 function getDispatchTargetEmailsForLogging(metadata, discoveryResult) {
