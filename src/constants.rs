@@ -28,11 +28,10 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64000;
 pub const DEFAULT_TEMPERATURE: f64 = 0.6;
 pub const DEFAULT_TOP_P: f64 = 0.95;
 pub const DEFAULT_MAX_TOKENS: u32 = 16000;
-pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-/// Effective HTTP timeout for LLM calls. Node validates the per-request
-/// `timeout` field but never applies it to the OpenAI SDK call, so the SDK
-/// default (10 minutes) governs every request; reproduce that behavior.
-pub const LLM_HTTP_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_LLM_TIMEOUT_SECS * 1000;
+/// Effective HTTP timeout for LLM calls (5 minutes default).
+pub const LLM_HTTP_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_MS;
 
 // Circuit breaker per-service presets (circuitBreaker.ts createForService)
 pub const CB_OPENAI_FAILURE_THRESHOLD: u32 = 3;

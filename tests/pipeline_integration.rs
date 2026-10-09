@@ -199,6 +199,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
             show_reasoning: false,
             show_stream: false,
             concurrent: 1,
+            timeout_s: 300,
         },
     )
     .await
@@ -242,6 +243,7 @@ async fn offline_pipeline_chain_writes_manifests_and_checkpoints() {
             show_stream: false,
             suppress_errors: false,
             concurrent: 1,
+            timeout_s: 300,
         },
     )
     .await

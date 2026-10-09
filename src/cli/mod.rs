@@ -158,7 +158,7 @@ struct JobClothArgs {
     sleep: f64,
     #[arg(long = "jc-reasoning-effort", visible_alias = "reasoning-effort")]
     reasoning_effort: Option<String>,
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, visible_alias = "llm-api-timeout", default_value_t = crate::constants::DEFAULT_LLM_TIMEOUT_SECS)]
     openai_timeout: u64,
     #[arg(long, default_value_t = 3)]
     batch_retry_attempts: u32,
@@ -234,6 +234,8 @@ struct JobJudgeArgs {
     show_stream_tokens: Option<bool>,
     #[arg(long, visible_alias = "jj-concurrent", default_value_t = 3)]
     concurrent: usize,
+    #[arg(long = "llm-api-timeout", default_value_t = crate::constants::DEFAULT_LLM_TIMEOUT_SECS)]
+    llm_api_timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +284,8 @@ struct MakeMaterialsArgs {
     show_stream_tokens: Option<bool>,
     #[arg(long, visible_alias = "mm-concurrent", default_value_t = 3)]
     concurrent: usize,
+    #[arg(long = "llm-api-timeout", default_value_t = crate::constants::DEFAULT_LLM_TIMEOUT_SECS)]
+    llm_api_timeout: u64,
 }
 #[derive(Debug, Args)]
 struct RunPipelineArgs {
@@ -370,6 +374,13 @@ struct RunPipelineArgs {
         default_value_t = 3
     )]
     mm_concurrent: usize,
+    #[arg(
+        long = "llm-api-timeout",
+        default_value_t = crate::constants::DEFAULT_LLM_TIMEOUT_SECS,
+        value_name = "SECONDS",
+        help = "Timeout in seconds for all LLM API requests across pipeline stages (default: 300)"
+    )]
+    llm_api_timeout: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -834,6 +845,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                 show_stream: args.show_stream.unwrap_or(false)
                     || args.show_stream_tokens.unwrap_or(false),
                 concurrent: args.concurrent,
+                timeout_s: args.llm_api_timeout,
             };
             if options.max_tokens == Some(0) {
                 return Err(AppError::message("--max-tokens must be positive"));
@@ -877,6 +889,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                     || args.show_stream_tokens.unwrap_or(false),
                 suppress_errors: false,
                 concurrent: args.concurrent,
+                timeout_s: args.llm_api_timeout,
             };
             let _ = (
                 args.max_retries,
@@ -936,6 +949,7 @@ fn dispatch(command: Command, context: &RunContext) -> Result<i32> {
                     re_concurrent: args.re_concurrent,
                     jj_concurrent: args.jj_concurrent,
                     mm_concurrent: args.mm_concurrent,
+                    llm_api_timeout_s: args.llm_api_timeout,
                 },
             )?;
             let runtime = tokio::runtime::Runtime::new()

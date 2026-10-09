@@ -372,7 +372,7 @@ mod tests {
         let realistic_reasoning = [
             "First, let me carefully review the candidate's resume for Cloud Security credentials. ",
             "The job description specifies AWS, Terraform, and Kubernetes experience. ",
-            "Looking at the candidate's experience: ",
+            "Looking at Alex Taylor's experience: ",
             "He worked at ExampleCorp as a Security Engineer from 2021 to 2024. ",
             "His key accomplishments include deploying Carbon Black EDR across 500+ endpoints, ",
             "configuring Splunk SIEM alerts, and mitigating critical vulnerabilities. ",

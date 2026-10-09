@@ -46,6 +46,7 @@ pub struct PipelineConfig {
     pub re_concurrent: usize,
     pub jj_concurrent: usize,
     pub mm_concurrent: usize,
+    pub llm_api_timeout_s: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,7 @@ pub struct PipelineConfigArgs {
     pub re_concurrent: usize,
     pub jj_concurrent: usize,
     pub mm_concurrent: usize,
+    pub llm_api_timeout_s: u64,
 }
 
 /// Node buildStageRouting: merges a stage's explicit `only` list, its
@@ -168,6 +170,11 @@ pub fn build(ctx: &RunContext, args: PipelineConfigArgs) -> Result<PipelineConfi
     }
     if args.mm_concurrent == 0 {
         return Err(AppError::message("--mm-concurrent must be at least 1"));
+    }
+    if args.llm_api_timeout_s == 0 {
+        return Err(AppError::message(
+            "--llm-api-timeout must be at least 1 second",
+        ));
     }
     let routing_jobcloth = build_stage_routing(
         args.provider_only_jobcloth,
@@ -253,12 +260,52 @@ pub fn build(ctx: &RunContext, args: PipelineConfigArgs) -> Result<PipelineConfi
         re_concurrent: args.re_concurrent,
         jj_concurrent: args.jj_concurrent,
         mm_concurrent: args.mm_concurrent,
+        llm_api_timeout_s: args.llm_api_timeout_s,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{Diagnostics, DisplayConfig, LlmBudgets, Paths, RunContext};
+    use crate::types::LogFormat;
+    use tokio_util::sync::CancellationToken;
+
+    fn test_context(path: &std::path::Path) -> RunContext {
+        RunContext {
+            paths: Paths {
+                app_root: path.to_path_buf(),
+                resource_root: None,
+                data_dir: path.join("data"),
+                log_dir: path.join("logs"),
+                materials_dir: path.join("materials"),
+                profile_dir: path.join("profile"),
+            },
+            display: DisplayConfig {
+                verbose: false,
+                color: Some(false),
+                hide_reasoning: false,
+                show_reasoning: false,
+                show_fetch_url: false,
+                log_level: None,
+                log_format: LogFormat::Pretty,
+                machine_json: false,
+                banner_loops: 4,
+            },
+            budgets: LlmBudgets::default(),
+            diagnostics: Diagnostics {
+                log_llm_payloads: false,
+                log_max_payload_length: None,
+            },
+            api_key: None,
+            llm_base_url_override: None,
+            indeed_api_key: None,
+            usage_tracker: None,
+            telemetry: std::sync::Arc::new(crate::telemetry::TelemetryStore::new()),
+            cancellation: CancellationToken::new(),
+            run_started_at_ms: 0,
+        }
+    }
 
     fn list(values: &[&str]) -> Option<Vec<String>> {
         Some(values.iter().map(|v| v.to_string()).collect())
@@ -294,5 +341,56 @@ mod tests {
         assert!(routing.allow_fallbacks.is_none());
         assert!(routing.quantizations.is_none());
         assert_eq!(routing.ignore, list(&["x"]));
+    }
+
+    #[test]
+    fn llm_api_timeout_zero_fails_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context(temp.path());
+        let args = PipelineConfigArgs {
+            sites: "indeed".to_string(),
+            search_terms_file: None,
+            results_wanted: 10,
+            hours_old: None,
+            remote_only: false,
+            batch_size: 10,
+            sleep_ms: 1000,
+            clean: false,
+            resume: None,
+            skip_acquisition: true,
+            skip_materials: true,
+            deploy: false,
+            deploy_destination: None,
+            deployed_materials_dir: None,
+            internet_watchdog: None,
+            track_openrouter_costs: false,
+            log_cool_offs: false,
+            jobcloth_cool_off_days: 30,
+            astro_auto_provider_top: 3,
+            jobcloth_preset: "test".to_string(),
+            remoteeval_preset: "test".to_string(),
+            jobjudge_preset: "test".to_string(),
+            makematerials_preset: "test".to_string(),
+            reasoning_jobcloth: None,
+            reasoning_remoteeval: None,
+            reasoning_jobjudge: None,
+            reasoning_makematerials: None,
+            provider_ignore: None,
+            provider_only_jobcloth: None,
+            provider_only_remoteeval: None,
+            provider_only_jobjudge: None,
+            provider_only_makematerials: None,
+            provider_quant_jobcloth: None,
+            provider_quant_remoteeval: None,
+            provider_quant_jobjudge: None,
+            provider_quant_makematerials: None,
+            jc_concurrent: 1,
+            re_concurrent: 1,
+            jj_concurrent: 1,
+            mm_concurrent: 1,
+            llm_api_timeout_s: 0,
+        };
+        let err = build(&ctx, args).unwrap_err();
+        assert!(err.message.contains("--llm-api-timeout"));
     }
 }

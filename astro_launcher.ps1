@@ -98,7 +98,6 @@ function Resolve-AstroomBinary {
 
     if ($env:ASTROOM_BIN) { $candidates.Add($env:ASTROOM_BIN) }
     $candidates.Add((Join-Path $scriptDir 'astroom.exe'))
-    $candidates.Add((Join-Path $scriptDir (Join-Path 'bin' 'astroom.exe')))
     $candidates.Add((Join-Path $scriptDir (Join-Path '..' (Join-Path 'bin' 'astroom.exe'))))
     $candidates.Add((Join-Path $scriptDir (Join-Path 'target' (Join-Path 'release' 'astroom.exe'))))
     $candidates.Add((Join-Path $scriptDir (Join-Path 'target' (Join-Path 'debug' 'astroom.exe'))))

@@ -1,9 +1,9 @@
 ### Job Evaluation Prompt (JEP)
 
-You are evaluating a target job description against fixed “Candidate’s Rules” failure conditions, using the candidate’s resume only for Rules 12 and 13. If the targJD fails any rule, the entire job is a failure (isVeryHighlyAligned = false). Output only the specified JSON array.
+You are evaluating a target job description against fixed “Candidate Rules” failure conditions, using Candidate’s resume only for Rules 12 and 13. If the targJD fails any rule, the entire job is a failure (isVeryHighlyAligned = false). Output only the specified JSON array.
 
 ### Inputs
-- Candidate’s Rules: Use exactly as provided. Do not reinterpret or modify.
+- Candidate Rules: Use exactly as provided. Do not reinterpret or modify.
 - targJD: Full target Job Description text.
 - myResume: Candidate’s resume text. Only use for Rules 12 and 13.
 
@@ -36,8 +36,8 @@ From the targJD, extract the following, defaulting to “Not Specified” if abs
 
 If information is scattered (e.g., in multiple sections), consolidate. Prefer explicit statements over implications. If hourly pay is given and full-time is implied, annualize using 40 hrs/week and 52 weeks to estimate the upper bound; if unsure, treat as “Not Specified.”
 
-### Candidate’s Rules - Rule Evaluation
-Apply Candidate’s Rules exactly as written. A single failure flips the overall result to false.
+### Candidate Rules - Rule Evaluation
+Apply Candidate Rules exactly as written. A single failure flips the overall result to false.
 
 - Rule 1 — Culture/Company
   - Fail if language indicates potentially toxic, overly bureaucratic, or technologically stagnant environment. Evidence includes phrases like “must strictly follow rigid processes without deviation,” “no remote tools,” “legacy-only stack with no modernization,” or overtly aggressive/hostile tone.
@@ -49,13 +49,13 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
     - IT Systems Administration: Systems Administrator/Engineer, Windows/Linux Admin, AD/IAM Admin.
 - Rule 3 — Location
   - Fail if:
-    - Onsite/Hybrid and specified city is not commutable: [YOUR_COMMUTE_CITIES, e.g. Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, or roughly ~30 minutes from your location].
-    - Remote but explicitly restricted outside [YOUR_RESIDENCY_STATE/REGION] or incompatible time zone (e.g., “PST hours required,” “must sit in CA/TX only”).
+    - Onsite/Hybrid and specified city is not commutable from the candidate's documented location in `myResume`.
+    - Remote but explicitly restricted outside candidate's region or incompatible time zone (e.g., “PST hours required” when in EST).
     - Location is “Not Specified” and there is no textual evidence of remote or commutable status.
 - Rule 4 — Employment Type
   - Fail if Part-time, Contract, or Temporary. Pass if “Not Specified.”
 - Rule 5 — Residency
-  - Fail if residency requirements explicitly exclude candidate's location ([YOUR_LOCATION / YOUR_RESIDENCY_STATE/COUNTRY], e.g., “must reside in CA only,” “cannot hire in candidate's state”). General “US only” is fine.
+  - Fail if residency requirements explicitly exclude the candidate's home state/location documented in `myResume` (e.g., “must reside in CA only”). General “US only” is fine.
 - Rule 6 — Security Clearance
   - Fail if a clearance is required prior to hire, is not Public Trust, and the JD does not state it can be obtained post-hire. Public Trust required is acceptable.
 - Rule 7 — Travel
@@ -70,12 +70,12 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
   - Fail if specific certifications are required prior to hire (other than CompTIA A+ or ACMT) and the JD does not state they can be obtained post-hire. “Preferred” or “or equivalent experience” passes.
 - Rule 12 — Responsibilities Alignment (use myResume)
   - Fail if core responsibilities are “Not Specified.”
-  - Extract 8–15 primary responsibilities. Consider them “highly aligned” if the candidate has direct, hands-on experience with at least 60% of them.
+  - Extract 8–15 primary responsibilities. Consider them “highly aligned” if Candidate has direct, hands-on experience with at least 60% of them.
   - Compute coverage: $$ \text{coverage} = \frac{\text{matched responsibilities}}{\text{total primary responsibilities}} $$. Pass if $$ \text{coverage} \ge 0.60 $$.
   - Accept mismatches on niche tools if broader functions align (EDR, SIEM, IR, cloud security, vulnerability management).
 - Rule 13 — Technical Skills Alignment (use myResume)
   - Fail if required technical skills are “Not Specified.”
-  - Extract the explicit required technologies/protocols/platforms. Consider “highly aligned” if the candidate covers at least 60%.
+  - Extract the explicit required technologies/protocols/platforms. Consider “highly aligned” if Candidate covers at least 60%.
   - Compute coverage: $$ \text{coverage} = \frac{\text{matched required skills}}{\text{total required skills}} $$. Pass if $$ \text{coverage} \ge 0.60 $$.
   - Near-equivalence mappings are acceptable (see below).
 
@@ -90,7 +90,7 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
   - Scripting/Automation: Python, PowerShell
   - OS/Endpoint Mgmt: Windows/Mac/Linux, SCCM
   - Compliance/Frameworks: NIST CSF, RMF, CIS, HIPAA, GRC platforms
-- Count a JD item as matched if the candidate’s resume shows direct experience in the same domain or a clearly equivalent tool/stack.
+- Count a JD item as matched if Candidate’s resume shows direct experience in the same domain or a clearly equivalent tool/stack.
 - Document a few key matches in the rationale for transparency.
 
 ### Decision Logic
@@ -106,12 +106,12 @@ Apply Candidate’s Rules exactly as written. A single failure flips the overall
 ### Definitions and Heuristics
 - Toxic/Bureaucratic/Stagnant signals (Rule 1) include rigid, punitive, or anti-modernization language; absence of modern tools without plans to modernize; excessive micromanagement phrasing.
 - Opportunity Type mapping (Rule 2) uses role function over title keywords. If split across security and non-security, choose the dominant function.
-- Location (Rule 3) commutable means within ~30 minutes of [YOUR_LOCATION]. Explicit incompatible time-zone hours or single-state residency outside [YOUR_RESIDENCY_STATE/REGION] fails remote roles.
+- Location (Rule 3) commutable means within reasonable distance (~30 minutes) of the candidate's location in `myResume`. Explicit incompatible time-zone or single-state residency outside candidate's region fails remote roles.
 - Salary (Rule 8) use the stated upper bound. If a single value is given, treat it as both lower and upper.
 - Years of experience (Rule 9) must reference cybersecurity/infosec specifically to trigger failure.
 
 ### Commutable Locations
-- Treat the following as commutable: [YOUR_COMMUTE_CITIES, e.g. Albany, Troy, Schenectady, Clifton Park, Saratoga Springs, and nearby locales approximately ~30 minutes from primary location]. If a nearby town is listed, judge commutability reasonably; when uncertain, do not assume commutable.
+- Judge commutability reasonably based on candidate's location in `myResume` (~30 minutes travel time). If a nearby town is listed, judge commutability reasonably; when uncertain, do not assume commutable.
 
 ### Output Construction
 - jobTitle: From targJD; else “Not Specified.”

@@ -527,6 +527,7 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     sleep_ms: 2_000,
                     reasoning_effort: config.reasoning_jobcloth.clone(),
                     provider_routing: cloth_routing,
+                    openai_timeout_s: config.llm_api_timeout_s,
                     show_reasoning: true,
                     show_stream: true,
                     ..job_cloth::JobClothOptions::default()
@@ -701,6 +702,7 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                         show_reasoning: true,
                         show_stream: true,
                         concurrent: config.re_concurrent,
+                        timeout_s: config.llm_api_timeout_s,
                     },
                 )
                 .await?;
@@ -796,6 +798,7 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     show_reasoning: true,
                     show_stream: true,
                     concurrent: config.jj_concurrent,
+                    timeout_s: config.llm_api_timeout_s,
                 },
             )
             .await?;
@@ -896,6 +899,7 @@ async fn execute_untracked(ctx: &RunContext, config: &PipelineConfig) -> Result<
                     show_stream: true,
                     suppress_errors: true,
                     concurrent: config.mm_concurrent,
+                    timeout_s: config.llm_api_timeout_s,
                 },
             )
             .await?;

@@ -1,41 +1,14 @@
-# Rust / Cargo build output
 target/
-**/*.rs.bk
-*.pdb
-
-# Release binaries explicitly tracked
-!bin/
-!bin/astroom
-!bin/astroom.exe
-!bin/*
-
-# Local candidate profiles and secrets
-.env
-.env.*
-!.env.example
-candidate_data/
-
-# Application runtime directories
 data/
 logs/
 materials/
 materials-deployed/
-
-# Database files & journals (keep committed test fixtures)
+candidate_data/
+.env
 *.sqlite
 *.sqlite-*
-!tests/fixtures/*.sqlite
-!tests/fixtures/*.sqlite-*
-
-# Logs & debugging
 *.log
 
-# Editor / IDE debris
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
-desktop.ini
+# Committed Node-generated database compatibility fixture.
+!tests/fixtures/*.sqlite
+!tests/fixtures/*.sqlite-*

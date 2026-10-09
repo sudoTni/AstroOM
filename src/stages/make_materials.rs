@@ -49,6 +49,7 @@ pub struct MakeMaterialsOptions {
     /// swallowed (and the stats export is skipped, matching the pipeline).
     pub suppress_errors: bool,
     pub concurrent: usize,
+    pub timeout_s: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +130,15 @@ fn safe(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+fn clean_job_title(filename: &str) -> String {
+    let s = filename
+        .strip_prefix("Candidate_Materials_")
+        .or_else(|| filename.strip_prefix("Candidate_Resume_"))
+        .or_else(|| filename.strip_prefix("Candidate_"))
+        .unwrap_or(filename);
+    s.to_string()
 }
 
 pub async fn run(ctx: &RunContext, options: &MakeMaterialsOptions) -> Result<MakeMaterialsResult> {
@@ -485,7 +495,7 @@ async fn run_inner(
                                     temperature: options.temperature.unwrap_or(preset.temperature),
                                     top_p: options.top_p.unwrap_or(preset.top_p),
                                     max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
-                                    timeout_ms: 30_000,
+                                    timeout_ms: options.timeout_s.saturating_mul(1000),
                                     show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
                                     show_response_stream: options.show_stream,
                                     suppress_stream_display: options.concurrent > 1,
@@ -619,10 +629,7 @@ async fn run_inner(
                         }
                     };
 
-                    let safe_job_title = material
-                        .resume_filename
-                        .replacen("Candidate_Materials_", "", 1)
-                        .replacen("Candidate_Resume_", "", 1);
+                    let safe_job_title = clean_job_title(&material.resume_filename);
                     let dir = ctx
                         .paths
                         .materials_dir
@@ -817,7 +824,7 @@ async fn run_inner(
                             temperature: options.temperature.unwrap_or(preset.temperature),
                             top_p: options.top_p.unwrap_or(preset.top_p),
                             max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
-                            timeout_ms: 30_000,
+                            timeout_ms: options.timeout_s.saturating_mul(1000),
                             show_reasoning_tokens: !ctx.display.hide_reasoning
                                 && options.show_reasoning,
                             show_response_stream: options.show_stream,
@@ -950,11 +957,7 @@ async fn run_inner(
                     continue;
                 }
             };
-            let safe_job_title =
-                material
-                    .resume_filename
-                    .replacen("Candidate_Materials_", "", 1)
-                    .replacen("Candidate_Resume_", "", 1);
+            let safe_job_title = clean_job_title(&material.resume_filename);
             let dir =
                 ctx.paths
                     .materials_dir

@@ -50,7 +50,7 @@ pub struct JobClothOptions {
     pub sleep_ms: u64,
     pub reasoning_effort: Option<String>,
     pub provider_routing: Option<ProviderRouting>,
-    /// Per-request timeout in seconds (Node `openaiTimeout`, default 60).
+    /// Per-request timeout in seconds (default 300).
     pub openai_timeout_s: u64,
     /// Batch-level retry attempts (Node default 3).
     pub batch_retry_attempts: u32,
@@ -80,7 +80,7 @@ impl Default for JobClothOptions {
             sleep_ms: 0,
             reasoning_effort: None,
             provider_routing: None,
-            openai_timeout_s: 60,
+            openai_timeout_s: crate::constants::DEFAULT_LLM_TIMEOUT_SECS,
             batch_retry_attempts: 3,
             batch_retry_delay_ms: 5000,
             job_title_retry_attempts: 2,

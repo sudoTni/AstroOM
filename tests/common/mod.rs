@@ -329,7 +329,7 @@ pub fn populate_full_profile(profile: &Path) {
         ),
         (
             "my_testimonials.txt",
-            "The candidate is a top-tier security professional.\n",
+            "Candidate is a top-tier security professional.\n",
         ),
     ];
     for (name, contents) in files {

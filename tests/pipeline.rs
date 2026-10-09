@@ -337,3 +337,54 @@ fn resume_past_remote_eval_with_remote_only_requires_artifact() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn llm_api_timeout_must_be_positive() {
+    let sandbox = Sandbox::new();
+    let data = sandbox.sub("data");
+    let logs = sandbox.sub("logs");
+    let profile = sandbox.sub("profile");
+    let mut args = base_args(
+        data.to_str().unwrap(),
+        logs.to_str().unwrap(),
+        profile.to_str().unwrap(),
+    );
+    args.extend([
+        "run-pipeline",
+        "--api-key",
+        "test-key",
+        "--resume",
+        "deployment",
+        "--llm-api-timeout",
+        "0",
+    ]);
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--llm-api-timeout"), "stderr: {stderr}");
+}
+
+#[test]
+fn llm_api_timeout_override_is_accepted() {
+    let sandbox = Sandbox::new();
+    let data = sandbox.sub("data");
+    let logs = sandbox.sub("logs");
+    let profile = sandbox.sub("profile");
+    populate_profile(&profile);
+    let mut args = base_args(
+        data.to_str().unwrap(),
+        logs.to_str().unwrap(),
+        profile.to_str().unwrap(),
+    );
+    args.extend([
+        "run-pipeline",
+        "--api-key",
+        "test-key",
+        "--resume",
+        "deployment",
+        "--llm-api-timeout",
+        "120",
+    ]);
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(0));
+}

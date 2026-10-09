@@ -40,6 +40,7 @@ pub struct JobJudgeOptions {
     /// Node `showResponseStream` (standalone default false; pipeline default true).
     pub show_stream: bool,
     pub concurrent: usize,
+    pub timeout_s: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,7 +391,7 @@ async fn evaluate(
                     temperature: preset.temperature,
                     top_p: preset.top_p,
                     max_tokens: options.max_tokens.or(preset.max_tokens).unwrap_or(16_000),
-                    timeout_ms: 30_000,
+                    timeout_ms: options.timeout_s.saturating_mul(1000),
                     show_reasoning_tokens: !ctx.display.hide_reasoning && options.show_reasoning,
                     show_response_stream: options.show_stream,
                     suppress_stream_display: options.concurrent > 1,

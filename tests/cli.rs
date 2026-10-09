@@ -327,3 +327,15 @@ fn llm_base_url_override_is_a_global_option() {
         "global endpoint override must be documented: {stdout}"
     );
 }
+
+#[test]
+fn llm_api_timeout_is_documented_in_run_pipeline_help() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["run-pipeline", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--llm-api-timeout"),
+        "run-pipeline must document --llm-api-timeout: {stdout}"
+    );
+}

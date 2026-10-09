@@ -327,6 +327,10 @@ All subcommands support `--help` for comprehensive option listings.
 - `--max-llm-requests`, `--max-llm-output-tokens`, `--max-total-llm-output-tokens`, `--llm-deadline-ms`: LLM spend and time budgets.
 - `--log-llm-payloads`, `--log-max-payload-length`: Write every outbound LLM request body to `logs/*_payload_logs/`.
 
+
+### Pipeline Flags (`run-pipeline`)
+- `--llm-api-timeout <SECONDS>`: Timeout in seconds for all LLM API requests across pipeline stages (default: `300` / 5 minutes). Also supported on individual stage commands (`jobCloth`, `jobJudge`, `makeMaterials`).
+
 ---
 
 ## Google Apps Script Deployment

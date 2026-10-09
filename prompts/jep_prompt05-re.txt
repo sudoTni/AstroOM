@@ -9,21 +9,21 @@ POST-REMOTE-PREFILTER
 
 Please act as an expert talent-acquisition analyst and rigorous weighted-assessment engine.
 
-Please analyze `targJD` against the candidate's `myResume` and `candidateEvidenceProfile` to determine whether the opportunity is very highly aligned with their documented background, preferences, interview readiness, and realistic offer-conversion likelihood.
+Please analyze `targJD` against Candidate's `myResume` and `candidateEvidenceProfile` to determine whether the opportunity is very highly aligned with their documented background, preferences, interview readiness, and realistic offer-conversion likelihood.
 
 Evaluate Security/SecOps/Cybersecurity, Remote Support/Enterprise IT/Endpoint Support, materially hybrid Security+Support, and other roles as applicable.
 
-Optimize for interview confidence and offer conversion, not application volume. Prefer opportunities the candidate can credibly, confidently, specifically, and truthfully defend under detailed interview questioning over superficially attractive roles requiring exaggeration.
+Optimize for interview confidence and offer conversion, not application volume. Prefer opportunities Candidate can credibly, confidently, specifically, and truthfully defend under detailed interview questioning over superficially attractive roles requiring exaggeration.
 
 ### Mandatory upstream precondition
 
-Remote/WFH work-arrangement eligibility, geographic residency eligibility, and the upstream travel condition have already been evaluated by the separate `Remote/WFH Evaluation Prompt`.
+Remote/WFH work-arrangement eligibility, New York geographic eligibility, and the upstream travel condition have already been evaluated by the separate `Remote/WFH Evaluation Prompt`.
 
 This prompt MUST be invoked only for jobs whose upstream result contained:
 
 `"isConfirmedRemote": true`
 
-Within the upstream contract, `"isConfirmedRemote": true` means the opportunity has already passed the applicable Remote/WFH and geographic residency eligibility requirements and the upstream travel condition that excludes roles with travel requirements greater than or equal to 10%.
+Within the upstream contract, `"isConfirmedRemote": true` means the opportunity has already passed the applicable Remote/WFH and New York eligibility requirements and the upstream travel condition that excludes roles with travel requirements greater than or equal to 10%.
 
 Therefore:
 
@@ -396,7 +396,7 @@ without affirmative non-waivable pre-hire language.
 FAIL only if all five are true:
 
 1. a specific certification/license/registration/professional credential is explicitly mandatory;
-2. the candidate lacks it according to `myResume`;
+2. Candidate lacks it according to `myResume`;
 3. the JD affirmatively establishes active/pre-existing possession before employment/application, such as:
    * `must currently hold`;
    * `required at time of application`;
@@ -758,7 +758,7 @@ Score:
 
 For every strong credit, internally test:
 
-`Could the candidate truthfully and specifically discuss the resume evidence under detailed technical questioning?`
+`Could Candidate truthfully and specifically discuss the resume evidence under detailed technical questioning?`
 
 If not, reduce credit.
 
@@ -870,11 +870,11 @@ Score:
 * `9`: 30–39%
 * `6`: <30%
 * `13`: responsibilities Not Specified
-* `0`: overriding case where core responsibilities are substantially outside the candidate's professional domain.
+* `0`: overriding case where core responsibilities are substantially outside Candidate's professional domain.
 
 Day-one test:
 
-`Could the candidate competently perform the responsibility with minimal ramp-up from documented evidence?`
+`Could Candidate competently perform the responsibility with minimal ramp-up from documented evidence?`
 
 Direct experience should strongly satisfy this.
 
@@ -982,25 +982,21 @@ Maximum:
 
 #### 5A — Degree Fit (5)
 
-The candidate holds:
-
-`[YOUR_DEGREE, e.g. a Bachelor of Arts in Psychology]`
-
-Evaluate degree level and required field.
+Evaluate Candidate's degree level and required field per `myResume`.
 
 * `5`: no degree required.
-* `5`: any Bachelor's required, no mandatory field.
-* `5`: Bachelor's preferred, not required.
-* `5`: Bachelor's required with explicit `or equivalent experience` and the candidate's professional experience reasonably satisfies it.
-* `3`: specific technical/role-related Bachelor's field preferred, not mandatory.
-* `3`: specific technical/role-related Bachelor's required but equivalent professional experience is explicitly permitted and reasonably satisfied.
-* `1`: Master's preferred, not required.
-* `0`: specific Bachelor's field explicitly mandatory, no equivalent-experience provision, and the candidate's degree ([YOUR_DEGREE]) does not satisfy it.
-* `0`: Master's/PhD explicitly mandatory with no acceptable equivalence.
+* `5`: any degree required with no mandatory field and Candidate holds that level.
+* `5`: degree preferred, not required.
+* `5`: degree required with explicit `or equivalent experience` reasonably satisfied by Candidate's documented professional experience.
+* `3`: specific technical/role-related degree field preferred, not mandatory.
+* `3`: specific technical/role-related degree required but equivalent professional experience is explicitly permitted and reasonably satisfied.
+* `1`: higher degree (Master's/PhD) preferred, not required.
+* `0`: specific degree field explicitly mandatory, no equivalent-experience provision, and Candidate's degree does not satisfy it.
+* `0`: higher degree (Master's/PhD) explicitly mandatory with no acceptable equivalence.
 
-Do not give full credit merely for holding a Bachelor's when a specific field is mandatory.
+Do not give full credit merely for holding a degree when a specific field is mandatory.
 
-Do not penalize the candidate's degree when any Bachelor's suffices.
+Do not penalize Candidate when any degree suffices.
 
 Never invent equivalent-experience permission.
 
@@ -1044,7 +1040,7 @@ Never infer employer culture from:
 * outside assumptions;
 * `candidateEvidenceProfile`.
 
-`candidateEvidenceProfile` may only support the candidate's compatibility with environments valuing:
+`candidateEvidenceProfile` may only support Candidate's compatibility with environments valuing:
 
 * responsiveness;
 * collaboration;
@@ -1163,7 +1159,7 @@ Hybrid roles: evaluate both proportionally.
 
 Never reduce a support role because it lacks cybersecurity.
 
-Never inflate a security role merely because the candidate has extensive general IT/support experience.
+Never inflate a security role merely because Candidate has extensive general IT/support experience.
 
 Use profile evidence appropriately when the JD values:
 
@@ -1193,13 +1189,13 @@ Never claim:
 
 * CrowdStrike when only Carbon Black is documented;
 * CISSP if not held;
-* [DESIRED_DEGREE_FIELD, e.g. Computer Science] when the degree is in another field ([YOUR_DEGREE, e.g. Psychology]);
+* Computer Science when the degree is Psychology;
 * cybersecurity years that are unrelated IT;
 * named technical proficiency based only on qualitative praise.
 
 ### Interview-success test
 
-For every strongly credited requirement, verify internally whether the candidate could defend it with specific documented evidence under detailed questioning.
+For every strongly credited requirement, verify internally whether Candidate could defend it with specific documented evidence under detailed questioning.
 
 For hard technical requirements, evidence must primarily come from `myResume`.
 
@@ -1207,11 +1203,11 @@ For qualitative service/communication requirements, `candidateEvidenceProfile` m
 
 The relevant standard is not merely:
 
-`Could the candidate learn this?`
+`Could Candidate learn this?`
 
 but also:
 
-`Could the candidate credibly explain why their documented background makes them a strong candidate today?`
+`Could Candidate credibly explain why their documented background makes them a strong candidate today?`
 
 ---
 
@@ -1414,7 +1410,7 @@ Thank you!
 
 This profile is a normalized summary of recurring qualitative evidence from documented professional testimonials.
 
-It exists to preserve useful evidence of the candidate's demonstrated professional behaviors without repeatedly supplying or analyzing the underlying testimonial corpus.
+It exists to preserve useful evidence of Candidate's demonstrated professional behaviors without repeatedly supplying or analyzing the underlying testimonial corpus.
 
 Treat the statements below as supported qualitative evidence.
 
@@ -1423,7 +1419,7 @@ Do not infer details beyond what the profile states.
 
 ### RESPONSIVENESS & TIMELINESS
 
-The candidate is repeatedly described as:
+Candidate is repeatedly described as:
 
 - highly responsive;
 - prompt in addressing support needs;
@@ -1436,7 +1432,7 @@ Users consistently report feeling that their technical concerns receive prompt a
 
 ### TROUBLESHOOTING & PROBLEM OWNERSHIP
 
-The candidate is repeatedly described as:
+Candidate is repeatedly described as:
 
 - a strong problem solver;
 - persistent when troubleshooting;
@@ -1449,7 +1445,7 @@ Their support behavior demonstrates persistence, practical troubleshooting judgm
 
 ### COMMUNICATION
 
-The candidate consistently demonstrates:
+Candidate consistently demonstrates:
 
 - clear communication;
 - proactive status updates;
@@ -1462,7 +1458,7 @@ Users report feeling informed and supported rather than left uncertain about tec
 
 ### FOLLOW-THROUGH
 
-The candidate demonstrates strong follow-through by:
+Candidate demonstrates strong follow-through by:
 
 - checking that solutions remain effective;
 - confirming that users have what they need after an intervention;
@@ -1474,7 +1470,7 @@ Their service behavior reflects responsibility for outcomes rather than merely c
 
 ### CUSTOMER / USER SERVICE
 
-The candidate is repeatedly described as:
+Candidate is repeatedly described as:
 
 - courteous;
 - respectful;
@@ -1484,14 +1480,14 @@ The candidate is repeatedly described as:
 - accommodating;
 - professional.
 
-They combine technical support with a strong customer-service orientation.
+Candidate combines technical support with a strong customer-service orientation.
 
 Users consistently describe positive service experiences and express high levels of appreciation for their assistance.
 
 
 ### USER-CENTERED SUPPORT
 
-The candidate demonstrates sensitivity to the operational needs of the people they support.
+Candidate demonstrates sensitivity to the operational needs of the people he supports.
 
 Supported behaviors include:
 
@@ -1506,7 +1502,7 @@ Their approach is service-oriented rather than purely technology-oriented.
 
 ### OPERATIONAL CONTINUITY
 
-The candidate demonstrates a strong focus on maintaining user and business continuity during technical problems.
+Candidate demonstrates a strong focus on maintaining user and business continuity during technical problems.
 
 Documented qualitative evidence supports that they:
 
@@ -1522,7 +1518,7 @@ This profile does not independently establish proficiency with any specific heal
 
 ### TEAMWORK & COLLABORATION
 
-The candidate is repeatedly characterized as:
+Candidate is repeatedly characterized as:
 
 - a strong team player;
 - supportive of colleagues;
@@ -1535,7 +1531,7 @@ Their interpersonal style supports effective collaboration with both technical a
 
 ### PROFESSIONALISM
 
-The candidate consistently demonstrates:
+Candidate consistently demonstrates:
 
 - respectful professional conduct;
 - reliability;
@@ -1544,12 +1540,12 @@ The candidate consistently demonstrates:
 - accountability;
 - calm user interaction.
 
-Users describe them as someone they trust and value working with.
+Users describe Candidate as someone they trust and value working with.
 
 
 ### SUPPORT EFFECTIVENESS
 
-Recurring qualitative evidence indicates that the candidate's technical-support work is perceived as highly effective.
+Recurring qualitative evidence indicates that Candidate's technical-support work is perceived as highly effective.
 
 Users repeatedly report:
 
@@ -1566,7 +1562,7 @@ It MUST NOT be used to claim professional proficiency with a specific technology
 
 ### REMOTE-SUPPORT BEHAVIOR
 
-Documented qualitative evidence supports the candidate's ability to provide patient, effective assistance when support is delivered remotely.
+Documented qualitative evidence supports Candidate's ability to provide patient, effective assistance when support is delivered remotely.
 
 This may support conclusions involving:
 
@@ -1580,7 +1576,7 @@ It does not independently establish professional use of a specific remote-suppor
 
 ### INTERVIEW-RELEVANT QUALITATIVE STRENGTHS
 
-When relevant to the JD, the candidate has strong evidence supporting their ability to credibly discuss:
+When relevant to the JD, Candidate has strong evidence supporting their ability to credibly discuss:
 
 - customer-service philosophy;
 - issue ownership;

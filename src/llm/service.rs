@@ -1528,4 +1528,12 @@ mod tests {
         assert_eq!(map["provider.quantizations"], json!("fp8"));
         assert_eq!(map["provider.allow_fallbacks"], json!(false));
     }
+
+    #[test]
+    fn default_llm_request_timeout_is_300_seconds() {
+        let default_req = LlmRequest::default();
+        assert_eq!(default_req.timeout_ms, crate::constants::DEFAULT_TIMEOUT_MS);
+        assert_eq!(default_req.timeout_ms, 300_000);
+        assert_eq!(crate::constants::DEFAULT_LLM_TIMEOUT_SECS, 300);
+    }
 }

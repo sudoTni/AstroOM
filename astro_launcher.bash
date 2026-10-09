@@ -125,6 +125,7 @@ ARGS=(
   --jj-provider astro_auto_provider --j-provider-quant fp8 --jj-reasoning-effort high
   --mm-provider astro_auto_provider --mm-provider-quant fp8 --mm-reasoning-effort high
   --astro_auto_provider-top 3
+  --provider-ignore baseten/fp8
   --remote-only true --track-or-costs --internet-watchdog --log-cool-offs
 )
 

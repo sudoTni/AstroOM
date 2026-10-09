@@ -74,11 +74,9 @@ pub(crate) fn shared_client() -> crate::error::Result<&'static reqwest::Client> 
 
 /// Resolves the effective HTTP timeout for one request.
 ///
-/// `LlmRequest::timeout_ms` is the caller-declared budget (`--openai-timeout`
-/// for `jobCloth`, 30s for the other stages). It was previously only written
-/// into the log context and never applied, so every request ran for the full
-/// [`crate::constants::LLM_HTTP_TIMEOUT_MS`] regardless of configuration. A
-/// zero or absent value falls back to that default.
+/// `LlmRequest::timeout_ms` is the caller-declared budget (`--llm-api-timeout`,
+/// defaulting to 300s across all stages). A zero value falls back to
+/// [`crate::constants::LLM_HTTP_TIMEOUT_MS`].
 pub(crate) fn resolve_http_timeout(timeout_ms: u64) -> Duration {
     if timeout_ms == 0 {
         Duration::from_millis(crate::constants::LLM_HTTP_TIMEOUT_MS)
